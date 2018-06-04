@@ -24,19 +24,24 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.PriorityQueue;
+import java.util.NavigableSet;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
+import com.google.common.collect.Lists;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedListEntries;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.protocol.OpenFileEntry;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.util.Daemon;
+import org.apache.hadoop.util.Time;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -69,8 +74,10 @@ public class LeaseManager {
 
   private final FSNamesystem fsnamesystem;
 
-  private long softLimit = HdfsServerConstants.LEASE_SOFTLIMIT_PERIOD;
-  private long hardLimit = HdfsServerConstants.LEASE_HARDLIMIT_PERIOD;
+  private long softLimit = HdfsConstants.LEASE_SOFTLIMIT_PERIOD;
+  private long hardLimit = HdfsConstants.LEASE_HARDLIMIT_PERIOD;
+  private long lastHolderUpdateTime;
+  private String internalLeaseHolder;
 
   //
   // Used for handling lock-leases
@@ -78,20 +85,43 @@ public class LeaseManager {
   //
   private final SortedMap<String, Lease> leases = new TreeMap<>();
   // Set of: Lease
-  private final PriorityQueue<Lease> sortedLeases = new PriorityQueue<>(512,
+  private final NavigableSet<Lease> sortedLeases = new TreeSet<>(
       new Comparator<Lease>() {
         @Override
         public int compare(Lease o1, Lease o2) {
-          return Long.signum(o1.getLastUpdate() - o2.getLastUpdate());
+          if (o1.getLastUpdate() != o2.getLastUpdate()) {
+            return Long.signum(o1.getLastUpdate() - o2.getLastUpdate());
+          } else {
+            return o1.holder.compareTo(o2.holder);
+          }
         }
   });
   // INodeID -> Lease
-  private final HashMap<Long, Lease> leasesById = new HashMap<>();
+  private final TreeMap<Long, Lease> leasesById = new TreeMap<>();
 
   private Daemon lmthread;
   private volatile boolean shouldRunMonitor;
 
-  LeaseManager(FSNamesystem fsnamesystem) {this.fsnamesystem = fsnamesystem;}
+  LeaseManager(FSNamesystem fsnamesystem) {
+    this.fsnamesystem = fsnamesystem;
+    updateInternalLeaseHolder();
+  }
+
+  // Update the internal lease holder with the current time stamp.
+  private void updateInternalLeaseHolder() {
+    this.lastHolderUpdateTime = Time.monotonicNow();
+    this.internalLeaseHolder = HdfsServerConstants.NAMENODE_LEASE_HOLDER +
+        "-" + Time.formatTime(Time.now());
+  }
+
+  // Get the current internal lease holder name.
+  String getInternalLeaseHolder() {
+    long elapsed = Time.monotonicNow() - lastHolderUpdateTime;
+    if (elapsed > hardLimit) {
+      updateInternalLeaseHolder();
+    }
+    return internalLeaseHolder;
+  }
 
   Lease getLease(String holder) {
     return leases.get(holder);
@@ -108,7 +138,11 @@ public class LeaseManager {
     long numUCBlocks = 0;
     for (Long id : getINodeIdWithLeases()) {
       final INodeFile cons = fsnamesystem.getFSDirectory().getInode(id).asFile();
-      Preconditions.checkState(cons.isUnderConstruction());
+      if (!cons.isUnderConstruction()) {
+        LOG.warn("The file " + cons.getFullPathName()
+            + " is not under construction but has lease.");
+        continue;
+      }
       BlockInfo[] blocks = cons.getBlocks();
       if(blocks == null) {
         continue;
@@ -123,6 +157,52 @@ public class LeaseManager {
   }
 
   Collection<Long> getINodeIdWithLeases() {return leasesById.keySet();}
+
+  /**
+   * Get a batch of under construction files from the currently active leases.
+   * File INodeID is the cursor used to fetch new batch of results and the
+   * batch size is configurable using below config param. Since the list is
+   * fetched in batches, it does not represent a consistent view of all
+   * open files.
+   *
+   * @see org.apache.hadoop.hdfs.DFSConfigKeys#DFS_NAMENODE_LIST_OPENFILES_NUM_RESPONSES
+   * @param prevId the INodeID cursor
+   * @throws IOException
+   */
+  public BatchedListEntries<OpenFileEntry> getUnderConstructionFiles(
+      final long prevId) throws IOException {
+    assert fsnamesystem.hasReadLock();
+    SortedMap<Long, Lease> remainingLeases;
+    synchronized (this) {
+      remainingLeases = leasesById.tailMap(prevId, false);
+    }
+    Collection<Long> inodeIds = remainingLeases.keySet();
+    final int numResponses = Math.min(
+        this.fsnamesystem.getMaxListOpenFilesResponses(), inodeIds.size());
+    final List<OpenFileEntry> openFileEntries =
+        Lists.newArrayListWithExpectedSize(numResponses);
+
+    int count = 0;
+    for (Long inodeId: inodeIds) {
+      final INodeFile inodeFile =
+          fsnamesystem.getFSDirectory().getInode(inodeId).asFile();
+      if (!inodeFile.isUnderConstruction()) {
+        LOG.warn("The file " + inodeFile.getFullPathName()
+            + " is not under construction but has lease.");
+        continue;
+      }
+      openFileEntries.add(new OpenFileEntry(
+          inodeFile.getId(), inodeFile.getFullPathName(),
+          inodeFile.getFileUnderConstructionFeature().getClientName(),
+          inodeFile.getFileUnderConstructionFeature().getClientMachine()));
+      count++;
+      if (count >= numResponses) {
+        break;
+      }
+    }
+    boolean hasMore = (numResponses < remainingLeases.size());
+    return new BatchedListEntries<>(openFileEntries, hasMore);
+  }
 
   /** @return the lease containing src */
   public synchronized Lease getLease(INodeFile src) {return leasesById.get(src.getId());}
@@ -153,6 +233,13 @@ public class LeaseManager {
     leasesById.put(inodeId, lease);
     lease.files.add(inodeId);
     return lease;
+  }
+
+  synchronized void removeLease(long inodeId) {
+    final Lease lease = leasesById.get(inodeId);
+    if (lease != null) {
+      removeLease(lease, inodeId);
+    }
   }
 
   /**
@@ -293,16 +380,6 @@ public class LeaseManager {
     }
   }
 
-  @VisibleForTesting
-  synchronized void removeLeases(Collection<Long> inodes) {
-    for (long inode : inodes) {
-      Lease lease = leasesById.get(inode);
-      if (lease != null) {
-        removeLease(lease, inode);
-      }
-    }
-  }
-
   public void setLeasePeriod(long softLimit, long hardLimit) {
     this.softLimit = softLimit;
     this.hardLimit = hardLimit; 
@@ -327,14 +404,14 @@ public class LeaseManager {
               needSync = checkLeases();
             }
           } finally {
-            fsnamesystem.writeUnlock();
+            fsnamesystem.writeUnlock("leaseManager");
             // lease reassignments should to be sync'ed.
             if (needSync) {
               fsnamesystem.getEditLog().logSync();
             }
           }
   
-          Thread.sleep(HdfsServerConstants.NAMENODE_LEASE_RECHECK_INTERVAL);
+          Thread.sleep(fsnamesystem.getLeaseRecheckIntervalMs());
         } catch(InterruptedException ie) {
           if (LOG.isDebugEnabled()) {
             LOG.debug(name + " is interrupted", ie);
@@ -354,8 +431,12 @@ public class LeaseManager {
     boolean needSync = false;
     assert fsnamesystem.hasWriteLock();
 
-    while(!sortedLeases.isEmpty() && sortedLeases.peek().expiredHardLimit()) {
-      Lease leaseToCheck = sortedLeases.poll();
+    long start = monotonicNow();
+
+    while(!sortedLeases.isEmpty() &&
+        sortedLeases.first().expiredHardLimit()
+        && !isMaxLockHoldToReleaseLease(start)) {
+      Lease leaseToCheck = sortedLeases.first();
       LOG.info(leaseToCheck + " has expired hard limit");
 
       final List<Long> removing = new ArrayList<>();
@@ -367,6 +448,7 @@ public class LeaseManager {
       Long[] leaseINodeIds = files.toArray(new Long[files.size()]);
       FSDirectory fsd = fsnamesystem.getFSDirectory();
       String p = null;
+      String newHolder = getInternalLeaseHolder();
       for(Long id : leaseINodeIds) {
         try {
           INodesInPath iip = INodesInPath.fromINode(fsd.getInode(id));
@@ -375,9 +457,21 @@ public class LeaseManager {
           if (!p.startsWith("/")) {
             throw new IOException("Invalid path in the lease " + p);
           }
-          boolean completed = fsnamesystem.internalReleaseLease(
-              leaseToCheck, p, iip,
-              HdfsServerConstants.NAMENODE_LEASE_HOLDER);
+          final INodeFile lastINode = iip.getLastINode().asFile();
+          if (fsnamesystem.isFileDeleted(lastINode)) {
+            // INode referred by the lease could have been deleted.
+            removeLease(lastINode.getId());
+            continue;
+          }
+          boolean completed = false;
+          try {
+            completed = fsnamesystem.internalReleaseLease(
+                leaseToCheck, p, iip, newHolder);
+          } catch (IOException e) {
+            LOG.warn("Cannot release the path " + p + " in the lease "
+                + leaseToCheck + ". It will be retried.", e);
+            continue;
+          }
           if (LOG.isDebugEnabled()) {
             if (completed) {
               LOG.debug("Lease recovery for inode " + id + " is complete. " +
@@ -391,9 +485,14 @@ public class LeaseManager {
             needSync = true;
           }
         } catch (IOException e) {
-          LOG.error("Cannot release the path " + p + " in the lease "
+          LOG.warn("Removing lease with an invalid path: " + p + ","
               + leaseToCheck, e);
           removing.add(id);
+        }
+        if (isMaxLockHoldToReleaseLease(start)) {
+          LOG.debug("Breaking out of checkLeases after " +
+              fsnamesystem.getMaxLockHoldToReleaseLeaseMs() + "ms.");
+          break;
         }
       }
 
@@ -403,6 +502,13 @@ public class LeaseManager {
     }
 
     return needSync;
+  }
+
+
+  /** @return true if max lock hold is reached */
+  private boolean isMaxLockHoldToReleaseLease(long start) {
+    return monotonicNow() - start >
+        fsnamesystem.getMaxLockHoldToReleaseLeaseMs();
   }
 
   @Override

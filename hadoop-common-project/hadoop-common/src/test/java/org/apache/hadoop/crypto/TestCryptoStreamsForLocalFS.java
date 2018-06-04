@@ -30,6 +30,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -38,8 +39,8 @@ import org.junit.Ignore;
 import org.junit.Test;
 
 public class TestCryptoStreamsForLocalFS extends CryptoStreamsTestBase {
-  private static final String TEST_ROOT_DIR
-    = System.getProperty("test.build.data","build/test/data") + "/work-dir/localfs";
+  private static final String TEST_ROOT_DIR =
+      GenericTestUtils.getTempPath("work-dir/testcryptostreamsforlocalfs");
 
   private final File base = new File(TEST_ROOT_DIR);
   private final Path file = new Path(TEST_ROOT_DIR, "test-file");
@@ -87,28 +88,28 @@ public class TestCryptoStreamsForLocalFS extends CryptoStreamsTestBase {
   
   @Ignore("ChecksumFSInputChecker doesn't support ByteBuffer read")
   @Override
-  @Test(timeout=1000)
+  @Test(timeout=10000)
   public void testByteBufferRead() throws Exception {}
   
   @Ignore("ChecksumFSOutputSummer doesn't support Syncable")
   @Override
-  @Test(timeout=1000)
+  @Test(timeout=10000)
   public void testSyncable() throws IOException {}
   
   @Ignore("ChecksumFSInputChecker doesn't support ByteBuffer read")
   @Override
-  @Test(timeout=1000)
+  @Test(timeout=10000)
   public void testCombinedOp() throws Exception {}
   
   @Ignore("ChecksumFSInputChecker doesn't support enhanced ByteBuffer access")
   @Override
-  @Test(timeout=1000)
+  @Test(timeout=10000)
   public void testHasEnhancedByteBufferAccess() throws Exception {
   }
   
   @Ignore("ChecksumFSInputChecker doesn't support seekToNewSource")
   @Override
-  @Test(timeout=1000)
+  @Test(timeout=10000)
   public void testSeekToNewSource() throws Exception {
   }
 }

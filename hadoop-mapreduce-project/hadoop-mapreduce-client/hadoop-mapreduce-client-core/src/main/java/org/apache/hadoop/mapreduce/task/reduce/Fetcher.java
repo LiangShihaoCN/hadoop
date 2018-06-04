@@ -263,7 +263,7 @@ class Fetcher<K,V> extends Thread {
     DataInputStream input = null;
 
     try {
-      setupConnectionsWithRetry(host, remaining, url);
+      setupConnectionsWithRetry(url);
       if (stopped) {
         abortConnect(host, remaining);
       } else {
@@ -280,11 +280,6 @@ class Fetcher<K,V> extends Thread {
       scheduler.hostFailed(host.getHostName());
       for(TaskAttemptID left: remaining) {
         scheduler.copyFailed(left, host, false, connectExcpt);
-      }
-
-      // Add back all the remaining maps, WITHOUT marking them as failed
-      for(TaskAttemptID left: remaining) {
-        scheduler.putBackKnownMapOutput(host, left);
       }
     }
 
@@ -320,12 +315,14 @@ class Fetcher<K,V> extends Thread {
     
     // Construct the url and connect
     URL url = getMapOutputURL(host, maps);
-    DataInputStream input = openShuffleUrl(host, remaining, url);
-    if (input == null) {
-      return;
-    }
+    DataInputStream input = null;
     
     try {
+      input = openShuffleUrl(host, remaining, url);
+      if (input == null) {
+        return;
+      }
+
       // Loop through available map-outputs and fetch them
       // On any error, faildTasks is not null and we exit
       // after putting back the remaining maps to the 
@@ -374,9 +371,8 @@ class Fetcher<K,V> extends Thread {
     }
   }
 
-  private void setupConnectionsWithRetry(MapHost host,
-      Set<TaskAttemptID> remaining, URL url) throws IOException {
-    openConnectionWithRetry(host, remaining, url);
+  private void setupConnectionsWithRetry(URL url) throws IOException {
+    openConnectionWithRetry(url);
     if (stopped) {
       return;
     }
@@ -396,8 +392,7 @@ class Fetcher<K,V> extends Thread {
     verifyConnection(url, msgToEncode, encHash);
   }
 
-  private void openConnectionWithRetry(MapHost host,
-      Set<TaskAttemptID> remaining, URL url) throws IOException {
+  private void openConnectionWithRetry(URL url) throws IOException {
     long startTime = Time.monotonicNow();
     boolean shouldWait = true;
     while (shouldWait) {
@@ -537,7 +532,7 @@ class Fetcher<K,V> extends Thread {
             + " len: " + compressedLength + " to " + mapOutput.getDescription());
         mapOutput.shuffle(host, is, compressedLength, decompressedLength,
             metrics, reporter);
-      } catch (java.lang.InternalError e) {
+      } catch (java.lang.InternalError | Exception e) {
         LOG.warn("Failed to shuffle for fetcher#"+id, e);
         throw new IOException(e);
       }

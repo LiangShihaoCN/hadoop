@@ -62,13 +62,13 @@ public interface FsVolumeSpi {
   boolean isTransientStorage();
 
   /**
-   * Reserve disk space for an RBW block so a writer does not run out of
-   * space before the block is full.
+   * Reserve disk space for a block (RBW or Re-replicating)
+   * so a writer does not run out of space before the block is full.
    */
-  void reserveSpaceForRbw(long bytesToReserve);
+  void reserveSpaceForReplica(long bytesToReserve);
 
   /**
-   * Release disk space previously reserved for RBW block.
+   * Release disk space previously reserved for block opened for write.
    */
   void releaseReservedSpace(long bytesToRelease);
 
@@ -186,4 +186,15 @@ public interface FsVolumeSpi {
    * Get the FSDatasetSpi which this volume is a part of.
    */
   FsDatasetSpi getDataset();
+
+  /**
+   * Load last partial chunk checksum from checksum file.
+   * Need to be called with FsDataset lock acquired.
+   * @param blockFile
+   * @param metaFile
+   * @return the last partial checksum
+   * @throws IOException
+   */
+  byte[] loadLastPartialChunkChecksum(File blockFile, File metaFile)
+      throws IOException;
 }

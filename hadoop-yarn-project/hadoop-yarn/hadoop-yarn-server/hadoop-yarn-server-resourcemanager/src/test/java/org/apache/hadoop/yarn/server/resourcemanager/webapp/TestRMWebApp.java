@@ -28,6 +28,7 @@ import static org.mockito.Mockito.when;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 
 import org.apache.hadoop.conf.Configuration;
@@ -51,6 +52,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
 import org.apache.hadoop.yarn.server.resourcemanager.applicationsmanager.MockAsm;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.NullRMNodeLabelsManager;
+import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
@@ -119,6 +121,10 @@ public class TestRMWebApp {
         YarnApplicationState.RUNNING.toString()));
     rmViewInstance.render();
     WebAppTests.flushOutput(injector);
+    Map<String, String> moreParams =
+        rmViewInstance.context().requestContext().moreParams();
+    String appsTableColumnsMeta = moreParams.get("ui.dataTables.apps.init");
+    Assert.assertTrue(appsTableColumnsMeta.indexOf("natural") != -1);
   }
 
   @Test public void testNodesPage() {
@@ -223,12 +229,15 @@ public class TestRMWebApp {
     setupQueueConfiguration(conf);
 
     CapacityScheduler cs = new CapacityScheduler();
-    cs.setConf(new YarnConfiguration());
+    YarnConfiguration yarnConf = new YarnConfiguration();
+    cs.setConf(yarnConf);
     RMContext rmContext = new RMContextImpl(null, null, null, null, null,
         null, new RMContainerTokenSecretManager(conf),
         new NMTokenSecretManagerInRM(conf),
         new ClientToAMTokenSecretManagerInRM(), null);
-    rmContext.setNodeLabelManager(new NullRMNodeLabelsManager());
+    RMNodeLabelsManager labelManager = new NullRMNodeLabelsManager();
+    labelManager.init(yarnConf);
+    rmContext.setNodeLabelManager(labelManager);
     cs.setRMContext(rmContext);
     cs.init(conf);
     return cs;

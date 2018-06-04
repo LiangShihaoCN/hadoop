@@ -24,21 +24,21 @@ import static org.junit.Assert.assertTrue;
 
 public class TestResources {
   
-  public Resource createResource(int memory, int vCores) {
+  public Resource createResource(long memory, int vCores) {
     return Resource.newInstance(memory, vCores);
   }
 
-  @Test(timeout=1000)
+  @Test(timeout=10000)
   public void testCompareToWithUnboundedResource() {
     assertTrue(Resources.unbounded().compareTo(
-            createResource(Integer.MAX_VALUE, Integer.MAX_VALUE)) == 0);
+            createResource(Long.MAX_VALUE, Integer.MAX_VALUE)) == 0);
     assertTrue(Resources.unbounded().compareTo(
-        createResource(Integer.MAX_VALUE, 0)) > 0);
+        createResource(Long.MAX_VALUE, 0)) > 0);
     assertTrue(Resources.unbounded().compareTo(
         createResource(0, Integer.MAX_VALUE)) > 0);
   }
 
-  @Test(timeout=1000)
+  @Test(timeout=10000)
   public void testCompareToWithNoneResource() {
     assertTrue(Resources.none().compareTo(createResource(0, 0)) == 0);
     assertTrue(Resources.none().compareTo(
@@ -46,5 +46,4 @@ public class TestResources {
     assertTrue(Resources.none().compareTo(
         createResource(0, 1)) < 0);
   }
-  
 }

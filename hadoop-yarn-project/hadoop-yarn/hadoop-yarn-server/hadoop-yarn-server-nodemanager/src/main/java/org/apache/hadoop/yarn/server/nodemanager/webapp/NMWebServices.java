@@ -21,6 +21,9 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
 import java.util.Map.Entry;
 
 import javax.servlet.http.HttpServletRequest;
@@ -36,7 +39,7 @@ import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status;
 import javax.ws.rs.core.StreamingOutput;
 import javax.ws.rs.core.UriInfo;
-
+import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.classification.InterfaceAudience.Public;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
@@ -58,6 +61,7 @@ import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.webapp.BadRequestException;
 import org.apache.hadoop.yarn.webapp.NotFoundException;
 import org.apache.hadoop.yarn.webapp.WebApp;
+import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
 
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -129,7 +133,7 @@ public class NMWebServices {
           String msg = "Error: You must specify a non-empty string for the user";
           throw new BadRequestException(msg);
         }
-        if (!appInfo.getUser().toString().equals(userQuery)) {
+        if (!appInfo.getUser().equals(userQuery)) {
           continue;
         }
       }
@@ -143,10 +147,7 @@ public class NMWebServices {
   @Produces({ MediaType.APPLICATION_JSON, MediaType.APPLICATION_XML })
   public AppInfo getNodeApp(@PathParam("appid") String appId) {
     init();
-    ApplicationId id = ConverterUtils.toApplicationId(recordFactory, appId);
-    if (id == null) {
-      throw new NotFoundException("app with id " + appId + " not found");
-    }
+    ApplicationId id = WebAppUtils.parseApplicationId(recordFactory, appId);
     Application app = this.nmContext.getApplications().get(id);
     if (app == null) {
       throw new NotFoundException("app with id " + appId + " not found");
@@ -158,7 +159,8 @@ public class NMWebServices {
   @GET
   @Path("/containers")
   @Produces({ MediaType.APPLICATION_JSON, MediaType.APPLICATION_XML })
-  public ContainersInfo getNodeContainers() {
+  public ContainersInfo getNodeContainers(@javax.ws.rs.core.Context
+      HttpServletRequest hsr) {
     init();
     ContainersInfo allContainers = new ContainersInfo();
     for (Entry<ContainerId, Container> entry : this.nmContext.getContainers()
@@ -168,7 +170,7 @@ public class NMWebServices {
         continue;
       }
       ContainerInfo info = new ContainerInfo(this.nmContext, entry.getValue(),
-          uriInfo.getBaseUri().toString(), webapp.name());
+          uriInfo.getBaseUri().toString(), webapp.name(), hsr.getRemoteUser());
       allContainers.add(info);
     }
     return allContainers;
@@ -177,11 +179,12 @@ public class NMWebServices {
   @GET
   @Path("/containers/{containerid}")
   @Produces({ MediaType.APPLICATION_JSON, MediaType.APPLICATION_XML })
-  public ContainerInfo getNodeContainer(@PathParam("containerid") String id) {
+  public ContainerInfo getNodeContainer(@javax.ws.rs.core.Context
+      HttpServletRequest hsr, @PathParam("containerid") String id) {
     ContainerId containerId = null;
     init();
     try {
-      containerId = ConverterUtils.toContainerId(id);
+      containerId = ContainerId.fromString(id);
     } catch (Exception e) {
       throw new BadRequestException("invalid container id, " + id);
     }
@@ -191,7 +194,7 @@ public class NMWebServices {
       throw new NotFoundException("container with id, " + id + ", not found");
     }
     return new ContainerInfo(this.nmContext, container, uriInfo.getBaseUri()
-        .toString(), webapp.name());
+        .toString(), webapp.name(), hsr.getRemoteUser());
 
   }
   
@@ -218,7 +221,7 @@ public class NMWebServices {
       @PathParam("filename") String filename) {
     ContainerId containerId;
     try {
-      containerId = ConverterUtils.toContainerId(containerIdStr);
+      containerId = ContainerId.fromString(containerIdStr);
     } catch (IllegalArgumentException ex) {
       return Response.status(Status.BAD_REQUEST).build();
     }
@@ -236,18 +239,25 @@ public class NMWebServices {
     try {
       final FileInputStream fis = ContainerLogsUtils.openLogFileForRead(
           containerIdStr, logFile, nmContext);
-      
+      final FileChannel inputChannel = fis.getChannel();
       StreamingOutput stream = new StreamingOutput() {
         @Override
         public void write(OutputStream os) throws IOException,
             WebApplicationException {
-          int bufferSize = 65536;
-          byte[] buf = new byte[bufferSize];
-          int len;
-          while ((len = fis.read(buf, 0, bufferSize)) > 0) {
-            os.write(buf, 0, len);
+          WritableByteChannel outputChannel = Channels.newChannel(os);
+          try {
+            long remaining = inputChannel.size();
+            long position = 0;
+            while (remaining > 0) {
+              long transferred =
+                  inputChannel.transferTo(position, remaining, outputChannel);
+              remaining -= transferred;
+              position += transferred;
+            }
+            os.flush();
+          } finally {
+            IOUtils.closeQuietly(fis);
           }
-          os.flush();
         }
       };
       

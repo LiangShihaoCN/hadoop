@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.rmcontainer;
 
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -45,16 +46,19 @@ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppRunningOnNodeEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
-import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.event.RMAppAttemptContainerAllocatedEvent;
+import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.event.RMAppAttemptContainerFinishedEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeCleanContainerEvent;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.ContainerRescheduledEvent;
+import org.apache.hadoop.yarn.server.resourcemanager.rmnode
+    .RMNodeDecreaseContainerEvent;
 import org.apache.hadoop.yarn.state.InvalidStateTransitionException;
 import org.apache.hadoop.yarn.state.MultipleArcTransition;
 import org.apache.hadoop.yarn.state.SingleArcTransition;
 import org.apache.hadoop.yarn.state.StateMachine;
 import org.apache.hadoop.yarn.state.StateMachineFactory;
 import org.apache.hadoop.yarn.util.ConverterUtils;
+import org.apache.hadoop.yarn.util.resource.Resources;
 import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
 
 @SuppressWarnings({"unchecked", "rawtypes"})
@@ -96,7 +100,7 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
     .addTransition(RMContainerState.ALLOCATED, RMContainerState.EXPIRED,
         RMContainerEventType.EXPIRE, new FinishedTransition())
     .addTransition(RMContainerState.ALLOCATED, RMContainerState.KILLED,
-        RMContainerEventType.KILL, new ContainerRescheduledTransition())
+        RMContainerEventType.KILL, new FinishedTransition())
 
     // Transitions from ACQUIRED state
     .addTransition(RMContainerState.ACQUIRED, RMContainerState.RUNNING,
@@ -118,7 +122,15 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
     .addTransition(RMContainerState.RUNNING, RMContainerState.RELEASED,
         RMContainerEventType.RELEASED, new KillTransition())
     .addTransition(RMContainerState.RUNNING, RMContainerState.RUNNING,
-        RMContainerEventType.EXPIRE)
+        RMContainerEventType.RESERVED, new ContainerReservedTransition())
+    .addTransition(RMContainerState.RUNNING, RMContainerState.RUNNING,
+        RMContainerEventType.CHANGE_RESOURCE, new ChangeResourceTransition())
+    .addTransition(RMContainerState.RUNNING, RMContainerState.RUNNING,
+        RMContainerEventType.ACQUIRE_UPDATED_CONTAINER, 
+        new ContainerAcquiredWhileRunningTransition())
+    .addTransition(RMContainerState.RUNNING, RMContainerState.RUNNING,
+        RMContainerEventType.NM_DONE_CHANGE_RESOURCE, 
+        new NMReportedContainerChangeIsDoneTransition())
 
     // Transitions from COMPLETED state
     .addTransition(RMContainerState.COMPLETED, RMContainerState.COMPLETED,
@@ -140,9 +152,7 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
             RMContainerEventType.KILL, RMContainerEventType.FINISHED))
 
     // create the topology tables
-    .installTopology(); 
-                        
-                        
+    .installTopology();
 
   private final StateMachine<RMContainerState, RMContainerEventType,
                                                  RMContainerEvent> stateMachine;
@@ -166,7 +176,13 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
   private ContainerStatus finishedStatus;
   private boolean isAMContainer;
   private List<ResourceRequest> resourceRequests;
-  
+
+  private volatile boolean hasIncreaseReservation = false;
+  // Only used for container resource increase and decrease. This is the
+  // resource to rollback to should container resource increase token expires.
+  private Resource lastConfirmedResource;
+  private volatile String queueName;
+
   public RMContainerImpl(Container container,
       ApplicationAttemptId appAttemptId, NodeId nodeId, String user,
       RMContext rmContext) {
@@ -199,6 +215,7 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
     this.isAMContainer = false;
     this.resourceRequests = null;
     this.nodeLabelExpression = nodeLabelExpression;
+    this.lastConfirmedResource = container.getResource();
 
     ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     this.readLock = lock.readLock();
@@ -264,7 +281,22 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
 
   @Override
   public Resource getAllocatedResource() {
-    return container.getResource();
+    try {
+      readLock.lock();
+      return container.getResource();
+    } finally {
+      readLock.unlock();
+    }
+  }
+
+  @Override
+  public Resource getLastConfirmedResource() {
+    try {
+      readLock.lock();
+      return this.lastConfirmedResource;
+    } finally {
+      readLock.unlock();
+    }
   }
 
   @Override
@@ -314,7 +346,7 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
       logURL.append(WebAppUtils.getHttpSchemePrefix(rmContext
           .getYarnConfiguration()));
       logURL.append(WebAppUtils.getRunningLogURL(
-          container.getNodeHttpAddress(), ConverterUtils.toString(containerId),
+          container.getNodeHttpAddress(), containerId.toString(),
           user));
       return logURL.toString();
     } finally {
@@ -471,8 +503,8 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
     }
   }
 
-  private static final class ContainerReservedTransition extends
-  BaseTransition {
+  private static final class ContainerReservedTransition
+      extends BaseTransition {
 
     @Override
     public void transition(RMContainerImpl container, RMContainerEvent event) {
@@ -480,6 +512,12 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
       container.reservedResource = e.getReservedResource();
       container.reservedNode = e.getReservedNode();
       container.reservedPriority = e.getReservedPriority();
+      
+      if (!EnumSet.of(RMContainerState.NEW, RMContainerState.RESERVED)
+          .contains(container.getState())) {
+        // When container's state != NEW/RESERVED, it is an increase reservation
+        container.hasIncreaseReservation = true;
+      }
     }
   }
 
@@ -489,8 +527,8 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
 
     @Override
     public void transition(RMContainerImpl container, RMContainerEvent event) {
-      container.eventHandler.handle(new RMAppAttemptContainerAllocatedEvent(
-          container.appAttemptId));
+      container.eventHandler.handle(new RMAppAttemptEvent(
+          container.appAttemptId, RMAppAttemptEventType.CONTAINER_ALLOCATED));
     }
   }
 
@@ -498,26 +536,127 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
 
     @Override
     public void transition(RMContainerImpl container, RMContainerEvent event) {
-      // Clear ResourceRequest stored in RMContainer
+      // Clear ResourceRequest stored in RMContainer, we don't need to remember
+      // this anymore.
       container.setResourceRequests(null);
       
       // Register with containerAllocationExpirer.
-      container.containerAllocationExpirer.register(container.getContainerId());
+      container.containerAllocationExpirer.register(
+          new AllocationExpirationInfo(container.getContainerId()));
 
       // Tell the app
       container.eventHandler.handle(new RMAppRunningOnNodeEvent(container
           .getApplicationAttemptId().getApplicationId(), container.nodeId));
     }
   }
-
-  private static final class ContainerRescheduledTransition extends
-      FinishedTransition {
+  
+  private static final class ContainerAcquiredWhileRunningTransition extends
+      BaseTransition {
 
     @Override
     public void transition(RMContainerImpl container, RMContainerEvent event) {
-      // Tell scheduler to recover request of this container to app
-      container.eventHandler.handle(new ContainerRescheduledEvent(container));
-      super.transition(container, event);
+      RMContainerUpdatesAcquiredEvent acquiredEvent =
+          (RMContainerUpdatesAcquiredEvent) event;
+      if (acquiredEvent.isIncreasedContainer()) {
+        // If container is increased but not acquired by AM, we will start
+        // containerAllocationExpirer for this container in this transition. 
+        container.containerAllocationExpirer.register(
+            new AllocationExpirationInfo(event.getContainerId(), true));
+      }
+    }
+  }
+  
+  private static final class NMReportedContainerChangeIsDoneTransition
+      extends BaseTransition {
+
+    @Override
+    public void transition(RMContainerImpl container, RMContainerEvent event) {
+      RMContainerNMDoneChangeResourceEvent nmDoneChangeResourceEvent =
+          (RMContainerNMDoneChangeResourceEvent)event;
+      Resource rmContainerResource = container.getAllocatedResource();
+      Resource nmContainerResource =
+          nmDoneChangeResourceEvent.getNMContainerResource();
+
+      if (Resources.equals(rmContainerResource, nmContainerResource)) {
+        // If rmContainerResource == nmContainerResource, the resource
+        // increase is confirmed.
+        // In this case:
+        //    - Set the lastConfirmedResource as nmContainerResource
+        //    - Unregister the allocation expirer
+        container.lastConfirmedResource = nmContainerResource;
+        container.containerAllocationExpirer.unregister(
+            new AllocationExpirationInfo(event.getContainerId()));
+      } else if (Resources.fitsIn(rmContainerResource, nmContainerResource)) {
+        // If rmContainerResource < nmContainerResource, this is caused by the
+        // following sequence:
+        //   1. AM asks for increase from 1G to 5G, and RM approves it
+        //   2. AM acquires the increase token and increases on NM
+        //   3. Before NM reports 5G to RM to confirm the increase, AM sends
+        //      a decrease request to 4G, and RM approves it
+        //   4. When NM reports 5G to RM, RM now sees its own allocation as 4G
+        // In this cases:
+        //    - Set the lastConfirmedResource as rmContainerResource
+        //    - Unregister the allocation expirer
+        //    - Notify NM to reduce its resource to rmContainerResource
+        container.lastConfirmedResource = rmContainerResource;
+        container.containerAllocationExpirer.unregister(
+            new AllocationExpirationInfo(event.getContainerId()));
+        container.eventHandler.handle(new RMNodeDecreaseContainerEvent(
+            container.nodeId,
+            Collections.singletonList(container.getContainer())));
+      } else if (Resources.fitsIn(nmContainerResource, rmContainerResource)) {
+        // If nmContainerResource < rmContainerResource, this is caused by the
+        // following sequence:
+        //    1. AM asks for increase from 1G to 2G, and RM approves it
+        //    2. AM asks for increase from 2G to 4G, and RM approves it
+        //    3. AM only uses the 2G token to increase on NM, but never uses the
+        //       4G token
+        //    4. NM reports 2G to RM, but RM sees its own allocation as 4G
+        // In this case:
+        //    - Set the lastConfirmedResource as the maximum of
+        //      nmContainerResource and lastConfirmedResource
+        //    - Do NOT unregister the allocation expirer
+        // When the increase allocation expires, resource will be rolled back to
+        // the last confirmed resource.
+        container.lastConfirmedResource = Resources.componentwiseMax(
+            nmContainerResource, container.lastConfirmedResource);
+      } else {
+        // Something wrong happened, kill the container
+        LOG.warn("Something wrong happened, container size reported by NM"
+            + " is not expected, ContainerID=" + container.containerId
+            + " rm-size-resource:" + rmContainerResource + " nm-size-reosurce:"
+            + nmContainerResource);
+        container.eventHandler.handle(new RMNodeCleanContainerEvent(
+            container.nodeId, container.containerId));
+
+      }
+    }
+  }
+  
+  private static final class ChangeResourceTransition extends BaseTransition {
+
+    @Override
+    public void transition(RMContainerImpl container, RMContainerEvent event) {
+      RMContainerChangeResourceEvent changeEvent = (RMContainerChangeResourceEvent)event;
+
+      Resource targetResource = changeEvent.getTargetResource();
+      Resource lastConfirmedResource = container.lastConfirmedResource;
+
+      if (!changeEvent.isIncrease()) {
+        // Only unregister from the containerAllocationExpirer when target
+        // resource is less than or equal to the last confirmed resource.
+        if (Resources.fitsIn(targetResource, lastConfirmedResource)) {
+          container.lastConfirmedResource = targetResource;
+          container.containerAllocationExpirer.unregister(
+              new AllocationExpirationInfo(event.getContainerId()));
+        }
+      }
+
+      container.container.setResource(targetResource);
+
+      // We reach here means we either allocated increase reservation OR
+      // decreased container, reservation will be cancelled anyway. 
+      container.hasIncreaseReservation = false;
     }
   }
 
@@ -561,20 +700,24 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
       RMAppAttempt rmAttempt = container.rmContext.getRMApps()
           .get(container.getApplicationAttemptId().getApplicationId())
           .getCurrentAppAttempt();
-      if (ContainerExitStatus.PREEMPTED == container.finishedStatus
-        .getExitStatus()) {
-        rmAttempt.getRMAppAttemptMetrics().updatePreemptionInfo(resource,
-          container);
-      }
 
       if (rmAttempt != null) {
         long usedMillis = container.finishTime - container.creationTime;
-        long memorySeconds = resource.getMemory()
+        long memorySeconds = resource.getMemorySize()
                               * usedMillis / DateUtils.MILLIS_PER_SECOND;
         long vcoreSeconds = resource.getVirtualCores()
                              * usedMillis / DateUtils.MILLIS_PER_SECOND;
         rmAttempt.getRMAppAttemptMetrics()
                   .updateAggregateAppResourceUsage(memorySeconds,vcoreSeconds);
+        // If this is a preempted container, update preemption metrics
+        if (ContainerExitStatus.PREEMPTED == container.finishedStatus
+                .getExitStatus()) {
+          rmAttempt.getRMAppAttemptMetrics().updatePreemptionInfo(resource,
+                  container);
+          rmAttempt.getRMAppAttemptMetrics()
+                  .updateAggregatePreemptedAppResourceUsage(memorySeconds,
+                          vcoreSeconds);
+        }
       }
     }
   }
@@ -585,8 +728,8 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
     public void transition(RMContainerImpl container, RMContainerEvent event) {
 
       // Unregister from containerAllocationExpirer.
-      container.containerAllocationExpirer.unregister(container
-          .getContainerId());
+      container.containerAllocationExpirer.unregister(
+          new AllocationExpirationInfo(container.getContainerId()));
 
       // Inform node
       container.eventHandler.handle(new RMNodeCleanContainerEvent(
@@ -664,5 +807,24 @@ public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
       return containerId.compareTo(o.getContainerId());
     }
     return -1;
+  }
+
+  @Override
+  public boolean hasIncreaseReservation() {
+    return hasIncreaseReservation;
+  }
+
+  @Override
+  public void cancelIncreaseReservation() {
+    hasIncreaseReservation = false;
+  }
+
+  public void setQueueName(String queueName) {
+    this.queueName = queueName;
+  }
+
+  @Override
+  public String getQueueName() {
+    return queueName;
   }
 }

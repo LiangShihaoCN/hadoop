@@ -49,10 +49,10 @@ public interface MRJobConfig {
 
   public static final String TASK_CLEANUP_NEEDED = "mapreduce.job.committer.task.cleanup.needed";
 
-  public static final String TASK_PROGRESS_REPORT_INTERVAL =
-      "mapreduce.task.progress-report.interval";
-  /** The number of milliseconds between progress reports. */
-  public static final int DEFAULT_TASK_PROGRESS_REPORT_INTERVAL = 3000;
+  public static final String TASK_LOCAL_WRITE_LIMIT_BYTES =
+          "mapreduce.task.local-fs.write-limit.bytes";
+  // negative values disable the limit
+  public static final long DEFAULT_TASK_LOCAL_WRITE_LIMIT_BYTES = -1;
 
   public static final String JAR = "mapreduce.job.jar";
 
@@ -250,6 +250,10 @@ public interface MRJobConfig {
   public static final String TASK_REDUCE_PROFILE_PARAMS = "mapreduce.task.profile.reduce.params";
   
   public static final String TASK_TIMEOUT = "mapreduce.task.timeout";
+  long DEFAULT_TASK_TIMEOUT_MILLIS = 5 * 60 * 1000L;
+
+  String TASK_PROGRESS_REPORT_INTERVAL =
+      "mapreduce.task.progress-report.interval";
 
   public static final String TASK_TIMEOUT_CHECK_INTERVAL_MS = "mapreduce.task.timeout.check-interval-ms";
 
@@ -408,7 +412,7 @@ public interface MRJobConfig {
   public static final String JOB_ACL_MODIFY_JOB = "mapreduce.job.acl-modify-job";
 
   public static final String DEFAULT_JOB_ACL_MODIFY_JOB = " ";
-  
+
   public static final String JOB_RUNNING_MAP_LIMIT =
       "mapreduce.job.running.map.limit";
   public static final int DEFAULT_JOB_RUNNING_MAP_LIMIT = 0;
@@ -703,10 +707,18 @@ public interface MRJobConfig {
       10 * 1000l;
 
   /**
-   * The threshold in terms of seconds after which an unsatisfied mapper request
-   * triggers reducer preemption to free space. Default 0 implies that the reduces
-   * should be preempted immediately after allocation if there is currently no
-   * room for newly allocated mappers.
+   * Duration to wait before forcibly preempting a reducer to allow
+   * allocating new mappers, even when YARN reports positive headroom.
+   */
+  public static final String MR_JOB_REDUCER_UNCONDITIONAL_PREEMPT_DELAY_SEC =
+      "mapreduce.job.reducer.unconditional-preempt.delay.sec";
+
+  public static final int
+      DEFAULT_MR_JOB_REDUCER_UNCONDITIONAL_PREEMPT_DELAY_SEC = 5 * 60;
+
+  /**
+   * Duration to wait before preempting a reducer, when there is no headroom
+   * to allocate new mappers.
    */
   public static final String MR_JOB_REDUCER_PREEMPT_DELAY_SEC =
       "mapreduce.job.reducer.preempt.delay.sec";
@@ -717,6 +729,16 @@ public interface MRJobConfig {
   
   public static final String MR_AM_ADMIN_USER_ENV =
       MR_AM_PREFIX + "admin.user.env";
+
+  // although the AM admin user env default should be the same as the task user
+  // env default, there are problems in making it work on Windows currently
+  // MAPREDUCE-6588 should address the issue and set it to a proper non-empty
+  // value
+  public static final String DEFAULT_MR_AM_ADMIN_USER_ENV =
+      Shell.WINDOWS ?
+          "" :
+          "LD_LIBRARY_PATH=" + Apps.crossPlatformify("HADOOP_COMMON_HOME") +
+              "/lib/native";
 
   public static final String MR_AM_PROFILE = MR_AM_PREFIX + "profile";
   public static final boolean DEFAULT_MR_AM_PROFILE = false;
@@ -741,10 +763,13 @@ public interface MRJobConfig {
   public static final String MAPRED_ADMIN_USER_ENV =
       "mapreduce.admin.user.env";
 
-  public final String DEFAULT_MAPRED_ADMIN_USER_ENV = 
-      Shell.WINDOWS ? 
-          "PATH=%PATH%;%HADOOP_COMMON_HOME%\\bin":
-          "LD_LIBRARY_PATH=$HADOOP_COMMON_HOME/lib/native";
+  // the "%...%" macros can be expanded prematurely and are probably not OK
+  // this should be addressed by MAPREDUCE-6588
+  public static final String DEFAULT_MAPRED_ADMIN_USER_ENV =
+      Shell.WINDOWS ?
+          "PATH=%PATH%;%HADOOP_COMMON_HOME%\\bin" :
+          "LD_LIBRARY_PATH=" + Apps.crossPlatformify("HADOOP_COMMON_HOME") +
+              "/lib/native";
 
   public static final String WORKDIR = "work";
 
@@ -916,4 +941,12 @@ public interface MRJobConfig {
   public static final int DEFAULT_MR_ENCRYPTED_INTERMEDIATE_DATA_BUFFER_KB =
           128;
 
+  /**
+   * A comma-separated list of properties whose value will be redacted.
+   */
+  String MR_JOB_REDACTED_PROPERTIES = "mapreduce.job.redacted-properties";
+
+  String FINISH_JOB_WHEN_REDUCERS_DONE =
+      "mapreduce.job.finish-when-all-reducers-done";
+  boolean DEFAULT_FINISH_JOB_WHEN_REDUCERS_DONE = false;
 }

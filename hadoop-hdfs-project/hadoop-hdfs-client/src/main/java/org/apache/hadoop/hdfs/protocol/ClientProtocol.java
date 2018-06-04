@@ -25,11 +25,13 @@ import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
 import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedEntries;
+import org.apache.hadoop.hdfs.AddBlockFlag;
 import org.apache.hadoop.fs.CacheFlag;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.Options;
+import org.apache.hadoop.fs.QuotaUsage;
 import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.fs.XAttr;
 import org.apache.hadoop.fs.XAttrSetFlag;
@@ -47,6 +49,7 @@ import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.retry.AtMostOnce;
 import org.apache.hadoop.io.retry.Idempotent;
+import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.KerberosInfo;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenInfo;
@@ -280,6 +283,19 @@ public interface ClientProtocol {
       throws IOException;
 
   /**
+   * Unset the storage policy set for a given file or directory.
+   * @param src Path of an existing file/directory.
+   * @throws SnapshotAccessControlException If access is denied
+   * @throws org.apache.hadoop.fs.UnresolvedLinkException if <code>src</code>
+   *           contains a symlink
+   * @throws java.io.FileNotFoundException If file/dir <code>src</code> is not
+   *           found
+   * @throws QuotaExceededException If changes violate the quota restriction
+   */
+  @Idempotent
+  void unsetStoragePolicy(String src) throws IOException;
+
+  /**
    * Get the storage policy for a file/directory.
    * @param path
    *          Path of an existing file/directory.
@@ -375,6 +391,8 @@ public interface ClientProtocol {
    * @param fileId the id uniquely identifying a file
    * @param favoredNodes the list of nodes where the client wants the blocks.
    *          Nodes are identified by either host name or address.
+   * @param addBlockFlags flags to advise the behavior of allocating and placing
+   *                      a new block.
    *
    * @return LocatedBlock allocated block information.
    *
@@ -393,7 +411,7 @@ public interface ClientProtocol {
   @Idempotent
   LocatedBlock addBlock(String src, String clientName,
       ExtendedBlock previous, DatanodeInfo[] excludeNodes, long fileId,
-      String[] favoredNodes)
+      String[] favoredNodes, EnumSet<AddBlockFlag> addBlockFlags)
       throws IOException;
 
   /**
@@ -711,10 +729,13 @@ public interface ClientProtocol {
   int GET_STATS_CORRUPT_BLOCKS_IDX = 4;
   int GET_STATS_MISSING_BLOCKS_IDX = 5;
   int GET_STATS_MISSING_REPL_ONE_BLOCKS_IDX = 6;
+  int GET_STATS_BYTES_IN_FUTURE_BLOCKS_IDX = 7;
+  int GET_STATS_PENDING_DELETION_BLOCKS_IDX = 8;
+  int STATS_ARRAY_LENGTH = 9;
 
   /**
    * Get a set of statistics about the filesystem.
-   * Right now, only seven values are returned.
+   * Right now, only eight values are returned.
    * <ul>
    * <li> [0] contains the total storage capacity of the system, in bytes.</li>
    * <li> [1] contains the total used space of the system, in bytes.</li>
@@ -724,6 +745,8 @@ public interface ClientProtocol {
    * <li> [5] contains number of blocks without any good replicas left. </li>
    * <li> [6] contains number of blocks which have replication factor
    *          1 and have lost the only replica. </li>
+   * <li> [7] contains number of bytes  that are at risk for deletion. </li>
+   * <li> [8] contains number of pending deletion blocks. </li>
    * </ul>
    * Use public constants like {@link #GET_STATS_CAPACITY_IDX} in place of
    * actual numbers to index into the array.
@@ -1478,4 +1501,29 @@ public interface ClientProtocol {
    */
   @Idempotent
   EventBatchList getEditsFromTxid(long txid) throws IOException;
+
+  /**
+   * Get {@link QuotaUsage} rooted at the specified directory.
+   * @param path The string representation of the path
+   *
+   * @throws AccessControlException permission denied
+   * @throws java.io.FileNotFoundException file <code>path</code> is not found
+   * @throws org.apache.hadoop.fs.UnresolvedLinkException if <code>path</code>
+   *         contains a symlink.
+   * @throws IOException If an I/O error occurred
+   */
+  @Idempotent
+  QuotaUsage getQuotaUsage(String path) throws IOException;
+
+  /**
+   * List open files in the system in batches. INode id is the cursor and the
+   * open files returned in a batch will have their INode ids greater than
+   * the cursor INode id. Open files can only be requested by super user and
+   * the the list across batches are not atomic.
+   *
+   * @param prevId the cursor INode id.
+   * @throws IOException
+   */
+  @Idempotent
+  BatchedEntries<OpenFileEntry> listOpenFiles(long prevId) throws IOException;
 }

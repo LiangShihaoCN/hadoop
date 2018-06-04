@@ -63,6 +63,7 @@ public class TestComputeInvalidateWork {
     namesystem = cluster.getNamesystem();
     bm = namesystem.getBlockManager();
     nodes = bm.getDatanodeManager().getHeartbeatManager().getDatanodes();
+    BlockManagerTestUtil.stopReplicationThread(bm);
     assertEquals(nodes.length, NUM_OF_DATANODES);
   }
 
@@ -70,6 +71,7 @@ public class TestComputeInvalidateWork {
   public void teardown() throws Exception {
     if (cluster != null) {
       cluster.shutdown();
+      cluster = null;
     }
   }
 
@@ -145,6 +147,7 @@ public class TestComputeInvalidateWork {
     // Create a file and shutdown the DNs, which populates InvalidateBlocks
     DFSTestUtil.createFile(dfs, path, dfs.getDefaultBlockSize(),
         (short) NUM_OF_DATANODES, 0xED0ED0);
+    DFSTestUtil.waitForReplication(dfs, path, (short) NUM_OF_DATANODES, 12000);
     for (DataNode dn : cluster.getDataNodes()) {
       dn.shutdown();
     }

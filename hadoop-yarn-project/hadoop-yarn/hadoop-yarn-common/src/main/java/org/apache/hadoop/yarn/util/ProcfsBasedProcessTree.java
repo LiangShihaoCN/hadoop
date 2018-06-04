@@ -57,10 +57,10 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
 
   private static final String PROCFS = "/proc/";
 
-  private static final Pattern PROCFS_STAT_FILE_FORMAT = Pattern .compile(
-    "^([0-9-]+)\\s([^\\s]+)\\s[^\\s]\\s([0-9-]+)\\s([0-9-]+)\\s([0-9-]+)\\s" +
-    "([0-9-]+\\s){7}([0-9]+)\\s([0-9]+)\\s([0-9-]+\\s){7}([0-9]+)\\s([0-9]+)" +
-    "(\\s[0-9-]+){15}");
+  private static final Pattern PROCFS_STAT_FILE_FORMAT = Pattern.compile(
+      "^([\\d-]+)\\s\\(([^)]+)\\)\\s[^\\s]\\s([\\d-]+)\\s([\\d-]+)\\s" +
+      "([\\d-]+)\\s([\\d-]+\\s){7}(\\d+)\\s(\\d+)\\s([\\d-]+\\s){7}(\\d+)\\s" +
+      "(\\d+)(\\s[\\d-]+){15}");
 
   public static final String PROCFS_STAT_FILE = "stat";
   public static final String PROCFS_CMDLINE_FILE = "cmdline";
@@ -216,7 +216,16 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
         String pID = entry.getKey();
         if (!pID.equals("1")) {
           ProcessInfo pInfo = entry.getValue();
-          ProcessInfo parentPInfo = allProcessInfo.get(pInfo.getPpid());
+          String ppid = pInfo.getPpid();
+          // If parent is init and process is not session leader,
+          // attach to sessionID
+          if (ppid.equals("1")) {
+              String sid = pInfo.getSessionId().toString();
+              if (!pID.equals(sid)) {
+                 ppid = sid;
+              }
+          }
+          ProcessInfo parentPInfo = allProcessInfo.get(ppid);
           if (parentPInfo != null) {
             parentPInfo.addChild(pInfo);
           }
@@ -530,8 +539,9 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
       Matcher m = PROCFS_STAT_FILE_FORMAT.matcher(str);
       boolean mat = m.find();
       if (mat) {
+        String processName = "(" + m.group(2) + ")";
         // Set (name) (ppid) (pgrpId) (session) (utime) (stime) (vsize) (rss)
-        pinfo.updateProcessInfo(m.group(2), m.group(3),
+        pinfo.updateProcessInfo(processName, m.group(3),
                 Integer.parseInt(m.group(4)), Integer.parseInt(m.group(5)),
                 Long.parseLong(m.group(7)), new BigInteger(m.group(8)),
                 Long.parseLong(m.group(10)), Long.parseLong(m.group(11)));
@@ -571,6 +581,14 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
       pTree.append(" ");
     }
     return pTree.substring(0, pTree.length()) + "]";
+  }
+
+/**
+ * Returns boolean indicating whether pid
+ * is in process tree.
+ */
+  public boolean contains(String pid) {
+    return processTree.containsKey(pid);
   }
 
   /**

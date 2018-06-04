@@ -18,9 +18,13 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
 
+import static org.junit.Assert.assertEquals;
+
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
@@ -37,6 +41,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.NullRMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
+import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemoryRMStateStore;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
@@ -45,6 +50,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppReport;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNode;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNodeReport;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.YarnScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerApp;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAttemptRemovedSchedulerEvent;
@@ -81,18 +87,20 @@ public class TestNodeLabelContainerAllocation {
     conf.setQueues(CapacitySchedulerConfiguration.ROOT, new String[] {"a", "b", "c"});
     conf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT, "x", 100);
     conf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT, "y", 100);
+    conf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT, "z", 100);
 
     final String A = CapacitySchedulerConfiguration.ROOT + ".a";
     conf.setCapacity(A, 10);
     conf.setMaximumCapacity(A, 15);
     conf.setAccessibleNodeLabels(A, toSet("x"));
     conf.setCapacityByLabel(A, "x", 100);
-    
+
     final String B = CapacitySchedulerConfiguration.ROOT + ".b";
     conf.setCapacity(B, 20);
-    conf.setAccessibleNodeLabels(B, toSet("y"));
+    conf.setAccessibleNodeLabels(B, toSet("y", "z"));
     conf.setCapacityByLabel(B, "y", 100);
-    
+    conf.setCapacityByLabel(B, "z", 100);
+
     final String C = CapacitySchedulerConfiguration.ROOT + ".c";
     conf.setCapacity(C, 70);
     conf.setMaximumCapacity(C, 70);
@@ -110,6 +118,7 @@ public class TestNodeLabelContainerAllocation {
     conf.setCapacity(B1, 100);
     conf.setMaximumCapacity(B1, 100);
     conf.setCapacityByLabel(B1, "y", 100);
+    conf.setCapacityByLabel(B1, "z", 100);
 
     final String C1 = C + ".c1";
     conf.setQueues(C, new String[] {"c1"});
@@ -456,7 +465,84 @@ public class TestNodeLabelContainerAllocation {
 
     rm1.close();
   }
-  
+
+  @Test (timeout = 120000)
+  public void testContainerReservationWithLabels() throws Exception {
+    // This test is pretty much similar to testContainerAllocateWithLabel.
+    // Difference is, this test doesn't specify label expression in
+    // ResourceRequest,
+    // instead, it uses default queue label expression
+
+    // set node -> label
+    mgr.addToCluserNodeLabelsWithDefaultExclusivity(ImmutableSet.of("x", "y",
+        "z"));
+    mgr.addLabelsToNode(ImmutableMap.of(NodeId.newInstance("h1", 0),
+        toSet("x"), NodeId.newInstance("h2", 0), toSet("y"),
+        NodeId.newInstance("h3", 0), toSet("x")));
+
+    // inject node label manager
+    MockRM rm1 = new MockRM(
+        TestUtils.getConfigurationWithDefaultQueueLabels(conf)) {
+      @Override
+      public RMNodeLabelsManager createNodeLabelManager() {
+        return mgr;
+      }
+    };
+
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1 = rm1.registerNode("h1:1234", 8 * GB); // label = x
+    rm1.registerNode("h2:1234", 8 * GB); // label = y
+    rm1.registerNode("h3:1234", 8 * GB); // label = x
+
+    ContainerId containerId;
+
+    // launch an app to queue a1 (label = x), and check all container will
+    // be allocated in h1
+    RMApp app1 = rm1.submitApp(1 * GB, "app", "user", null, "a1");
+    MockAM am1 = MockRM.launchAndRegisterAM(app1, rm1, nm1);
+
+    // request a container.
+    am1.allocate("*", 4 * GB, 2, new ArrayList<ContainerId>());
+    containerId = ContainerId.newContainerId(am1.getApplicationAttemptId(), 2);
+
+    CapacityScheduler cs = (CapacityScheduler) rm1.getResourceScheduler();
+    RMNode rmNode1 = rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    LeafQueue leafQueue = (LeafQueue) cs.getQueue("a1");
+
+    // Do node heartbeats 2 times
+    // First time will allocate container for app1, second time will reserve
+    // container for app1
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    checkTaskContainersHost(am1.getApplicationAttemptId(), containerId, rm1,
+        "h1");
+
+    // Check if a 4G container allocated for app1, and 4G is reserved
+    FiCaSchedulerApp schedulerApp1 = cs.getApplicationAttempt(am1
+        .getApplicationAttemptId());
+    Assert.assertEquals(2, schedulerApp1.getLiveContainers().size());
+    Assert.assertTrue(schedulerApp1.getReservedContainers().size() > 0);
+    Assert.assertEquals(9 * GB, cs.getRootQueue().getQueueResourceUsage()
+        .getUsed("x").getMemorySize());
+    Assert.assertEquals(4 * GB, cs.getRootQueue().getQueueResourceUsage()
+        .getReserved("x").getMemorySize());
+    Assert.assertEquals(4 * GB,
+        leafQueue.getQueueResourceUsage().getReserved("x").getMemorySize());
+
+    // Cancel asks of app2 and re-kick RM
+    am1.allocate("*", 4 * GB, 0, new ArrayList<ContainerId>());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+
+    Assert.assertEquals(5 * GB, cs.getRootQueue().getQueueResourceUsage()
+        .getUsed("x").getMemorySize());
+    Assert.assertEquals(0, cs.getRootQueue().getQueueResourceUsage()
+        .getReserved("x").getMemorySize());
+    Assert.assertEquals(0, leafQueue.getQueueResourceUsage().getReserved("x")
+        .getMemorySize());
+    rm1.close();
+  }
+
   private void checkPendingResource(MockRM rm, int priority,
       ApplicationAttemptId attemptId, int memory) {
     CapacityScheduler cs = (CapacityScheduler) rm.getRMContext().getScheduler();
@@ -465,7 +551,7 @@ public class TestNodeLabelContainerAllocation {
         app.getAppSchedulingInfo().getResourceRequest(
             Priority.newInstance(priority), "*");
     Assert.assertEquals(memory,
-        rr.getCapability().getMemory() * rr.getNumContainers());
+        rr.getCapability().getMemorySize() * rr.getNumContainers());
   }
   
   private void checkLaunchedContainerNumOnNode(MockRM rm, NodeId nodeId,
@@ -474,7 +560,110 @@ public class TestNodeLabelContainerAllocation {
     SchedulerNode node = cs.getSchedulerNode(nodeId);
     Assert.assertEquals(numContainers, node.getNumContainers());
   }
-  
+
+  /**
+   * JIRA YARN-4140, In Resource request set node label will be set only on ANY
+   * reqest. RACK/NODE local and default requests label expression need to be
+   * updated. This testcase is to verify the label expression is getting changed
+   * based on ANY requests.
+   *
+   * @throws Exception
+   */
+  @Test
+  public void testResourceRequestUpdateNodePartitions() throws Exception {
+    // set node -> label
+    mgr.addToCluserNodeLabels(ImmutableSet.of(NodeLabel.newInstance("x"),
+        NodeLabel.newInstance("y", false), NodeLabel.newInstance("z", false)));
+    mgr.addLabelsToNode(ImmutableMap.of(NodeId.newInstance("h1", 0), toSet("y")));
+    // inject node label manager
+    MockRM rm1 = new MockRM(getConfigurationWithQueueLabels(conf)) {
+      @Override
+      public RMNodeLabelsManager createNodeLabelManager() {
+        return mgr;
+      }
+    };
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm2 = rm1.registerNode("h2:1234", 40 * GB); // label = y
+    // launch an app to queue b1 (label = y), AM container should be launched in
+    // nm2
+    RMApp app1 = rm1.submitApp(1 * GB, "app", "user", null, "b1");
+    MockAM am1 = MockRM.launchAndRegisterAM(app1, rm1, nm2);
+    // Creating request set when request before ANY is not having label and any
+    // is having label
+    List<ResourceRequest> resourceRequest = new ArrayList<ResourceRequest>();
+    resourceRequest.add(am1.createResourceReq("/default-rack", 1024, 3, 1,
+        RMNodeLabelsManager.NO_LABEL));
+    resourceRequest.add(am1.createResourceReq("*", 1024, 3, 5, "y"));
+    resourceRequest.add(am1.createResourceReq("h1:1234", 1024, 3, 2,
+        RMNodeLabelsManager.NO_LABEL));
+    resourceRequest.add(am1.createResourceReq("*", 1024, 2, 3, "y"));
+    resourceRequest.add(am1.createResourceReq("h2:1234", 1024, 2, 4, null));
+    resourceRequest.add(am1.createResourceReq("*", 1024, 4, 3, null));
+    resourceRequest.add(am1.createResourceReq("h2:1234", 1024, 4, 4, null));
+    am1.allocate(resourceRequest, new ArrayList<ContainerId>());
+    CapacityScheduler cs =
+        (CapacityScheduler) rm1.getRMContext().getScheduler();
+    FiCaSchedulerApp app =
+        cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    List<ResourceRequest> allResourceRequests =
+        app.getAppSchedulingInfo().getAllResourceRequests();
+    for (ResourceRequest changeReq : allResourceRequests) {
+      if (changeReq.getPriority().getPriority() == 2
+          || changeReq.getPriority().getPriority() == 3) {
+        Assert.assertEquals("Expected label y", "y",
+            changeReq.getNodeLabelExpression());
+      } else if (changeReq.getPriority().getPriority() == 4) {
+        Assert.assertEquals("Expected label EMPTY",
+            RMNodeLabelsManager.NO_LABEL, changeReq.getNodeLabelExpression());
+      }
+    }
+
+    // Previous any request was Y trying to update with z and the
+    // request before ANY label is null
+    List<ResourceRequest> newReq = new ArrayList<ResourceRequest>();
+    newReq.add(am1.createResourceReq("h2:1234", 1024, 3, 4, null));
+    newReq.add(am1.createResourceReq("*", 1024, 3, 5, "z"));
+    newReq.add(am1.createResourceReq("h1:1234", 1024, 3, 4, null));
+    newReq.add(am1.createResourceReq("*", 1024, 4, 5, "z"));
+    am1.allocate(newReq, new ArrayList<ContainerId>());
+    allResourceRequests = app.getAppSchedulingInfo().getAllResourceRequests();
+    for (ResourceRequest changeReq : allResourceRequests) {
+      if (changeReq.getPriority().getPriority() == 3
+          || changeReq.getPriority().getPriority() == 4) {
+        Assert.assertEquals("Expected label z", "z",
+            changeReq.getNodeLabelExpression());
+      } else if (changeReq.getPriority().getPriority() == 2) {
+        Assert.assertEquals("Expected label y", "y",
+            changeReq.getNodeLabelExpression());
+      }
+    }
+    // Request before ANY and ANY request is set as NULL. Request should be set
+    // with Empty Label
+    List<ResourceRequest> resourceRequest1 = new ArrayList<ResourceRequest>();
+    resourceRequest1.add(am1.createResourceReq("/default-rack", 1024, 3, 1,
+        null));
+    resourceRequest1.add(am1.createResourceReq("*", 1024, 3, 5, null));
+    resourceRequest1.add(am1.createResourceReq("h1:1234", 1024, 3, 2,
+        RMNodeLabelsManager.NO_LABEL));
+    resourceRequest1.add(am1.createResourceReq("/default-rack", 1024, 2, 1,
+        null));
+    resourceRequest1.add(am1.createResourceReq("*", 1024, 2, 3,
+        RMNodeLabelsManager.NO_LABEL));
+    resourceRequest1.add(am1.createResourceReq("h2:1234", 1024, 2, 4, null));
+    am1.allocate(resourceRequest1, new ArrayList<ContainerId>());
+    allResourceRequests = app.getAppSchedulingInfo().getAllResourceRequests();
+    for (ResourceRequest changeReq : allResourceRequests) {
+      if (changeReq.getPriority().getPriority() == 3) {
+        Assert.assertEquals("Expected label Empty",
+            RMNodeLabelsManager.NO_LABEL, changeReq.getNodeLabelExpression());
+      } else if (changeReq.getPriority().getPriority() == 2) {
+        Assert.assertEquals("Expected label y", RMNodeLabelsManager.NO_LABEL,
+            changeReq.getNodeLabelExpression());
+      }
+    }
+  }
+
   @Test
   public void testPreferenceOfNeedyAppsTowardsNodePartitions() throws Exception {
     /**
@@ -579,8 +768,6 @@ public class TestNodeLabelContainerAllocation {
     rm1.start();
     MockNM nm1 = rm1.registerNode("h1:1234", 8 * GB); // label = y
     MockNM nm2 = rm1.registerNode("h2:1234", 100 * GB); // label = <empty>
-    
-    ContainerId nextContainerId;
 
     // launch an app to queue b1 (label = y), AM container should be launched in nm3
     RMApp app1 = rm1.submitApp(1 * GB, "app", "user", null, "b1");
@@ -588,13 +775,14 @@ public class TestNodeLabelContainerAllocation {
     
     // request containers from am2, priority=1 asks for "" and priority=2 asks
     // for "y", "y" container should be allocated first
-    nextContainerId =
-        ContainerId.newContainerId(am1.getApplicationAttemptId(), 2);
     am1.allocate("*", 1 * GB, 1, 1, new ArrayList<ContainerId>(), "");
     am1.allocate("*", 1 * GB, 1, 2, new ArrayList<ContainerId>(), "y");
-    Assert.assertTrue(rm1.waitForState(nm1, nextContainerId,
-        RMContainerState.ALLOCATED, 10 * 1000));
-    
+
+    // Do a node heartbeat once
+    CapacityScheduler cs = (CapacityScheduler) rm1.getResourceScheduler();
+    cs.handle(new NodeUpdateSchedulerEvent(
+        rm1.getRMContext().getRMNodes().get(nm1.getNodeId())));
+
     // Check pending resource for am2, priority=1 doesn't get allocated before
     // priority=2 allocated
     checkPendingResource(rm1, 1, am1.getApplicationAttemptId(), 1 * GB);
@@ -920,10 +1108,11 @@ public class TestNodeLabelContainerAllocation {
 
     rm1.getRMContext().setNodeLabelManager(mgr);
     rm1.start();
-    MockNM nm1 = rm1.registerNode("h1:1234", 8 * GB); // label = x
+    String nodeIdStr = "h1:1234";
+    MockNM nm1 = rm1.registerNode(nodeIdStr, 8 * GB); // label = x
 
     // launch an app to queue b1 (label = y), AM container should be launched in nm3
-    rm1.submitApp(1 * GB, "app", "user", null, "b1");
+    RMApp app = rm1.submitApp(1 * GB, "app", "user", null, "b1");
    
     CapacityScheduler cs = (CapacityScheduler) rm1.getResourceScheduler();
     RMNode rmNode1 = rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
@@ -932,14 +1121,24 @@ public class TestNodeLabelContainerAllocation {
     for (int i = 0; i < 50; i++) {
       cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
     }
-    
+
+    Assert.assertTrue(
+        "Scheduler diagnostics should have reason for not assigning the node",
+        app.getDiagnostics().toString().contains(
+            CSAMContainerLaunchDiagnosticsConstants.SKIP_AM_ALLOCATION_IN_IGNORE_EXCLUSIVE_MODE));
+
+    Assert.assertTrue(
+        "Scheduler diagnostics should have last processed node information",
+        app.getDiagnostics().toString().contains(
+            CSAMContainerLaunchDiagnosticsConstants.LAST_NODE_PROCESSED_MSG
+                + nodeIdStr + " ( Partition : [x]"));
     Assert.assertEquals(0, cs.getSchedulerNode(nm1.getNodeId())
         .getNumContainers());
     
     rm1.close();
   }
-  
-  @Test
+
+  @Test(timeout=60000)
   public void
       testQueueMaxCapacitiesWillNotBeHonoredWhenNotRespectingExclusivity()
           throws Exception {
@@ -1351,9 +1550,11 @@ public class TestNodeLabelContainerAllocation {
     csConf.setCapacityByLabel(B, "x", 70);
     
     final String C = CapacitySchedulerConfiguration.ROOT + ".c";
+    csConf.setAccessibleNodeLabels(C, Collections.<String> emptySet());
     csConf.setCapacity(C, 25);
     
     final String D = CapacitySchedulerConfiguration.ROOT + ".d";
+    csConf.setAccessibleNodeLabels(D, Collections.<String> emptySet());
     csConf.setCapacity(D, 25);
 
     // set node -> label
@@ -1455,11 +1656,11 @@ public class TestNodeLabelContainerAllocation {
         cs.getApplicationAttempt(am3.getApplicationAttemptId()));
     checkNumOfContainersInAnAppOnGivenNode(0, nm1.getNodeId(),
         cs.getApplicationAttempt(am4.getApplicationAttemptId()));
-    
+
     // Test case 7
     // After c allocated, d will go first because it has less used_capacity(x)
     // than c
-    doNMHeartbeat(rm, nm1.getNodeId(), 2);
+    doNMHeartbeat(rm, nm1.getNodeId(), 1);
     checkNumOfContainersInAnAppOnGivenNode(2, nm1.getNodeId(),
         cs.getApplicationAttempt(am1.getApplicationAttemptId()));
     checkNumOfContainersInAnAppOnGivenNode(3, nm1.getNodeId(),
@@ -1481,5 +1682,383 @@ public class TestNodeLabelContainerAllocation {
     checkNumOfContainersInAnAppOnGivenNode(1, nm1.getNodeId(),
         cs.getApplicationAttempt(am4.getApplicationAttemptId()));
 
+  }
+
+  @Test
+  public void testOrderOfAllocationOnPartitionsWhenAccessibilityIsAll()
+      throws Exception {
+    /**
+     * Test case: have a following queue structure:
+     *
+     * <pre>
+     *             root
+     *          __________
+     *         /          \
+     *        a (*)      b (x)
+     * </pre>
+     *
+     * Both queues a/b can access x, we need to verify whether * accessibility
+     * is considered in ordering of queues
+     */
+
+    CapacitySchedulerConfiguration csConf =
+        new CapacitySchedulerConfiguration(this.conf);
+
+    // Define top-level queues
+    csConf.setQueues(CapacitySchedulerConfiguration.ROOT,
+        new String[] { "a", "b" });
+    csConf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT, "x", 100);
+
+    final String A = CapacitySchedulerConfiguration.ROOT + ".a";
+    csConf.setCapacity(A, 25);
+    csConf.setAccessibleNodeLabels(A, toSet("*"));
+    csConf.setCapacityByLabel(A, "x", 60);
+
+    final String B = CapacitySchedulerConfiguration.ROOT + ".b";
+    csConf.setCapacity(B, 75);
+    csConf.setAccessibleNodeLabels(B, toSet("x"));
+    csConf.setCapacityByLabel(B, "x", 40);
+
+    // set node -> label
+    mgr.addToCluserNodeLabels(
+        ImmutableSet.of(NodeLabel.newInstance("x", false)));
+    mgr.addLabelsToNode(
+        ImmutableMap.of(NodeId.newInstance("h1", 0), toSet("x")));
+
+    // inject node label manager
+    MockRM rm = new MockRM(csConf) {
+      @Override
+      public RMNodeLabelsManager createNodeLabelManager() {
+        return mgr;
+      }
+    };
+
+    rm.getRMContext().setNodeLabelManager(mgr);
+    rm.start();
+
+    CapacityScheduler cs = (CapacityScheduler) rm.getResourceScheduler();
+
+    MockNM nm1 = rm.registerNode("h1:1234", 10 * GB); // label = x
+
+    // app1 -> a
+    RMApp app1 = rm.submitApp(1 * GB, "app", "user", null, "a", "x");
+    MockAM am1 = MockRM.launchAndRegisterAM(app1, rm, nm1);
+
+    // app2 -> b
+    RMApp app2 = rm.submitApp(1 * GB, "app", "user", null, "b", "x");
+    MockAM am2 = MockRM.launchAndRegisterAM(app2, rm, nm1);
+
+    // Both a/b has used_capacity(x) = 0, when doing exclusive allocation, a
+    // will go first since a has more capacity(x)
+    am1.allocate("*", 1 * GB, 1, new ArrayList<ContainerId>(), "x");
+    am2.allocate("*", 1 * GB, 1, new ArrayList<ContainerId>(), "x");
+    doNMHeartbeat(rm, nm1.getNodeId(), 1);
+    checkNumOfContainersInAnAppOnGivenNode(2, nm1.getNodeId(),
+        cs.getApplicationAttempt(am1.getApplicationAttemptId()));
+  }
+
+  @Test
+  public void testQueueMetricsWithLabels() throws Exception {
+    /**
+     * Test case: have a following queue structure:
+     *
+     * <pre>
+     *            root
+     *         /      \
+     *        a        b
+     *        (x)     (x)
+     * </pre>
+     *
+     * a/b can access x, both of them has max-capacity-on-x = 50
+     *
+     * When doing non-exclusive allocation, app in a (or b) can use 100% of x
+     * resource.
+     */
+
+    CapacitySchedulerConfiguration csConf = new CapacitySchedulerConfiguration(
+        this.conf);
+
+    // Define top-level queues
+    csConf.setQueues(CapacitySchedulerConfiguration.ROOT,
+        new String[] { "a", "b" });
+    csConf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT, "x", 100);
+
+    final String queueA = CapacitySchedulerConfiguration.ROOT + ".a";
+    csConf.setCapacity(queueA, 25);
+    csConf.setAccessibleNodeLabels(queueA, toSet("x"));
+    csConf.setCapacityByLabel(queueA, "x", 50);
+    csConf.setMaximumCapacityByLabel(queueA, "x", 50);
+    final String queueB = CapacitySchedulerConfiguration.ROOT + ".b";
+    csConf.setCapacity(queueB, 75);
+    csConf.setAccessibleNodeLabels(queueB, toSet("x"));
+    csConf.setCapacityByLabel(queueB, "x", 50);
+    csConf.setMaximumCapacityByLabel(queueB, "x", 50);
+
+    // set node -> label
+    mgr.addToCluserNodeLabels(
+        ImmutableSet.of(NodeLabel.newInstance("x", false)));
+    mgr.addToCluserNodeLabels(
+        ImmutableSet.of(NodeLabel.newInstance("y", false)));
+    mgr.addLabelsToNode(
+        ImmutableMap.of(NodeId.newInstance("h1", 0), toSet("x")));
+    mgr.addLabelsToNode(
+        ImmutableMap.of(NodeId.newInstance("h2", 0), toSet("y")));
+
+    // inject node label manager
+    MockRM rm1 = new MockRM(csConf) {
+      @Override
+      public RMNodeLabelsManager createNodeLabelManager() {
+        return mgr;
+      }
+    };
+
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1 = rm1.registerNode("h1:1234", 10 * GB); // label = x
+    MockNM nm2 = rm1.registerNode("h2:1234", 10 * GB); // label = y
+    // app1 -> a
+    RMApp app1 = rm1.submitApp(1 * GB, "app", "user", null, "a", "x");
+    MockAM am1 = MockRM.launchAndRegisterAM(app1, rm1, nm1);
+
+    // app1 asks for 5 partition=x containers
+    am1.allocate("*", 1 * GB, 5, new ArrayList<ContainerId>(), "x");
+    // NM1 do 50 heartbeats
+    CapacityScheduler cs = (CapacityScheduler) rm1.getResourceScheduler();
+    RMNode rmNode1 = rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+
+    SchedulerNode schedulerNode1 = cs.getSchedulerNode(nm1.getNodeId());
+
+    for (int i = 0; i < 50; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    }
+
+    // app1 gets all resource in partition=x
+    Assert.assertEquals(5, schedulerNode1.getNumContainers());
+
+    SchedulerNodeReport reportNm1 = rm1.getResourceScheduler()
+        .getNodeReport(nm1.getNodeId());
+    Assert.assertEquals(5 * GB, reportNm1.getUsedResource().getMemorySize());
+    Assert.assertEquals(5 * GB,
+        reportNm1.getAvailableResource().getMemorySize());
+
+    SchedulerNodeReport reportNm2 = rm1.getResourceScheduler()
+        .getNodeReport(nm2.getNodeId());
+    Assert.assertEquals(0 * GB, reportNm2.getUsedResource().getMemorySize());
+    Assert.assertEquals(10 * GB,
+        reportNm2.getAvailableResource().getMemorySize());
+
+    LeafQueue leafQueue = (LeafQueue) cs.getQueue("a");
+    assertEquals(5 * GB, leafQueue.getMetrics().getAvailableMB());
+    assertEquals(0 * GB, leafQueue.getMetrics().getAllocatedMB());
+    rm1.close();
+  }
+
+  @Test
+  public void testQueueMetricsWithLabelsOnDefaultLabelNode() throws Exception {
+    /**
+     * Test case: have a following queue structure:
+     *
+     * <pre>
+     *            root
+     *         /      \
+     *        a        b
+     *        (x)     (x)
+     * </pre>
+     *
+     * a/b can access x, both of them has max-capacity-on-x = 50
+     *
+     * When doing non-exclusive allocation, app in a (or b) can use 100% of x
+     * resource.
+     */
+
+    CapacitySchedulerConfiguration csConf = new CapacitySchedulerConfiguration(
+        this.conf);
+
+    // Define top-level queues
+    csConf.setQueues(CapacitySchedulerConfiguration.ROOT,
+        new String[] { "a", "b" });
+    csConf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT, "x", 100);
+
+    final String queueA = CapacitySchedulerConfiguration.ROOT + ".a";
+    csConf.setCapacity(queueA, 25);
+    csConf.setAccessibleNodeLabels(queueA, toSet("x"));
+    csConf.setCapacityByLabel(queueA, "x", 50);
+    csConf.setMaximumCapacityByLabel(queueA, "x", 50);
+    final String queueB = CapacitySchedulerConfiguration.ROOT + ".b";
+    csConf.setCapacity(queueB, 75);
+    csConf.setAccessibleNodeLabels(queueB, toSet("x"));
+    csConf.setCapacityByLabel(queueB, "x", 50);
+    csConf.setMaximumCapacityByLabel(queueB, "x", 50);
+
+    // set node -> label
+    mgr.addToCluserNodeLabels(
+        ImmutableSet.of(NodeLabel.newInstance("x", false)));
+    mgr.addLabelsToNode(
+        ImmutableMap.of(NodeId.newInstance("h1", 0), toSet("x")));
+
+    // inject node label manager
+    MockRM rm1 = new MockRM(csConf) {
+      @Override
+      public RMNodeLabelsManager createNodeLabelManager() {
+        return mgr;
+      }
+    };
+
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1 = rm1.registerNode("h1:1234", 10 * GB); // label = x
+    MockNM nm2 = rm1.registerNode("h2:1234", 10 * GB); // label = <no_label>
+    // app1 -> a
+    RMApp app1 = rm1.submitApp(1 * GB, "app", "user", null, "a");
+    MockAM am1 = MockRM.launchAndRegisterAM(app1, rm1, nm2);
+
+    // app1 asks for 3 partition= containers
+    am1.allocate("*", 1 * GB, 3, new ArrayList<ContainerId>());
+
+    // NM1 do 50 heartbeats
+    CapacityScheduler cs = (CapacityScheduler) rm1.getResourceScheduler();
+    RMNode rmNode1 = rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+
+    SchedulerNode schedulerNode1 = cs.getSchedulerNode(nm1.getNodeId());
+    for (int i = 0; i < 50; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    }
+
+    // app1 gets all resource in partition=x (non-exclusive)
+    Assert.assertEquals(3, schedulerNode1.getNumContainers());
+
+    SchedulerNodeReport reportNm1 = rm1.getResourceScheduler()
+        .getNodeReport(nm1.getNodeId());
+    Assert.assertEquals(3 * GB, reportNm1.getUsedResource().getMemorySize());
+    Assert.assertEquals(7 * GB,
+        reportNm1.getAvailableResource().getMemorySize());
+
+    SchedulerNodeReport reportNm2 = rm1.getResourceScheduler()
+        .getNodeReport(nm2.getNodeId());
+    Assert.assertEquals(1 * GB, reportNm2.getUsedResource().getMemorySize());
+    Assert.assertEquals(9 * GB,
+        reportNm2.getAvailableResource().getMemorySize());
+
+    LeafQueue leafQueue = (LeafQueue) cs.getQueue("a");
+    double delta = 0.0001;
+    // 3GB is used from label x quota. 1.5 GB is remaining from default label.
+    // 2GB is remaining from label x.
+    assertEquals(6.5 * GB, leafQueue.getMetrics().getAvailableMB(), delta);
+    assertEquals(1 * GB, leafQueue.getMetrics().getAllocatedMB());
+
+    // app1 asks for 1 default partition container
+    am1.allocate("*", 1 * GB, 5, new ArrayList<ContainerId>());
+
+    // NM2 do couple of heartbeats
+    RMNode rmNode2 = rm1.getRMContext().getRMNodes().get(nm2.getNodeId());
+
+    SchedulerNode schedulerNode2 = cs.getSchedulerNode(nm2.getNodeId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+
+    // app1 gets all resource in default partition
+    Assert.assertEquals(2, schedulerNode2.getNumContainers());
+
+    // 3GB is used from label x quota. 2GB used from default label.
+    // So total 2.5 GB is remaining.
+    assertEquals(2.5 * GB, leafQueue.getMetrics().getAvailableMB(), delta);
+    assertEquals(2 * GB, leafQueue.getMetrics().getAllocatedMB());
+
+    rm1.close();
+  }
+
+  @Test
+  public void testParentQueueMaxCapsAreRespected() throws Exception {
+    /*
+     * Queue tree:
+     *          Root
+     *        /     \
+     *       A       B
+     *      / \
+     *     A1 A2
+     *
+     * A has 50% capacity and 50% max capacity (of label=x)
+     * A1/A2 has 50% capacity and 100% max capacity (of label=x)
+     * Cluster has one node (label=x) with resource = 24G.
+     * So we can at most use 12G resources under queueA.
+     */
+    CapacitySchedulerConfiguration csConf =
+        new CapacitySchedulerConfiguration(this.conf);
+
+    // Define top-level queues
+    csConf.setQueues(CapacitySchedulerConfiguration.ROOT, new String[] { "a",
+        "b"});
+    csConf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT, "x", 100);
+
+    final String A = CapacitySchedulerConfiguration.ROOT + ".a";
+    csConf.setCapacity(A, 10);
+    csConf.setAccessibleNodeLabels(A, toSet("x"));
+    csConf.setCapacityByLabel(A, "x", 50);
+    csConf.setMaximumCapacityByLabel(A, "x", 50);
+
+    final String B = CapacitySchedulerConfiguration.ROOT + ".b";
+    csConf.setCapacity(B, 90);
+    csConf.setAccessibleNodeLabels(B, toSet("x"));
+    csConf.setCapacityByLabel(B, "x", 50);
+    csConf.setMaximumCapacityByLabel(B, "x", 50);
+
+    // Define 2nd-level queues
+    csConf.setQueues(A, new String[] { "a1",
+        "a2"});
+
+    final String A1 = A + ".a1";
+    csConf.setCapacity(A1, 50);
+    csConf.setAccessibleNodeLabels(A1, toSet("x"));
+    csConf.setCapacityByLabel(A1, "x", 50);
+    csConf.setMaximumCapacityByLabel(A1, "x", 100);
+    csConf.setUserLimitFactor(A1, 100.0f);
+
+    final String A2 = A + ".a2";
+    csConf.setCapacity(A2, 50);
+    csConf.setAccessibleNodeLabels(A2, toSet("x"));
+    csConf.setCapacityByLabel(A2, "x", 50);
+    csConf.setMaximumCapacityByLabel(A2, "x", 100);
+    csConf.setUserLimitFactor(A2, 100.0f);
+
+    // set node -> label
+    mgr.addToCluserNodeLabels(ImmutableSet.of(
+        NodeLabel.newInstance("x", false)));
+    mgr.addLabelsToNode(ImmutableMap.of(NodeId.newInstance("h1", 0), toSet("x")));
+
+    // inject node label manager
+    MockRM rm = new MockRM(csConf) {
+      @Override
+      public RMNodeLabelsManager createNodeLabelManager() {
+        return mgr;
+      }
+    };
+
+    rm.getRMContext().setNodeLabelManager(mgr);
+    rm.start();
+
+    CapacityScheduler cs = (CapacityScheduler) rm.getResourceScheduler();
+
+    MockNM nm1 =
+        new MockNM("h1:1234", 24 * GB, rm.getResourceTrackerService());
+    nm1.registerNode();
+
+    // Launch app1 in a1, resource usage is 1GB (am) + 4GB * 2 = 9GB
+    RMApp app1 = rm.submitApp(1 * GB, "app", "user", null, "a1", "x");
+    MockAM am1 = MockRM.launchAndRegisterAM(app1, rm, nm1);
+    am1.allocate("*", 4 * GB, 2, new ArrayList<ContainerId>(), "x");
+    doNMHeartbeat(rm, nm1.getNodeId(), 10);
+    checkNumOfContainersInAnAppOnGivenNode(3, nm1.getNodeId(),
+        cs.getApplicationAttempt(am1.getApplicationAttemptId()));
+
+    // Try to launch app2 in a2, asked 2GB, should success
+    RMApp app2 = rm.submitApp(2 * GB, "app", "user", null, "a2", "x");
+    MockAM am2 = MockRM.launchAndRegisterAM(app2, rm, nm1);
+
+    // am2 asks more resources, cannot success because current used = 9G (app1)
+    // + 2G (app2) = 11G, and queue's max capacity = 12G
+    am2.allocate("*", 2 * GB, 2, new ArrayList<ContainerId>(), "x");
+
+    doNMHeartbeat(rm, nm1.getNodeId(), 10);
+    checkNumOfContainersInAnAppOnGivenNode(1, nm1.getNodeId(),
+        cs.getApplicationAttempt(am2.getApplicationAttemptId()));
   }
 }

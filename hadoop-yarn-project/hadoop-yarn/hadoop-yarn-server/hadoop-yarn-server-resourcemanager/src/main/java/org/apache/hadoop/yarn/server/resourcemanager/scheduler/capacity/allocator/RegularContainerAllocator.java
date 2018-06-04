@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator;
 
+import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.yarn.api.records.Container;
@@ -28,12 +29,13 @@ import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
-import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.NodeType;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceLimits;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSAMContainerLaunchDiagnosticsConstants;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSAssignment;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.SchedulingMode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerApp;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerNode;
@@ -41,11 +43,14 @@ import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
 import org.apache.hadoop.yarn.util.resource.Resources;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Allocate normal (new) containers, considers locality/label, etc. Using
  * delayed scheduling mechanism to get better locality allocation.
  */
-public class RegularContainerAllocator extends ContainerAllocator {
+public class RegularContainerAllocator extends AbstractContainerAllocator {
   private static final Log LOG = LogFactory.getLog(RegularContainerAllocator.class);
   
   private ResourceRequest lastResourceRequest = null;
@@ -55,10 +60,31 @@ public class RegularContainerAllocator extends ContainerAllocator {
     super(application, rc, rmContext);
   }
   
+  private boolean checkHeadroom(Resource clusterResource,
+      ResourceLimits currentResourceLimits, Resource required,
+      FiCaSchedulerNode node) {
+    // If headroom + currentReservation < required, we cannot allocate this
+    // require
+    Resource resourceCouldBeUnReserved = application.getCurrentReservation();
+    if (!application.getCSLeafQueue().getReservationContinueLooking()
+        || !node.getPartition().equals(RMNodeLabelsManager.NO_LABEL)) {
+      // If we don't allow reservation continuous looking, OR we're looking at
+      // non-default node partition, we won't allow to unreserve before
+      // allocation.
+      resourceCouldBeUnReserved = Resources.none();
+    }
+    return Resources.greaterThanOrEqual(rc, clusterResource, Resources.add(
+        currentResourceLimits.getHeadroom(), resourceCouldBeUnReserved),
+        required);
+  }
+
+  
   private ContainerAllocation preCheckForNewContainer(Resource clusterResource,
       FiCaSchedulerNode node, SchedulingMode schedulingMode,
       ResourceLimits resourceLimits, Priority priority) {
-    if (SchedulerAppUtils.isBlacklisted(application, node, LOG)) {
+    if (SchedulerAppUtils.isPlaceBlacklisted(application, node, LOG)) {
+      application.updateAppSkipNodeDiagnostics(
+          CSAMContainerLaunchDiagnosticsConstants.SKIP_AM_ALLOCATION_IN_BLACK_LISTED_NODE);
       return ContainerAllocation.APP_SKIPPED;
     }
 
@@ -79,16 +105,14 @@ public class RegularContainerAllocator extends ContainerAllocator {
     // AM container allocation doesn't support non-exclusive allocation to
     // avoid painful of preempt an AM container
     if (schedulingMode == SchedulingMode.IGNORE_PARTITION_EXCLUSIVITY) {
-      RMAppAttempt rmAppAttempt =
-          rmContext.getRMApps().get(application.getApplicationId())
-              .getCurrentAppAttempt();
-      if (rmAppAttempt.getSubmissionContext().getUnmanagedAM() == false
-          && null == rmAppAttempt.getMasterContainer()) {
+      if (application.isWaitingForAMContainer()) {
         if (LOG.isDebugEnabled()) {
           LOG.debug("Skip allocating AM container to app_attempt="
               + application.getApplicationAttemptId()
               + ", don't allow to allocate AM container in non-exclusive mode");
         }
+        application.updateAppSkipNodeDiagnostics(
+            "Skipping assigning to Node in Ignore Exclusivity mode. ");
         return ContainerAllocation.APP_SKIPPED;
       }
     }
@@ -96,8 +120,9 @@ public class RegularContainerAllocator extends ContainerAllocator {
     // Is the node-label-expression of this offswitch resource request
     // matches the node's label?
     // If not match, jump to next priority.
-    if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(anyRequest,
-        node.getPartition(), schedulingMode)) {
+    if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(
+        anyRequest.getNodeLabelExpression(), node.getPartition(),
+        schedulingMode)) {
       return ContainerAllocation.PRIORITY_SKIPPED;
     }
 
@@ -154,7 +179,6 @@ public class RegularContainerAllocator extends ContainerAllocator {
     return null;
   }
 
-  @Override
   ContainerAllocation preAllocation(Resource clusterResource,
       FiCaSchedulerNode node, SchedulingMode schedulingMode,
       ResourceLimits resourceLimits, Priority priority,
@@ -226,8 +250,11 @@ public class RegularContainerAllocator extends ContainerAllocator {
       float localityWaitFactor =
           getLocalityWaitFactor(priority, rmContext.getScheduler()
               .getNumClusterNodes());
-
-      return ((requiredContainers * localityWaitFactor) < missedOpportunities);
+      // Cap the delay by the number of nodes in the cluster. Under most conditions
+      // this means we will consider each node in the cluster before
+      // accepting an off-switch assignment.
+      return (Math.min(rmContext.getScheduler().getNumClusterNodes(),
+          (requiredContainers * localityWaitFactor)) < missedOpportunities);
     }
 
     // Check if we need containers on this rack
@@ -295,14 +322,16 @@ public class RegularContainerAllocator extends ContainerAllocator {
           schedulingMode, currentResoureLimits);
     }
 
-    return ContainerAllocation.QUEUE_SKIPPED;
+    application.updateAppSkipNodeDiagnostics(
+        CSAMContainerLaunchDiagnosticsConstants.SKIP_AM_ALLOCATION_DUE_TO_LOCALITY);
+    return ContainerAllocation.APP_SKIPPED;
   }
 
   private ContainerAllocation assignContainersOnNode(Resource clusterResource,
       FiCaSchedulerNode node, Priority priority, RMContainer reservedContainer,
       SchedulingMode schedulingMode, ResourceLimits currentResoureLimits) {
 
-    ContainerAllocation assigned;
+    ContainerAllocation allocation;
 
     NodeType requestType = null;
     // Data-local
@@ -310,14 +339,14 @@ public class RegularContainerAllocator extends ContainerAllocator {
         application.getResourceRequest(priority, node.getNodeName());
     if (nodeLocalResourceRequest != null) {
       requestType = NodeType.NODE_LOCAL;
-      assigned =
+      allocation =
           assignNodeLocalContainers(clusterResource, nodeLocalResourceRequest,
               node, priority, reservedContainer, schedulingMode,
               currentResoureLimits);
       if (Resources.greaterThan(rc, clusterResource,
-          assigned.getResourceToBeAllocated(), Resources.none())) {
-        assigned.requestNodeType = requestType;
-        return assigned;
+          allocation.getResourceToBeAllocated(), Resources.none())) {
+        allocation.requestNodeType = requestType;
+        return allocation;
       }
     }
 
@@ -333,14 +362,14 @@ public class RegularContainerAllocator extends ContainerAllocator {
         requestType = NodeType.RACK_LOCAL;
       }
 
-      assigned =
+      allocation =
           assignRackLocalContainers(clusterResource, rackLocalResourceRequest,
               node, priority, reservedContainer, schedulingMode,
               currentResoureLimits);
       if (Resources.greaterThan(rc, clusterResource,
-          assigned.getResourceToBeAllocated(), Resources.none())) {
-        assigned.requestNodeType = requestType;
-        return assigned;
+          allocation.getResourceToBeAllocated(), Resources.none())) {
+        allocation.requestNodeType = requestType;
+        return allocation;
       }
     }
 
@@ -356,13 +385,19 @@ public class RegularContainerAllocator extends ContainerAllocator {
         requestType = NodeType.OFF_SWITCH;
       }
 
-      assigned =
+      allocation =
           assignOffSwitchContainers(clusterResource, offSwitchResourceRequest,
               node, priority, reservedContainer, schedulingMode,
               currentResoureLimits);
-      assigned.requestNodeType = requestType;
+      allocation.requestNodeType = requestType;
+      
+      // When a returned allocation is LOCALITY_SKIPPED, since we're in
+      // off-switch request now, we will skip this app w.r.t priorities 
+      if (allocation.state == AllocationState.LOCALITY_SKIPPED) {
+        allocation.state = AllocationState.APP_SKIPPED;
+      }
 
-      return assigned;
+      return allocation;
     }
 
     return ContainerAllocation.PRIORITY_SKIPPED;
@@ -382,13 +417,13 @@ public class RegularContainerAllocator extends ContainerAllocator {
     }
 
     // check if the resource request can access the label
-    if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(request,
-        node.getPartition(), schedulingMode)) {
+    if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(
+        request.getNodeLabelExpression(), node.getPartition(), schedulingMode)) {
       // this is a reserved container, but we cannot allocate it now according
       // to label not match. This can be caused by node label changed
       // We should un-reserve this container.
       return new ContainerAllocation(rmContainer, null,
-          AllocationState.QUEUE_SKIPPED);
+          AllocationState.LOCALITY_SKIPPED);
     }
 
     Resource capability = request.getCapability();
@@ -400,17 +435,15 @@ public class RegularContainerAllocator extends ContainerAllocator {
       LOG.warn("Node : " + node.getNodeID()
           + " does not have sufficient resource for request : " + request
           + " node total capability : " + node.getTotalResource());
-      return ContainerAllocation.QUEUE_SKIPPED;
+      // Skip this locality request
+      return ContainerAllocation.LOCALITY_SKIPPED;
     }
-
-    assert Resources.greaterThan(
-        rc, clusterResource, available, Resources.none());
 
     boolean shouldAllocOrReserveNewContainer = shouldAllocOrReserveNewContainer(
         priority, capability);
 
     // Can we allocate a container on this node?
-    int availableContainers =
+    long availableContainers =
         rc.computeAvailableContainers(available, capability);
 
     // How much need to unreserve equals to:
@@ -427,6 +460,29 @@ public class RegularContainerAllocator extends ContainerAllocator {
     RMContainer unreservedContainer = null;
     boolean reservationsContinueLooking =
         application.getCSLeafQueue().getReservationContinueLooking();
+
+    // Check if we need to kill some containers to allocate this one
+    List<RMContainer> toKillContainers = null;
+    if (availableContainers == 0 && currentResoureLimits.isAllowPreemption()) {
+      Resource availableAndKillable = Resources.clone(available);
+      for (RMContainer killableContainer : node
+          .getKillableContainers().values()) {
+        if (null == toKillContainers) {
+          toKillContainers = new ArrayList<>();
+        }
+        toKillContainers.add(killableContainer);
+        Resources.addTo(availableAndKillable,
+                        killableContainer.getAllocatedResource());
+        if (Resources.fitsIn(rc,
+                             clusterResource,
+                             capability,
+                             availableAndKillable)) {
+          // Stop if we find enough spaces
+          availableContainers = 1;
+          break;
+        }
+      }
+    }
 
     if (availableContainers > 0) {
       // Allocate...
@@ -457,7 +513,8 @@ public class RegularContainerAllocator extends ContainerAllocator {
           // continue)). If we failed to unreserve some resource, we can't
           // continue.
           if (null == unreservedContainer) {
-            return ContainerAllocation.QUEUE_SKIPPED;
+            // Skip the locality request
+            return ContainerAllocation.LOCALITY_SKIPPED;
           }
         }
       }
@@ -466,21 +523,22 @@ public class RegularContainerAllocator extends ContainerAllocator {
           new ContainerAllocation(unreservedContainer, request.getCapability(),
               AllocationState.ALLOCATED);
       result.containerNodeType = type;
+      result.setToKillContainers(toKillContainers);
       return result;
     } else {
-      // if we are allowed to allocate but this node doesn't have space, reserve it or
-      // if this was an already a reserved container, reserve it again
+      // if we are allowed to allocate but this node doesn't have space, reserve
+      // it or if this was an already a reserved container, reserve it again
       if (shouldAllocOrReserveNewContainer || rmContainer != null) {
-
         if (reservationsContinueLooking && rmContainer == null) {
           // we could possibly ignoring queue capacity or user limits when
-          // reservationsContinueLooking is set. Make sure we didn't need to unreserve
-          // one.
+          // reservationsContinueLooking is set. Make sure we didn't need to
+          // unreserve one.
           if (needToUnreserve) {
             if (LOG.isDebugEnabled()) {
               LOG.debug("we needed to unreserve to be able to allocate");
             }
-            return ContainerAllocation.QUEUE_SKIPPED;
+            // Skip the locality request
+            return ContainerAllocation.LOCALITY_SKIPPED;          
           }
         }
 
@@ -488,9 +546,11 @@ public class RegularContainerAllocator extends ContainerAllocator {
             new ContainerAllocation(null, request.getCapability(),
                 AllocationState.RESERVED);
         result.containerNodeType = type;
+        result.setToKillContainers(null);
         return result;
       }
-      return ContainerAllocation.QUEUE_SKIPPED;
+      // Skip the locality request
+      return ContainerAllocation.LOCALITY_SKIPPED;    
     }
   }
 
@@ -563,8 +623,7 @@ public class RegularContainerAllocator extends ContainerAllocator {
       // Skip this app if we failed to allocate.
       ContainerAllocation ret =
           new ContainerAllocation(allocationResult.containerToBeUnreserved,
-              null, AllocationState.QUEUE_SKIPPED);
-      ret.state = AllocationState.APP_SKIPPED;
+              null, AllocationState.APP_SKIPPED);
       return ret;
     }
 
@@ -578,10 +637,8 @@ public class RegularContainerAllocator extends ContainerAllocator {
     return allocationResult;    
   }
 
-  @Override
   ContainerAllocation doAllocation(ContainerAllocation allocationResult,
-      Resource clusterResource, FiCaSchedulerNode node,
-      SchedulingMode schedulingMode, Priority priority,
+      FiCaSchedulerNode node, Priority priority,
       RMContainer reservedContainer) {
     // Create the container if necessary
     Container container =
@@ -590,8 +647,10 @@ public class RegularContainerAllocator extends ContainerAllocator {
 
     // something went wrong getting/creating the container
     if (container == null) {
+      application
+          .updateAppSkipNodeDiagnostics("Scheduling of container failed. ");
       LOG.warn("Couldn't get container for allocation!");
-      return ContainerAllocation.QUEUE_SKIPPED;
+      return ContainerAllocation.APP_SKIPPED;
     }
 
     if (allocationResult.getAllocationState() == AllocationState.ALLOCATED) {
@@ -615,15 +674,87 @@ public class RegularContainerAllocator extends ContainerAllocator {
         if (LOG.isDebugEnabled()) {
           LOG.debug("Resetting scheduling opportunities");
         }
-        application.resetSchedulingOpportunities(priority);
+        // Only reset scheduling opportunities for RACK_LOCAL if configured
+        // to do so. Not resetting means we will continue to schedule
+        // RACK_LOCAL without delay.
+        if (allocationResult.containerNodeType == NodeType.NODE_LOCAL
+            || application.getCSLeafQueue().getRackLocalityFullReset()) {
+          application.resetSchedulingOpportunities(priority);
+        }
       }
-      
+
       // Non-exclusive scheduling opportunity is different: we need reset
-      // it every time to make sure non-labeled resource request will be
+      // it when:
+      // - It allocated on the default partition
+      //
+      // This is to make sure non-labeled resource request will be
       // most likely allocated on non-labeled nodes first.
-      application.resetMissedNonPartitionedRequestSchedulingOpportunity(priority);
+      if (StringUtils.equals(node.getPartition(),
+          RMNodeLabelsManager.NO_LABEL)) {
+        application
+            .resetMissedNonPartitionedRequestSchedulingOpportunity(priority);
+      }
     }
 
     return allocationResult;
+  }
+
+  private ContainerAllocation allocate(Resource clusterResource,
+      FiCaSchedulerNode node, SchedulingMode schedulingMode,
+      ResourceLimits resourceLimits, Priority priority,
+      RMContainer reservedContainer) {
+    ContainerAllocation result =
+        preAllocation(clusterResource, node, schedulingMode, resourceLimits,
+            priority, reservedContainer);
+
+    if (AllocationState.ALLOCATED == result.state
+        || AllocationState.RESERVED == result.state) {
+      result = doAllocation(result, node, priority, reservedContainer);
+    }
+
+    return result;
+  }
+  
+  @Override
+  public CSAssignment assignContainers(Resource clusterResource,
+      FiCaSchedulerNode node, SchedulingMode schedulingMode,
+      ResourceLimits resourceLimits,
+      RMContainer reservedContainer) {
+    if (reservedContainer == null) {
+      // Check if application needs more resource, skip if it doesn't need more.
+      if (!application.hasPendingResourceRequest(rc,
+          node.getPartition(), clusterResource, schedulingMode)) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Skip app_attempt=" + application.getApplicationAttemptId()
+              + ", because it doesn't need more resource, schedulingMode="
+              + schedulingMode.name() + " node-label=" + node.getPartition());
+        }
+        return CSAssignment.SKIP_ASSIGNMENT;
+      }
+      
+      // Schedule in priority order
+      for (Priority priority : application.getPriorities()) {
+        ContainerAllocation result =
+            allocate(clusterResource, node, schedulingMode, resourceLimits,
+                priority, null);
+
+        AllocationState allocationState = result.getAllocationState();
+        if (allocationState == AllocationState.PRIORITY_SKIPPED) {
+          continue;
+        }
+        return getCSAssignmentFromAllocateResult(clusterResource, result,
+            null);
+      }
+
+      // We will reach here if we skipped all priorities of the app, so we will
+      // skip the app.
+      return CSAssignment.SKIP_ASSIGNMENT;
+    } else {
+      ContainerAllocation result =
+          allocate(clusterResource, node, schedulingMode, resourceLimits,
+              reservedContainer.getReservedPriority(), reservedContainer);
+      return getCSAssignmentFromAllocateResult(clusterResource, result,
+          reservedContainer);
+    }
   }
 }

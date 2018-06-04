@@ -18,6 +18,8 @@
 package org.apache.hadoop.hdfs.server.blockmanagement;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
@@ -38,6 +40,7 @@ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
 import org.apache.hadoop.hdfs.server.namenode.INodeFile;
 import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
+import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
 import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
 import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo.BlockStatus;
 import org.apache.hadoop.hdfs.server.protocol.StorageReceivedDeletedBlocks;
@@ -80,12 +83,19 @@ public class TestPendingReplication {
 
 
     //
-    // remove one item and reinsert it
+    // remove one item
     //
     BlockInfo blk = genBlockInfo(8, 8, 0);
     pendingReplications.decrement(blk, storages[7].getDatanodeDescriptor()); // removes one replica
     assertEquals("pendingReplications.getNumReplicas ",
                  7, pendingReplications.getNumReplicas(blk));
+
+    //
+    // insert the same item twice should be counted as once
+    //
+    pendingReplications.increment(blk, storages[0].getDatanodeDescriptor());
+    assertEquals("pendingReplications.getNumReplicas ",
+        7, pendingReplications.getNumReplicas(blk));
 
     for (int i = 0; i < 7; i++) {
       // removes all replicas
@@ -110,14 +120,15 @@ public class TestPendingReplication {
     //
     // verify that nothing has timed out so far
     //
-    assertTrue(pendingReplications.getTimedOutBlocks() == null);
+    assertNull(pendingReplications.getTimedOutBlocks());
+    assertEquals(0L, pendingReplications.getNumTimedOuts());
 
     //
     // Wait for one second and then insert some more items.
     //
     try {
       Thread.sleep(1000);
-    } catch (Exception e) {
+    } catch (Exception ignored) {
     }
 
     for (int i = 10; i < 15; i++) {
@@ -126,7 +137,8 @@ public class TestPendingReplication {
           DatanodeStorageInfo.toDatanodeDescriptors(
               DFSTestUtil.createDatanodeStorageInfos(i)));
     }
-    assertTrue(pendingReplications.size() == 15);
+    assertEquals(15, pendingReplications.size());
+    assertEquals(0L, pendingReplications.getNumTimedOuts());
 
     //
     // Wait for everything to timeout.
@@ -146,10 +158,14 @@ public class TestPendingReplication {
     // Verify that everything has timed out.
     //
     assertEquals("Size of pendingReplications ", 0, pendingReplications.size());
+    assertEquals(15L, pendingReplications.getNumTimedOuts());
     Block[] timedOut = pendingReplications.getTimedOutBlocks();
-    assertTrue(timedOut != null && timedOut.length == 15);
-    for (int i = 0; i < timedOut.length; i++) {
-      assertTrue(timedOut[i].getBlockId() < 15);
+    assertNotNull(timedOut);
+    assertEquals(15, timedOut.length);
+    // Verify the number is not reset
+    assertEquals(15L, pendingReplications.getNumTimedOuts());
+    for (Block block : timedOut) {
+      assertTrue(block.getBlockId() < 15);
     }
     pendingReplications.stop();
   }
@@ -190,10 +206,11 @@ public class TestPendingReplication {
           DatanodeStorageInfo.toDatanodeDescriptors(
               DFSTestUtil.createDatanodeStorageInfos(1)));
       BlockCollection bc = Mockito.mock(BlockCollection.class);
-      Mockito.doReturn((short) 3).when(bc).getPreferredBlockReplication();
       // Place into blocksmap with GenerationStamp = 1
       blockInfo.setGenerationStamp(1);
       blocksMap.addBlockCollection(blockInfo, bc);
+      //Save it for later.
+      BlockInfo storedBlock = blockInfo;
 
       assertEquals("Size of pendingReplications ", 1,
           pendingReplications.size());
@@ -240,6 +257,49 @@ public class TestPendingReplication {
       // Verify size of neededReplications is exactly 1.
       assertEquals("size of neededReplications is 1 ", 1,
           neededReplications.size());
+
+      // Verify HDFS-11960
+      // Stop the replication/redundancy monitor
+      BlockManagerTestUtil.stopReplicationThread(blkManager);
+      pendingReplications.clear();
+      // Pick a real node
+      DatanodeDescriptor desc[] = { blkManager.getDatanodeManager().
+          getDatanodes().iterator().next() };
+
+      // Add a stored block to the pendingReconstruction.
+      pendingReplications.increment(storedBlock, desc);
+      assertEquals("Size of pendingReplications ", 1,
+          pendingReplications.size());
+
+      // A received IBR processing calls addBlock(). If the gen stamp in the
+      // report is not the same, it should stay in pending.
+      fsn.writeLock();
+      try {
+        // Use a wrong gen stamp.
+        blkManager.addBlock(desc[0].getStorageInfos()[0],
+            new Block(1, 1, 0), null);
+      } finally {
+        fsn.writeUnlock();
+      }
+
+      // The block should still be pending
+      assertEquals("Size of pendingReplications ", 1,
+          pendingReplications.size());
+
+      // A block report with the correct gen stamp should remove the record
+      // from the pending queue.
+      fsn.writeLock();
+      try {
+        blkManager.addBlock(desc[0].getStorageInfos()[0],
+            new Block(1, 1, 1), null);
+      } finally {
+        fsn.writeUnlock();
+      }
+
+      // The pending queue should be empty.
+      assertEquals("Size of pendingReplications ", 0,
+          pendingReplications.size());
+
     } finally {
       if (cluster != null) {
         cluster.shutdown();
@@ -297,15 +357,17 @@ public class TestPendingReplication {
         if (!datanodes.get(i).getDatanodeId().equals(existingDn)) {
           DatanodeRegistration dnR = datanodes.get(i).getDNRegistrationForBP(
               poolId);
-          StorageReceivedDeletedBlocks[] report = { 
-              new StorageReceivedDeletedBlocks("Fake-storage-ID-Ignored",
+          StorageReceivedDeletedBlocks[] report = {
+              new StorageReceivedDeletedBlocks(
+                  new DatanodeStorage("Fake-storage-ID-Ignored"),
               new ReceivedDeletedBlockInfo[] { new ReceivedDeletedBlockInfo(
                   blocks[0], BlockStatus.RECEIVED_BLOCK, "") }) };
           cluster.getNameNodeRpc().blockReceivedAndDeleted(dnR, poolId, report);
           reportDnNum++;
         }
       }
-
+      // IBRs are async, make sure the NN processes all of them.
+      cluster.getNamesystem().getBlockManager().flushBlockOps();
       assertEquals(DATANODE_COUNT - 3,
           blkManager.pendingReplications.getNumReplicas(blocks[0]));
 
@@ -314,15 +376,18 @@ public class TestPendingReplication {
         if (!datanodes.get(i).getDatanodeId().equals(existingDn)) {
           DatanodeRegistration dnR = datanodes.get(i).getDNRegistrationForBP(
               poolId);
-          StorageReceivedDeletedBlocks[] report = 
-            { new StorageReceivedDeletedBlocks("Fake-storage-ID-Ignored",
-              new ReceivedDeletedBlockInfo[] { new ReceivedDeletedBlockInfo(
-                  blocks[0], BlockStatus.RECEIVED_BLOCK, "") }) };
+          StorageReceivedDeletedBlocks[] report =
+            { new StorageReceivedDeletedBlocks(
+                new DatanodeStorage("Fake-storage-ID-Ignored"),
+                new ReceivedDeletedBlockInfo[] {
+                  new ReceivedDeletedBlockInfo(
+                      blocks[0], BlockStatus.RECEIVED_BLOCK, "")}) };
           cluster.getNameNodeRpc().blockReceivedAndDeleted(dnR, poolId, report);
           reportDnNum++;
         }
       }
 
+      cluster.getNamesystem().getBlockManager().flushBlockOps();
       assertEquals(DATANODE_COUNT - 3,
           blkManager.pendingReplications.getNumReplicas(blocks[0]));
 

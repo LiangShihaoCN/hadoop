@@ -19,12 +19,12 @@
   <parent>
     <artifactId>hadoop-yarn-server</artifactId>
     <groupId>org.apache.hadoop</groupId>
-    <version>2.8.0-SNAPSHOT</version>
+    <version>2.8.4</version>
   </parent>
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.apache.hadoop</groupId>
   <artifactId>hadoop-yarn-server-resourcemanager</artifactId>
-  <version>2.8.0-SNAPSHOT</version>
+  <version>2.8.4</version>
   <name>Apache Hadoop YARN ResourceManager</name>
 
   <properties>
@@ -320,6 +320,17 @@
             </configuration>
           </execution>
         </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <excludes>
+            <exclude>src/test/resources/submit-reservation.json</exclude>
+            <exclude>src/test/resources/delete-reservation.json</exclude>
+            <exclude>src/test/resources/update-reservation.json</exclude>
+          </excludes>
+        </configuration>
       </plugin>
     </plugins>
   </build>

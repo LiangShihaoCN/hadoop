@@ -19,17 +19,22 @@ package org.apache.hadoop.hdfs.web;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+
 import org.apache.hadoop.fs.ContentSummary;
+import org.apache.hadoop.fs.ContentSummary.Builder;
 import org.apache.hadoop.fs.FileChecksum;
 import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.MD5MD5CRC32CastagnoliFileChecksum;
 import org.apache.hadoop.fs.MD5MD5CRC32FileChecksum;
 import org.apache.hadoop.fs.MD5MD5CRC32GzipFileChecksum;
+import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.fs.XAttrCodec;
 import org.apache.hadoop.fs.permission.AclEntry;
 import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSUtilClient;
+import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.FsPermissionExtension;
@@ -51,18 +56,26 @@ import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
 class JsonUtilClient {
   static final DatanodeInfo[] EMPTY_DATANODE_INFO_ARRAY = {};
+  static final String UNSUPPPORTED_EXCEPTION_STR =
+      UnsupportedOperationException.class.getName();
 
   /** Convert a Json map to a RemoteException. */
   static RemoteException toRemoteException(final Map<?, ?> json) {
-    final Map<?, ?> m = (Map<?, ?>)json.get(RemoteException.class.getSimpleName());
+    final Map<?, ?> m = (Map<?, ?>)json.get(
+        RemoteException.class.getSimpleName());
     final String message = (String)m.get("message");
     final String javaClassName = (String)m.get("javaClassName");
+    if (UNSUPPPORTED_EXCEPTION_STR.equals(javaClassName)) {
+      throw new UnsupportedOperationException(message);
+    }
     return new RemoteException(javaClassName, message);
   }
 
@@ -100,7 +113,8 @@ class JsonUtilClient {
   }
 
   /** Convert a Json map to a HdfsFileStatus object. */
-  static HdfsFileStatus toFileStatus(final Map<?, ?> json, boolean includesType) {
+  static HdfsFileStatus toFileStatus(final Map<?, ?> json,
+      boolean includesType) {
     if (json == null) {
       return null;
     }
@@ -108,7 +122,8 @@ class JsonUtilClient {
     final Map<?, ?> m = includesType ?
         (Map<?, ?>)json.get(FileStatus.class.getSimpleName()) : json;
     final String localName = (String) m.get("pathSuffix");
-    final WebHdfsConstants.PathType type = WebHdfsConstants.PathType.valueOf((String) m.get("type"));
+    final WebHdfsConstants.PathType type =
+        WebHdfsConstants.PathType.valueOf((String) m.get("type"));
     final byte[] symlink = type != WebHdfsConstants.PathType.SYMLINK? null
         : DFSUtilClient.string2Bytes((String) m.get("symlink"));
 
@@ -116,20 +131,21 @@ class JsonUtilClient {
     final String owner = (String) m.get("owner");
     final String group = (String) m.get("group");
     final FsPermission permission = toFsPermission((String) m.get("permission"),
-                                                   (Boolean) m.get("aclBit"),
-                                                   (Boolean) m.get("encBit"));
+        (Boolean) m.get("aclBit"),
+        (Boolean) m.get("encBit"));
     final long aTime = ((Number) m.get("accessTime")).longValue();
     final long mTime = ((Number) m.get("modificationTime")).longValue();
     final long blockSize = ((Number) m.get("blockSize")).longValue();
     final short replication = ((Number) m.get("replication")).shortValue();
     final long fileId = m.containsKey("fileId") ?
-        ((Number) m.get("fileId")).longValue() : HdfsConstants.GRANDFATHER_INODE_ID;
+        ((Number) m.get("fileId")).longValue() :
+        HdfsConstants.GRANDFATHER_INODE_ID;
     final int childrenNum = getInt(m, "childrenNum", -1);
     final byte storagePolicy = m.containsKey("storagePolicy") ?
         (byte) ((Number) m.get("storagePolicy")).longValue() :
         HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED;
-    return new HdfsFileStatus(len, type == WebHdfsConstants.PathType.DIRECTORY, replication,
-        blockSize, mTime, aTime, permission, owner, group,
+    return new HdfsFileStatus(len, type == WebHdfsConstants.PathType.DIRECTORY,
+        replication, blockSize, mTime, aTime, permission, owner, group,
         symlink, DFSUtilClient.string2Bytes(localName),
         fileId, childrenNum, null,
         storagePolicy);
@@ -185,7 +201,7 @@ class JsonUtilClient {
 
   /** Convert a Json map to an DatanodeInfo object. */
   static DatanodeInfo toDatanodeInfo(final Map<?, ?> m)
-    throws IOException {
+      throws IOException {
     if (m == null) {
       return null;
     }
@@ -241,7 +257,8 @@ class JsonUtilClient {
         getLong(m, "lastUpdateMonotonic", 0l),
         getInt(m, "xceiverCount", 0),
         getString(m, "networkLocation", ""),
-        DatanodeInfo.AdminStates.valueOf(getString(m, "adminState", "NORMAL")));
+        DatanodeInfo.AdminStates.valueOf(getString(m, "adminState", "NORMAL")),
+        getString(m, "upgradeDomain", ""));
   }
 
   /** Convert an Object[] to a DatanodeInfo[]. */
@@ -261,6 +278,23 @@ class JsonUtilClient {
     }
   }
 
+  /** Convert an Object[] to a StorageType[]. */
+  static StorageType[] toStorageTypeArray(final List<?> objects)
+      throws IOException {
+    if (objects == null) {
+      return null;
+    } else if (objects.isEmpty()) {
+      return StorageType.EMPTY_ARRAY;
+    } else {
+      final StorageType[] array = new StorageType[objects.size()];
+      int i = 0;
+      for (Object object : objects) {
+        array[i++] = StorageType.parseStorageType(object.toString());
+      }
+      return array;
+    }
+  }
+
   /** Convert a Json map to LocatedBlock. */
   static LocatedBlock toLocatedBlock(final Map<?, ?> m) throws IOException {
     if (m == null) {
@@ -275,8 +309,10 @@ class JsonUtilClient {
     final DatanodeInfo[] cachedLocations = toDatanodeInfoArray(
         getList(m, "cachedLocations"));
 
+    final StorageType[] storageTypes = toStorageTypeArray(
+        getList(m, "storageTypes"));
     final LocatedBlock locatedblock = new LocatedBlock(b, locations,
-        null, null, startOffset, isCorrupt, cachedLocations);
+        null, storageTypes, startOffset, isCorrupt, cachedLocations);
     locatedblock.setBlockToken(toBlockToken((Map<?, ?>)m.get("blockToken")));
     return locatedblock;
   }
@@ -303,17 +339,30 @@ class JsonUtilClient {
       return null;
     }
 
-    final Map<?, ?> m = (Map<?, ?>)json.get(ContentSummary.class.getSimpleName());
+    final Map<?, ?> m = (Map<?, ?>)json.get(
+        ContentSummary.class.getSimpleName());
     final long length = ((Number) m.get("length")).longValue();
     final long fileCount = ((Number) m.get("fileCount")).longValue();
     final long directoryCount = ((Number) m.get("directoryCount")).longValue();
     final long quota = ((Number) m.get("quota")).longValue();
     final long spaceConsumed = ((Number) m.get("spaceConsumed")).longValue();
     final long spaceQuota = ((Number) m.get("spaceQuota")).longValue();
+    final Map<?, ?> typem = (Map<?, ?>) m.get("typeQuota");
 
-    return new ContentSummary.Builder().length(length).fileCount(fileCount).
-        directoryCount(directoryCount).quota(quota).spaceConsumed(spaceConsumed).
-        spaceQuota(spaceQuota).build();
+    Builder contentSummaryBuilder = new ContentSummary.Builder().length(length)
+        .fileCount(fileCount).directoryCount(directoryCount).quota(quota)
+        .spaceConsumed(spaceConsumed).spaceQuota(spaceQuota);
+    if (typem != null) {
+      for (StorageType t : StorageType.getTypesSupportingQuota()) {
+        Map<?, ?> type = (Map<?, ?>) typem.get(t.toString());
+        if (type != null) {
+          contentSummaryBuilder = contentSummaryBuilder.typeQuota(t,
+              ((Number) type.get("quota")).longValue()).typeConsumed(t,
+              ((Number) type.get("consumed")).longValue());
+        }
+      }
+    }
+    return contentSummaryBuilder.build();
   }
 
   /** Convert a Json map to a MD5MD5CRC32FileChecksum. */
@@ -328,21 +377,22 @@ class JsonUtilClient {
     final int length = ((Number) m.get("length")).intValue();
     final byte[] bytes = StringUtils.hexStringToByte((String) m.get("bytes"));
 
-    final DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes));
+    final DataInputStream in = new DataInputStream(
+        new ByteArrayInputStream(bytes));
     final DataChecksum.Type crcType =
         MD5MD5CRC32FileChecksum.getCrcTypeFromAlgorithmName(algorithm);
     final MD5MD5CRC32FileChecksum checksum;
 
     // Recreate what DFSClient would have returned.
     switch(crcType) {
-      case CRC32:
-        checksum = new MD5MD5CRC32GzipFileChecksum();
-        break;
-      case CRC32C:
-        checksum = new MD5MD5CRC32CastagnoliFileChecksum();
-        break;
-      default:
-        throw new IOException("Unknown algorithm: " + algorithm);
+    case CRC32:
+      checksum = new MD5MD5CRC32GzipFileChecksum();
+      break;
+    case CRC32C:
+      checksum = new MD5MD5CRC32CastagnoliFileChecksum();
+      break;
+    default:
+      throw new IOException("Unknown algorithm: " + algorithm);
     }
     checksum.readFields(in);
 
@@ -389,14 +439,12 @@ class JsonUtilClient {
     return aclStatusBuilder.build();
   }
 
-  static String getPath(final Map<?, ?> json)
-      throws IOException {
+  static String getPath(final Map<?, ?> json) {
     if (json == null) {
       return null;
     }
 
-    String path = (String) json.get("Path");
-    return path;
+    return (String) json.get("Path");
   }
 
   static byte[] getXAttr(final Map<?, ?> json, final String name)
@@ -445,7 +493,7 @@ class JsonUtilClient {
     ObjectReader reader = new ObjectMapper().reader(List.class);
     final List<Object> xattrs = reader.readValue(namesInJson);
     final List<String> names =
-      Lists.newArrayListWithCapacity(json.keySet().size());
+        Lists.newArrayListWithCapacity(json.keySet().size());
 
     for (Object xattr : xattrs) {
       names.add((String) xattr);
@@ -494,7 +542,8 @@ class JsonUtilClient {
       return null;
     }
 
-    final Map<?, ?> m = (Map<?, ?>)json.get(LocatedBlocks.class.getSimpleName());
+    final Map<?, ?> m = (Map<?, ?>)json.get(
+        LocatedBlocks.class.getSimpleName());
     final long fileLength = ((Number) m.get("fileLength")).longValue();
     final boolean isUnderConstruction = (Boolean)m.get("isUnderConstruction");
     final List<LocatedBlock> locatedBlocks = toLocatedBlockList(
@@ -506,4 +555,82 @@ class JsonUtilClient {
         lastLocatedBlock, isLastBlockComplete, null);
   }
 
+  public static Collection<BlockStoragePolicy> getStoragePolicies(
+      Map<?, ?> json) {
+    Map<?, ?> policiesJson = (Map<?, ?>) json.get("BlockStoragePolicies");
+    if (policiesJson != null) {
+      List<?> objs = (List<?>) policiesJson.get(BlockStoragePolicy.class
+          .getSimpleName());
+      if (objs != null) {
+        BlockStoragePolicy[] storagePolicies = new BlockStoragePolicy[objs
+            .size()];
+        for (int i = 0; i < objs.size(); i++) {
+          final Map<?, ?> m = (Map<?, ?>) objs.get(i);
+          BlockStoragePolicy blockStoragePolicy = toBlockStoragePolicy(m);
+          storagePolicies[i] = blockStoragePolicy;
+        }
+        return Arrays.asList(storagePolicies);
+      }
+    }
+    return new ArrayList<BlockStoragePolicy>(0);
+  }
+
+  public static BlockStoragePolicy toBlockStoragePolicy(Map<?, ?> m) {
+    byte id = ((Number) m.get("id")).byteValue();
+    String name = (String) m.get("name");
+    StorageType[] storageTypes = toStorageTypes((List<?>) m
+        .get("storageTypes"));
+    StorageType[] creationFallbacks = toStorageTypes((List<?>) m
+        .get("creationFallbacks"));
+    StorageType[] replicationFallbacks = toStorageTypes((List<?>) m
+        .get("replicationFallbacks"));
+    Boolean copyOnCreateFile = (Boolean) m.get("copyOnCreateFile");
+    return new BlockStoragePolicy(id, name, storageTypes, creationFallbacks,
+        replicationFallbacks, copyOnCreateFile.booleanValue());
+  }
+
+  private static StorageType[] toStorageTypes(List<?> list) {
+    if (list == null) {
+      return null;
+    } else {
+      StorageType[] storageTypes = new StorageType[list.size()];
+      for (int i = 0; i < list.size(); i++) {
+        storageTypes[i] = StorageType.parseStorageType((String) list.get(i));
+      }
+      return storageTypes;
+    }
+  }
+
+  /*
+   * The parameters which have default value -1 are required fields according
+   * to hdfs.proto.
+   * The default values for optional fields are taken from
+   * hdfs.proto#FsServerDefaultsProto.
+   */
+  public static FsServerDefaults toFsServerDefaults(final Map<?, ?> json) {
+    if (json == null) {
+      return null;
+    }
+    Map<?, ?> m =
+        (Map<?, ?>) json.get(FsServerDefaults.class.getSimpleName());
+    long blockSize = getLong(m, "blockSize", -1);
+    int bytesPerChecksum = getInt(m, "bytesPerChecksum", -1);
+    int writePacketSize = getInt(m, "writePacketSize", -1);
+    short replication = (short) getInt(m, "replication", -1);
+    int fileBufferSize = getInt(m, "fileBufferSize", -1);
+    boolean encryptDataTransfer = m.containsKey("encryptDataTransfer")
+        ? (Boolean) m.get("encryptDataTransfer")
+        : false;
+    long trashInterval = getLong(m, "trashInterval", 0);
+    DataChecksum.Type type =
+        DataChecksum.Type.valueOf(getInt(m, "checksumType", 1));
+    String keyProviderUri = (String) m.get("keyProviderUri");
+    byte storagepolicyId = m.containsKey("defaultStoragePolicyId")
+        ? ((Number) m.get("defaultStoragePolicyId")).byteValue()
+        : HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED;
+    return new FsServerDefaults(blockSize, bytesPerChecksum,
+        writePacketSize, replication, fileBufferSize,
+        encryptDataTransfer, trashInterval, type, keyProviderUri,
+        storagepolicyId);
+  }
 }

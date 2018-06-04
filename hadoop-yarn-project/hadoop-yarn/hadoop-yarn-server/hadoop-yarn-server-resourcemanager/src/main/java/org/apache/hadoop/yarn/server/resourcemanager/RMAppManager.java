@@ -17,11 +17,7 @@
  */
 package org.apache.hadoop.yarn.server.resourcemanager;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.LinkedList;
-import java.util.Map;
-
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -50,7 +46,6 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppRecoverEvent;
-import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppRejectedEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl;
@@ -59,7 +54,10 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.YarnScheduler;
 import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 
-import com.google.common.annotations.VisibleForTesting;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.LinkedList;
+import java.util.Map;
 
 /**
  * This class manages the list of applications for the resource manager. 
@@ -171,6 +169,8 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
           .add("finalStatus", app.getFinalApplicationStatus())
           .add("memorySeconds", metrics.getMemorySeconds())
           .add("vcoreSeconds", metrics.getVcoreSeconds())
+          .add("preemptedMemorySeconds", metrics.getPreemptedMemorySeconds())
+          .add("preemptedVcoreSeconds", metrics.getPreemptedVcoreSeconds())
           .add("preemptedAMContainers", metrics.getNumAMContainersPreempted())
           .add("preemptedNonAMContainers", metrics.getNumNonAMContainersPreempted())
           .add("preemptedResources", metrics.getResourcePreempted())
@@ -282,14 +282,14 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
 
     RMAppImpl application =
         createAndPopulateNewRMApp(submissionContext, submitTime, user, false);
-    ApplicationId appId = submissionContext.getApplicationId();
     Credentials credentials = null;
     try {
       credentials = parseCredentials(submissionContext);
       if (UserGroupInformation.isSecurityEnabled()) {
-        this.rmContext.getDelegationTokenRenewer().addApplicationAsync(appId,
-            credentials, submissionContext.getCancelTokensWhenComplete(),
-            application.getUser());
+        this.rmContext.getDelegationTokenRenewer()
+            .addApplicationAsync(applicationId, credentials,
+                submissionContext.getCancelTokensWhenComplete(),
+                application.getUser());
       } else {
         // Dispatcher is not yet started at this time, so these START events
         // enqueued should be guaranteed to be first processed when dispatcher
@@ -304,7 +304,8 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
       // scheduler about the existence of the application
       assert application.getState() == RMAppState.NEW;
       this.rmContext.getDispatcher().getEventHandler()
-          .handle(new RMAppRejectedEvent(applicationId, e.getMessage()));
+          .handle(new RMAppEvent(applicationId,
+              RMAppEventType.APP_REJECTED, e.getMessage()));
       throw RPCUtil.getRemoteException(e);
     }
   }
@@ -326,9 +327,19 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
   private RMAppImpl createAndPopulateNewRMApp(
       ApplicationSubmissionContext submissionContext, long submitTime,
       String user, boolean isRecovery) throws YarnException {
+    // Do queue mapping
+    if (!isRecovery) {
+      if (rmContext.getQueuePlacementManager() != null) {
+        // We only do queue mapping when it's a new application
+        rmContext.getQueuePlacementManager().placeApplication(
+            submissionContext, user);
+      }
+    }
+    
     ApplicationId applicationId = submissionContext.getApplicationId();
-    ResourceRequest amReq =
-        validateAndCreateResourceRequest(submissionContext, isRecovery);
+
+    ResourceRequest amReq = validateAndCreateResourceRequest(
+        submissionContext, isRecovery);
 
     // Verify and get the update application priority and set back to
     // submissionContext

@@ -130,7 +130,7 @@ public class TestWebHdfsTokens {
     verify(fs, never()).setDelegationToken((Token<?>)any(Token.class));
   }
 
-  @Test(timeout = 1000)
+  @Test(timeout = 10000)
   public void testGetOpRequireAuth() {
     for (HttpOpParam.Op op : GetOpParam.Op.values()) {
       boolean expect = (op == GetOpParam.Op.GETDELEGATIONTOKEN);
@@ -138,7 +138,7 @@ public class TestWebHdfsTokens {
     }
   }
 
-  @Test(timeout = 1000)
+  @Test(timeout = 10000)
   public void testPutOpRequireAuth() {
     for (HttpOpParam.Op op : PutOpParam.Op.values()) {
       boolean expect = (op == PutOpParam.Op.RENEWDELEGATIONTOKEN || op == PutOpParam.Op.CANCELDELEGATIONTOKEN);
@@ -146,14 +146,14 @@ public class TestWebHdfsTokens {
     }
   }
 
-  @Test(timeout = 1000)
+  @Test(timeout = 10000)
   public void testPostOpRequireAuth() {
     for (HttpOpParam.Op op : PostOpParam.Op.values()) {
       assertFalse(op.getRequireAuth());
     }
   }
 
-  @Test(timeout = 1000)
+  @Test(timeout = 10000)
   public void testDeleteOpRequireAuth() {
     for (HttpOpParam.Op op : DeleteOpParam.Op.values()) {
       assertFalse(op.getRequireAuth());
@@ -195,6 +195,8 @@ public class TestWebHdfsTokens {
   public void testLazyTokenFetchForSWebhdfs() throws Exception {
     MiniDFSCluster cluster = null;
     SWebHdfsFileSystem fs = null;
+    String keystoresDir;
+    String sslConfDir;
     try {
       final Configuration clusterConf = new HdfsConfiguration(conf);
       SecurityUtil.setAuthenticationMethod(SIMPLE, clusterConf);
@@ -202,8 +204,6 @@ public class TestWebHdfsTokens {
 	    .DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY, true);
       String BASEDIR = System.getProperty("test.build.dir",
 	      	  "target/test-dir") + "/" + TestWebHdfsTokens.class.getSimpleName();
-      String keystoresDir;
-      String sslConfDir;
 	    
       clusterConf.setBoolean(HdfsClientConfigKeys.DFS_WEBHDFS_ENABLED_KEY, true);
       clusterConf.set(DFSConfigKeys.DFS_HTTP_POLICY_KEY, HttpConfig.Policy.HTTPS_ONLY.name());
@@ -216,7 +216,11 @@ public class TestWebHdfsTokens {
       keystoresDir = new File(BASEDIR).getAbsolutePath();
       sslConfDir = KeyStoreTestUtil.getClasspathDir(TestWebHdfsTokens.class);
       KeyStoreTestUtil.setupSSLConfig(keystoresDir, sslConfDir, clusterConf, false);
-	  
+      clusterConf.set(DFSConfigKeys.DFS_CLIENT_HTTPS_KEYSTORE_RESOURCE_KEY,
+          KeyStoreTestUtil.getClientSSLConfigFileName());
+      clusterConf.set(DFSConfigKeys.DFS_SERVER_HTTPS_KEYSTORE_RESOURCE_KEY,
+          KeyStoreTestUtil.getServerSSLConfigFileName());
+
       // trick the NN into thinking security is enabled w/o it trying
       // to login from a keytab
       UserGroupInformation.setConfiguration(clusterConf);
@@ -237,6 +241,7 @@ public class TestWebHdfsTokens {
           cluster.shutdown();
         }
      }
+    KeyStoreTestUtil.cleanupSSLConfig(keystoresDir, sslConfDir);
   }
 
   @Test
@@ -383,8 +388,10 @@ public class TestWebHdfsTokens {
     reset(fs);
 
     // verify an expired token is replaced with a new token
-    fs.open(p).close();
-    verify(fs, times(2)).getDelegationToken(); // first bad, then good
+    InputStream is = fs.open(p);
+    is.read();
+    is.close();
+    verify(fs, times(3)).getDelegationToken(); // first bad, then good
     verify(fs, times(1)).replaceExpiredDelegationToken();
     verify(fs, times(1)).getDelegationToken(null);
     verify(fs, times(1)).setDelegationToken(any(Token.class));
@@ -398,10 +405,10 @@ public class TestWebHdfsTokens {
     // verify with open because it's a little different in how it
     // opens connections
     fs.cancelDelegationToken(fs.getRenewToken());
-    InputStream is = fs.open(p);
+    is = fs.open(p);
     is.read();
     is.close();
-    verify(fs, times(2)).getDelegationToken(); // first bad, then good
+    verify(fs, times(3)).getDelegationToken(); // first bad, then good
     verify(fs, times(1)).replaceExpiredDelegationToken();
     verify(fs, times(1)).getDelegationToken(null);
     verify(fs, times(1)).setDelegationToken(any(Token.class));

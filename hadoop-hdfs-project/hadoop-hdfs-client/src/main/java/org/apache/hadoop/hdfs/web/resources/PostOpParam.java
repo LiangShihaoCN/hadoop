@@ -22,12 +22,14 @@ import java.net.HttpURLConnection;
 /** Http POST operation parameter. */
 public class PostOpParam extends HttpOpParam<PostOpParam.Op> {
   /** Post operations. */
-  public static enum Op implements HttpOpParam.Op {
+  public enum Op implements HttpOpParam.Op {
     APPEND(true, HttpURLConnection.HTTP_OK),
 
     CONCAT(false, HttpURLConnection.HTTP_OK),
 
     TRUNCATE(false, HttpURLConnection.HTTP_OK),
+
+    UNSETSTORAGEPOLICY(false, HttpURLConnection.HTTP_OK),
 
     NULL(false, HttpURLConnection.HTTP_NOT_IMPLEMENTED);
 
@@ -71,7 +73,7 @@ public class PostOpParam extends HttpOpParam<PostOpParam.Op> {
     }
   }
 
-  private static final Domain<Op> DOMAIN = new Domain<PostOpParam.Op>(NAME, Op.class);
+  private static final Domain<Op> DOMAIN = new Domain<>(NAME, Op.class);
 
   /**
    * Constructor.

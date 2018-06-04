@@ -17,46 +17,82 @@
  */
 package org.apache.hadoop.hdfs;
 
-import com.google.common.base.Joiner;
-import com.google.common.collect.Maps;
-import com.google.common.primitives.SignedBytes;
-import org.apache.commons.io.Charsets;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.BlockLocation;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
-import org.apache.hadoop.hdfs.protocol.LocatedBlock;
-import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
-import org.apache.hadoop.hdfs.web.WebHdfsConstants;
-import org.apache.hadoop.net.NetUtils;
-import org.apache.hadoop.net.NodeBase;
-import org.apache.hadoop.util.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_HA_NAMENODES_KEY_PREFIX;
+import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_NAMESERVICES;
 
+import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.UnsupportedEncodingException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_HA_NAMENODES_KEY_PREFIX;
-import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_NAMESERVICES;
+import javax.net.SocketFactory;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.BlockLocation;
+import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
+import org.apache.hadoop.hdfs.net.BasicInetPeer;
+import org.apache.hadoop.hdfs.net.NioInetPeer;
+import org.apache.hadoop.hdfs.net.Peer;
+import org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol;
+import org.apache.hadoop.hdfs.protocol.DatanodeID;
+import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+import org.apache.hadoop.hdfs.protocol.datatransfer.sasl.DataEncryptionKeyFactory;
+import org.apache.hadoop.hdfs.protocol.datatransfer.sasl.SaslDataTransferClient;
+import org.apache.hadoop.hdfs.protocolPB.ClientDatanodeProtocolTranslatorPB;
+import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
+import org.apache.hadoop.hdfs.util.IOUtilsClient;
+import org.apache.hadoop.hdfs.web.WebHdfsConstants;
+import org.apache.hadoop.net.NetUtils;
+import org.apache.hadoop.net.NodeBase;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Joiner;
+import com.google.common.collect.Maps;
+import com.google.common.primitives.SignedBytes;
 
 public class DFSUtilClient {
   public static final byte[] EMPTY_BYTES = {};
   private static final Logger LOG = LoggerFactory.getLogger(
       DFSUtilClient.class);
+
+  // Using the charset canonical name for String/byte[] conversions is much
+  // more efficient due to use of cached encoders/decoders.
+  private static final String UTF8_CSN = StandardCharsets.UTF_8.name();
+
   /**
    * Converts a string to a byte array using UTF8 encoding.
    */
   public static byte[] string2Bytes(String str) {
-    return str.getBytes(Charsets.UTF_8);
+    try {
+      return str.getBytes(UTF8_CSN);
+    } catch (UnsupportedEncodingException e) {
+      // should never happen!
+      throw new IllegalArgumentException("UTF8 decoding is not supported", e);
+    }
   }
 
   /**
@@ -112,6 +148,19 @@ public class DFSUtilClient {
     assert !suffix.startsWith(".") :
       "suffix '" + suffix + "' should not already have '.' prepended.";
     return key + "." + suffix;
+  }
+
+  /**
+   * Returns list of InetSocketAddress corresponding to HA NN RPC addresses from
+   * the configuration.
+   *
+   * @param conf configuration
+   * @return list of InetSocketAddresses
+   */
+  public static Map<String, Map<String, InetSocketAddress>> getHaNnRpcAddresses(
+      Configuration conf) {
+    return DFSUtilClient.getAddresses(conf, null,
+      HdfsClientConfigKeys.DFS_NAMENODE_RPC_ADDRESS_KEY);
   }
 
   /**
@@ -181,6 +230,8 @@ public class DFSUtilClient {
       }
       blkLocations[idx] = new BlockLocation(xferAddrs, hosts, cachedHosts,
                                             racks,
+                                            blk.getStorageIDs(),
+                                            blk.getStorageTypes(),
                                             blk.getStartOffset(),
                                             blk.getBlockSize(),
                                             blk.isCorrupt());
@@ -240,13 +291,13 @@ public class DFSUtilClient {
    * @param length The number of bytes to decode
    * @return The decoded string
    */
-  private static String bytes2String(byte[] bytes, int offset, int length) {
+  static String bytes2String(byte[] bytes, int offset, int length) {
     try {
-      return new String(bytes, offset, length, "UTF8");
-    } catch(UnsupportedEncodingException e) {
-      assert false : "UTF8 encoding is not supported ";
+      return new String(bytes, offset, length, UTF8_CSN);
+    } catch (UnsupportedEncodingException e) {
+      // should never happen!
+      throw new IllegalArgumentException("UTF8 encoding is not supported", e);
     }
-    return null;
   }
 
   /**
@@ -276,8 +327,8 @@ public class DFSUtilClient {
    * @param keys Set of keys to look for in the order of preference
    * @return a map(nameserviceId to map(namenodeId to InetSocketAddress))
    */
-  static Map<String, Map<String, InetSocketAddress>>
-    getAddresses(Configuration conf, String defaultAddress, String... keys) {
+  static Map<String, Map<String, InetSocketAddress>> getAddresses(
+      Configuration conf, String defaultAddress, String... keys) {
     Collection<String> nameserviceIds = getNameServiceIds(conf);
     return getAddressesForNsIds(conf, nameserviceIds, defaultAddress, keys);
   }
@@ -290,8 +341,7 @@ public class DFSUtilClient {
    *
    * @return a map(nameserviceId to map(namenodeId to InetSocketAddress))
    */
-  static Map<String, Map<String, InetSocketAddress>>
-    getAddressesForNsIds(
+  static Map<String, Map<String, InetSocketAddress>> getAddressesForNsIds(
       Configuration conf, Collection<String> nsIds, String defaultAddress,
       String... keys) {
     // Look for configurations of the form <key>[.<nameserviceId>][.<namenodeId>]
@@ -299,7 +349,7 @@ public class DFSUtilClient {
     Map<String, Map<String, InetSocketAddress>> ret = Maps.newLinkedHashMap();
     for (String nsId : emptyAsSingletonNull(nsIds)) {
       Map<String, InetSocketAddress> isas =
-        getAddressesForNameserviceId(conf, nsId, defaultAddress, keys);
+          getAddressesForNameserviceId(conf, nsId, defaultAddress, keys);
       if (!isas.isEmpty()) {
         ret.put(nsId, isas);
       }
@@ -426,5 +476,202 @@ public class DFSUtilClient {
     SimpleDateFormat df =
         new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.ENGLISH);
     return df.format(date);
+  }
+
+  private static final Map<String, Boolean> localAddrMap = Collections
+      .synchronizedMap(new HashMap<String, Boolean>());
+
+  public static boolean isLocalAddress(InetSocketAddress targetAddr) {
+    InetAddress addr = targetAddr.getAddress();
+    Boolean cached = localAddrMap.get(addr.getHostAddress());
+    if (cached != null) {
+      LOG.trace("Address {} is {} local", targetAddr, (cached ? "" : "not"));
+      return cached;
+    }
+
+    boolean local = NetUtils.isLocalAddress(addr);
+
+    LOG.trace("Address {} is {} local", targetAddr, (local ? "" : "not"));
+    localAddrMap.put(addr.getHostAddress(), local);
+    return local;
+  }
+
+  /** Create a {@link ClientDatanodeProtocol} proxy */
+  public static ClientDatanodeProtocol createClientDatanodeProtocolProxy(
+      DatanodeID datanodeid, Configuration conf, int socketTimeout,
+      boolean connectToDnViaHostname, LocatedBlock locatedBlock) throws IOException {
+    return new ClientDatanodeProtocolTranslatorPB(datanodeid, conf, socketTimeout,
+        connectToDnViaHostname, locatedBlock);
+  }
+
+  /** Create {@link ClientDatanodeProtocol} proxy using kerberos ticket */
+  public static ClientDatanodeProtocol createClientDatanodeProtocolProxy(
+      DatanodeID datanodeid, Configuration conf, int socketTimeout,
+      boolean connectToDnViaHostname) throws IOException {
+    return new ClientDatanodeProtocolTranslatorPB(
+        datanodeid, conf, socketTimeout, connectToDnViaHostname);
+  }
+
+  /** Create a {@link ClientDatanodeProtocol} proxy */
+  public static ClientDatanodeProtocol createClientDatanodeProtocolProxy(
+      InetSocketAddress addr, UserGroupInformation ticket, Configuration conf,
+      SocketFactory factory) throws IOException {
+    return new ClientDatanodeProtocolTranslatorPB(addr, ticket, conf, factory);
+  }
+
+  public static Peer peerFromSocket(Socket socket)
+      throws IOException {
+    Peer peer;
+    boolean success = false;
+    try {
+      // TCP_NODELAY is crucial here because of bad interactions between
+      // Nagle's Algorithm and Delayed ACKs. With connection keepalive
+      // between the client and DN, the conversation looks like:
+      //   1. Client -> DN: Read block X
+      //   2. DN -> Client: data for block X
+      //   3. Client -> DN: Status OK (successful read)
+      //   4. Client -> DN: Read block Y
+      // The fact that step #3 and #4 are both in the client->DN direction
+      // triggers Nagling. If the DN is using delayed ACKs, this results
+      // in a delay of 40ms or more.
+      //
+      // TCP_NODELAY disables nagling and thus avoids this performance
+      // disaster.
+      socket.setTcpNoDelay(true);
+      SocketChannel channel = socket.getChannel();
+      if (channel == null) {
+        peer = new BasicInetPeer(socket);
+      } else {
+        peer = new NioInetPeer(socket);
+      }
+      success = true;
+      return peer;
+    } finally {
+      if (!success) {
+        // peer is always null so no need to call peer.close().
+        socket.close();
+      }
+    }
+  }
+
+  public static Peer peerFromSocketAndKey(
+        SaslDataTransferClient saslClient, Socket s,
+        DataEncryptionKeyFactory keyFactory,
+        Token<BlockTokenIdentifier> blockToken, DatanodeID datanodeId,
+        int socketTimeoutMs) throws IOException {
+    Peer peer = null;
+    boolean success = false;
+    try {
+      peer = peerFromSocket(s);
+      peer.setReadTimeout(socketTimeoutMs);
+      peer.setWriteTimeout(socketTimeoutMs);
+      peer = saslClient.peerSend(peer, keyFactory, blockToken, datanodeId);
+      success = true;
+      return peer;
+    } finally {
+      if (!success) {
+        IOUtilsClient.cleanup(null, peer);
+      }
+    }
+  }
+
+  public static int getIoFileBufferSize(Configuration conf) {
+    return conf.getInt(
+        CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_KEY,
+        CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_DEFAULT);
+  }
+
+  public static int getSmallBufferSize(Configuration conf) {
+    return Math.min(getIoFileBufferSize(conf) / 2, 512);
+  }
+
+  /**
+   * Probe for HDFS Encryption being enabled; this uses the value of the option
+   * {@link CommonConfigurationKeysPublic#HADOOP_SECURITY_KEY_PROVIDER_PATH}
+   * , returning true if that property contains a non-empty, non-whitespace
+   * string.
+   * @param conf configuration to probe
+   * @return true if encryption is considered enabled.
+   */
+  public static boolean isHDFSEncryptionEnabled(Configuration conf) {
+    return !(conf.getTrimmed(
+        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH, "")
+        .isEmpty());
+  }
+
+  public static InetSocketAddress getNNAddress(String address) {
+    return NetUtils.createSocketAddr(address,
+        HdfsClientConfigKeys.DFS_NAMENODE_RPC_PORT_DEFAULT);
+  }
+
+  public static InetSocketAddress getNNAddress(Configuration conf) {
+    URI filesystemURI = FileSystem.getDefaultUri(conf);
+    return getNNAddressCheckLogical(conf, filesystemURI);
+  }
+
+  /**
+   * @return address of file system
+   */
+  public static InetSocketAddress getNNAddress(URI filesystemURI) {
+    String authority = filesystemURI.getAuthority();
+    if (authority == null) {
+      throw new IllegalArgumentException(String.format(
+          "Invalid URI for NameNode address (check %s): %s has no authority.",
+          FileSystem.FS_DEFAULT_NAME_KEY, filesystemURI.toString()));
+    }
+    if (!HdfsConstants.HDFS_URI_SCHEME.equalsIgnoreCase(
+        filesystemURI.getScheme())) {
+      throw new IllegalArgumentException(String.format(
+          "Invalid URI for NameNode address (check %s): " +
+          "%s is not of scheme '%s'.", FileSystem.FS_DEFAULT_NAME_KEY,
+          filesystemURI.toString(), HdfsConstants.HDFS_URI_SCHEME));
+    }
+    return getNNAddress(authority);
+  }
+
+  /**
+   * Get the NN address from the URI. If the uri is logical, default address is
+   * returned. Otherwise return the DNS-resolved address of the URI.
+   *
+   * @param conf configuration
+   * @param filesystemURI URI of the file system
+   * @return address of file system
+   */
+  public static InetSocketAddress getNNAddressCheckLogical(Configuration conf,
+      URI filesystemURI) {
+    InetSocketAddress retAddr;
+    if (HAUtilClient.isLogicalUri(conf, filesystemURI)) {
+      retAddr = InetSocketAddress.createUnresolved(filesystemURI.getAuthority(),
+          HdfsClientConfigKeys.DFS_NAMENODE_RPC_PORT_DEFAULT);
+    } else {
+      retAddr = getNNAddress(filesystemURI);
+    }
+    return retAddr;
+  }
+
+  public static URI getNNUri(InetSocketAddress namenode) {
+    int port = namenode.getPort();
+    String portString =
+        (port == HdfsClientConfigKeys.DFS_NAMENODE_RPC_PORT_DEFAULT) ?
+        "" : (":" + port);
+    return URI.create(HdfsConstants.HDFS_URI_SCHEME + "://"
+        + namenode.getHostName() + portString);
+  }
+
+  /** Create a URI from the scheme and address */
+  public static URI createUri(String scheme, InetSocketAddress address) {
+    try {
+      return new URI(scheme, null, address.getHostName(), address.getPort(),
+          null, null, null);
+    } catch (URISyntaxException ue) {
+      throw new IllegalArgumentException(ue);
+    }
+  }
+
+  public static InterruptedIOException toInterruptedIOException(String message,
+      InterruptedException e) {
+    final InterruptedIOException iioe = new InterruptedIOException(message);
+    iioe.initCause(e);
+    return iioe;
   }
 }

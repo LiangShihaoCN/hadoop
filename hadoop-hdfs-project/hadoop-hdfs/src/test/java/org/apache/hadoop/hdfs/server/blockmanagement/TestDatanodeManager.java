@@ -19,11 +19,13 @@
 package org.apache.hadoop.hdfs.server.blockmanagement;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -38,17 +40,23 @@ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfoWithStorage;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.security.token.block.ExportedBlockKeys;
+import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+import org.apache.hadoop.hdfs.server.common.StorageInfo;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
 import org.apache.hadoop.net.DNSToSwitchMapping;
 import org.apache.hadoop.util.Shell;
 import org.junit.Assert;
 import org.junit.Test;
 import org.mockito.Mockito;
+import org.mockito.internal.util.reflection.Whitebox;
 import static org.hamcrest.core.Is.is;
 import static org.junit.Assert.*;
 
@@ -66,6 +74,52 @@ public class TestDatanodeManager {
     Mockito.when(bm.getBlockReportLeaseManager()).thenReturn(blm);
     DatanodeManager dm = new DatanodeManager(bm, fsn, conf);
     return dm;
+  }
+
+  /**
+   * Create an InetSocketAddress for a host:port string
+   * @param host a host identifier in host:port format
+   * @return a corresponding InetSocketAddress object
+   */
+  private static InetSocketAddress entry(String host) {
+    return HostFileManager.parseEntry("dummy", "dummy", host);
+  }
+
+  /**
+   * This test checks that if a node is re-registered with a new software
+   * version after the heartbeat expiry interval but before the HeartbeatManager
+   * has a chance to detect this and remove it, the node's version will still
+   * be correctly decremented.
+   */
+  @Test
+  public void testNumVersionsCorrectAfterReregister()
+      throws IOException, InterruptedException {
+    //Create the DatanodeManager which will be tested
+    FSNamesystem fsn = Mockito.mock(FSNamesystem.class);
+    Mockito.when(fsn.hasWriteLock()).thenReturn(true);
+    Configuration conf = new Configuration();
+    conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY, 0);
+    conf.setLong(DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY, 10);
+    DatanodeManager dm = mockDatanodeManager(fsn, conf);
+
+    String storageID = "someStorageID1";
+    String ip = "someIP" + storageID;
+
+    // Register then reregister the same node but with a different version
+    for (int i = 0; i <= 1; i++) {
+      dm.registerDatanode(new DatanodeRegistration(
+          new DatanodeID(ip, "", storageID, 9000, 0, 0, 0),
+          null, null, "version" + i));
+      if (i == 0) {
+        Thread.sleep(25);
+      }
+    }
+
+    //Verify DatanodeManager has the correct count
+    Map<String, Integer> mapToCheck = dm.getDatanodesSoftwareVersions();
+    assertNull("should be no more version0 nodes", mapToCheck.get("version0"));
+    assertEquals("should be one version1 node",
+        mapToCheck.get("version1").intValue(), 1);
   }
 
   /**
@@ -352,5 +406,89 @@ public class TestDatanodeManager {
     assertThat(sortedLocs[sortedLocs.length - 2].getAdminState(),
       is(DatanodeInfo.AdminStates.DECOMMISSIONED));
   }
-}
 
+  /**
+   * Test whether removing a host from the includes list without adding it to
+   * the excludes list will exclude it from data node reports.
+   */
+  @Test
+  public void testRemoveIncludedNode() throws IOException {
+    FSNamesystem fsn = Mockito.mock(FSNamesystem.class);
+
+    // Set the write lock so that the DatanodeManager can start
+    Mockito.when(fsn.hasWriteLock()).thenReturn(true);
+
+    DatanodeManager dm = mockDatanodeManager(fsn, new Configuration());
+    HostFileManager hm = new HostFileManager();
+    HostSet noNodes = new HostSet();
+    HostSet oneNode = new HostSet();
+    HostSet twoNodes = new HostSet();
+    DatanodeRegistration dr1 = new DatanodeRegistration(
+      new DatanodeID("127.0.0.1", "127.0.0.1", "someStorageID-123",
+          12345, 12345, 12345, 12345),
+      new StorageInfo(HdfsServerConstants.NodeType.DATA_NODE),
+      new ExportedBlockKeys(), "test");
+    DatanodeRegistration dr2 = new DatanodeRegistration(
+      new DatanodeID("127.0.0.1", "127.0.0.1", "someStorageID-234",
+          23456, 23456, 23456, 23456),
+      new StorageInfo(HdfsServerConstants.NodeType.DATA_NODE),
+      new ExportedBlockKeys(), "test");
+
+    twoNodes.add(entry("127.0.0.1:12345"));
+    twoNodes.add(entry("127.0.0.1:23456"));
+    oneNode.add(entry("127.0.0.1:23456"));
+
+    hm.refresh(twoNodes, noNodes);
+    Whitebox.setInternalState(dm, "hostConfigManager", hm);
+
+    // Register two data nodes to simulate them coming up.
+    // We need to add two nodes, because if we have only one node, removing it
+    // will cause the includes list to be empty, which means all hosts will be
+    // allowed.
+    dm.registerDatanode(dr1);
+    dm.registerDatanode(dr2);
+
+    // Make sure that both nodes are reported
+    List<DatanodeDescriptor> both =
+        dm.getDatanodeListForReport(HdfsConstants.DatanodeReportType.ALL);
+
+    // Sort the list so that we know which one is which
+    Collections.sort(both);
+
+    Assert.assertEquals("Incorrect number of hosts reported",
+        2, both.size());
+    Assert.assertEquals("Unexpected host or host in unexpected position",
+        "127.0.0.1:12345", both.get(0).getInfoAddr());
+    Assert.assertEquals("Unexpected host or host in unexpected position",
+        "127.0.0.1:23456", both.get(1).getInfoAddr());
+
+    // Remove one node from includes, but do not add it to excludes.
+    hm.refresh(oneNode, noNodes);
+
+    // Make sure that only one node is still reported
+    List<DatanodeDescriptor> onlyOne =
+        dm.getDatanodeListForReport(HdfsConstants.DatanodeReportType.ALL);
+
+    Assert.assertEquals("Incorrect number of hosts reported",
+        1, onlyOne.size());
+    Assert.assertEquals("Unexpected host reported",
+        "127.0.0.1:23456", onlyOne.get(0).getInfoAddr());
+
+    // Remove all nodes from includes
+    hm.refresh(noNodes, noNodes);
+
+    // Check that both nodes are reported again
+    List<DatanodeDescriptor> bothAgain =
+        dm.getDatanodeListForReport(HdfsConstants.DatanodeReportType.ALL);
+
+    // Sort the list so that we know which one is which
+    Collections.sort(bothAgain);
+
+    Assert.assertEquals("Incorrect number of hosts reported",
+        2, bothAgain.size());
+    Assert.assertEquals("Unexpected host or host in unexpected position",
+        "127.0.0.1:12345", bothAgain.get(0).getInfoAddr());
+    Assert.assertEquals("Unexpected host or host in unexpected position",
+        "127.0.0.1:23456", bothAgain.get(1).getInfoAddr());
+  }
+}

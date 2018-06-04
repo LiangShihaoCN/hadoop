@@ -116,14 +116,12 @@ public class DatanodeStorageInfo {
 
   private long capacity;
   private long dfsUsed;
+  private long nonDfsUsed;
   private volatile long remaining;
   private long blockPoolUsed;
 
   private volatile BlockInfo blockList = null;
   private int numBlocks = 0;
-
-  // The ID of the last full block report which updated this storage.
-  private long lastBlockReportId = 0;
 
   /** The number of block reports received */
   private int blockReportCount = 0;
@@ -151,7 +149,7 @@ public class DatanodeStorageInfo {
     this.state = s.getState();
   }
 
-  int getBlockReportCount() {
+  public int getBlockReportCount() {
     return blockReportCount;
   }
 
@@ -189,14 +187,6 @@ public class DatanodeStorageInfo {
     this.blockPoolUsed = blockPoolUsed;
   }
 
-  long getLastBlockReportId() {
-    return lastBlockReportId;
-  }
-
-  void setLastBlockReportId(long lastBlockReportId) {
-    this.lastBlockReportId = lastBlockReportId;
-  }
-
   State getState() {
     return this.state;
   }
@@ -223,6 +213,10 @@ public class DatanodeStorageInfo {
 
   long getDfsUsed() {
     return dfsUsed;
+  }
+
+  long getNonDfsUsed() {
+    return nonDfsUsed;
   }
 
   long getRemaining() {
@@ -298,6 +292,7 @@ public class DatanodeStorageInfo {
   void updateState(StorageReport r) {
     capacity = r.getCapacity();
     dfsUsed = r.getDfsUsed();
+    nonDfsUsed = r.getNonDfsUsed();
     remaining = r.getRemaining();
     blockPoolUsed = r.getBlockPoolUsed();
   }
@@ -310,6 +305,16 @@ public class DatanodeStorageInfo {
   public static void incrementBlocksScheduled(DatanodeStorageInfo... storages) {
     for (DatanodeStorageInfo s : storages) {
       s.getDatanodeDescriptor().incrementBlocksScheduled(s.getStorageType());
+    }
+  }
+
+  /**
+   * Decrement the number of blocks scheduled for each given storage. This will
+   * be called during abandon block or delete of UC block.
+   */
+  public static void decrementBlocksScheduled(DatanodeStorageInfo... storages) {
+    for (DatanodeStorageInfo s : storages) {
+      s.getDatanodeDescriptor().decrementBlocksScheduled(s.getStorageType());
     }
   }
 
@@ -337,7 +342,7 @@ public class DatanodeStorageInfo {
   StorageReport toStorageReport() {
     return new StorageReport(
         new DatanodeStorage(storageID, state, storageType),
-        false, capacity, dfsUsed, remaining, blockPoolUsed);
+        false, capacity, dfsUsed, remaining, blockPoolUsed, nonDfsUsed);
   }
 
   static Iterable<StorageType> toStorageTypes(

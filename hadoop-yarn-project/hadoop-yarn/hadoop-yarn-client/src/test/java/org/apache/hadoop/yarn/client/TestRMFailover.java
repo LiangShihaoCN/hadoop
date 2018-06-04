@@ -27,6 +27,7 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
+
 import javax.servlet.http.HttpServletResponse;
 
 import org.apache.commons.logging.Log;
@@ -45,6 +46,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.AdminService;
 import org.apache.hadoop.yarn.server.resourcemanager.HATestUtil;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
 import org.apache.hadoop.yarn.server.webproxy.WebAppProxyServer;
+import org.apache.hadoop.yarn.webapp.YarnWebParams;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -140,7 +142,6 @@ public class TestRMFailover extends ClientBaseWithFixes {
     conf.setBoolean(YarnConfiguration.AUTO_FAILOVER_ENABLED, false);
     cluster.init(conf);
     cluster.start();
-    getAdminService(0).transitionToActive(req);
     assertFalse("RM never turned active", -1 == cluster.getActiveRMIndex());
     verifyConnections();
 
@@ -229,7 +230,6 @@ public class TestRMFailover extends ClientBaseWithFixes {
     conf.setBoolean(YarnConfiguration.AUTO_FAILOVER_ENABLED, false);
     cluster.init(conf);
     cluster.start();
-    getAdminService(0).transitionToActive(req);
     assertFalse("RM never turned active", -1 == cluster.getActiveRMIndex());
     verifyConnections();
 
@@ -265,6 +265,7 @@ public class TestRMFailover extends ClientBaseWithFixes {
     getAdminService(0).transitionToActive(req);
     String rm1Url = "http://0.0.0.0:18088";
     String rm2Url = "http://0.0.0.0:28088";
+
     String redirectURL = getRedirectURL(rm2Url);
     // if uri is null, RMWebAppFilter will append a slash at the trail of the redirection url
     assertEquals(redirectURL,rm1Url+"/");
@@ -272,8 +273,8 @@ public class TestRMFailover extends ClientBaseWithFixes {
     redirectURL = getRedirectURL(rm2Url + "/metrics");
     assertEquals(redirectURL,rm1Url + "/metrics");
 
-    redirectURL = getRedirectURL(rm2Url + "/jmx");
-    assertEquals(redirectURL,rm1Url + "/jmx");
+    redirectURL = getRedirectURL(rm2Url + "/jmx?param1=value1+x&param2=y");
+    assertEquals(rm1Url + "/jmx?param1=value1+x&param2=y", redirectURL);
 
     // standby RM links /conf, /stacks, /logLevel, /static, /logs,
     // /cluster/cluster as well as webService
@@ -304,6 +305,17 @@ public class TestRMFailover extends ClientBaseWithFixes {
 
     redirectURL = getRedirectURL(rm2Url + "/proxy/" + fakeAppId);
     assertNull(redirectURL);
+
+    // transit the active RM to standby
+    // Both of RMs are in standby mode
+    getAdminService(0).transitionToStandby(req);
+    // RM2 is expected to send the httpRequest to itself.
+    // The Header Field: Refresh is expected to be set.
+    redirectURL = getRefreshURL(rm2Url);
+    assertTrue(redirectURL != null
+        && redirectURL.contains(YarnWebParams.NEXT_REFRESH_INTERVAL)
+        && redirectURL.contains(rm2Url));
+
   }
 
   // set up http connection with the given url and get the redirection url from the response
@@ -315,12 +327,26 @@ public class TestRMFailover extends ClientBaseWithFixes {
       // do not automatically follow the redirection
       // otherwise we get too many redirections exception
       conn.setInstanceFollowRedirects(false);
-      if(conn.getResponseCode() == HttpServletResponse.SC_TEMPORARY_REDIRECT)
+      if(conn.getResponseCode() == HttpServletResponse.SC_TEMPORARY_REDIRECT) {
         redirectUrl = conn.getHeaderField("Location");
+      }
     } catch (Exception e) {
       // throw new RuntimeException(e);
     }
     return redirectUrl;
   }
 
+  static String getRefreshURL(String url) {
+    String redirectUrl = null;
+    try {
+      HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+      // do not automatically follow the redirection
+      // otherwise we get too many redirections exception
+      conn.setInstanceFollowRedirects(false);
+      redirectUrl = conn.getHeaderField("Refresh");
+    } catch (Exception e) {
+      // throw new RuntimeException(e);
+    }
+    return redirectUrl;
+  }
 }

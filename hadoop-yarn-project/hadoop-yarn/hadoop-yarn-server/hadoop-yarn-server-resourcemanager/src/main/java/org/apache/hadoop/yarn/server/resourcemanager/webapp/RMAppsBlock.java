@@ -27,9 +27,12 @@ import java.util.Set;
 import org.apache.commons.lang.StringEscapeUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.yarn.api.ApplicationBaseProtocol;
+import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.webapp.AppsBlock;
 import org.apache.hadoop.yarn.server.webapp.dao.AppInfo;
 import org.apache.hadoop.yarn.util.ConverterUtils;
@@ -63,8 +66,11 @@ public class RMAppsBlock extends AppsBlock {
           .th(".runningcontainer", "Running Containers")
           .th(".allocatedCpu", "Allocated CPU VCores")
           .th(".allocatedMemory", "Allocated Memory MB")
+          .th(".queuePercentage", "% of Queue")
+          .th(".clusterPercentage", "% of Cluster")
           .th(".progress", "Progress")
-          .th(".ui", "Tracking UI").th(".blacklisted", "Blacklisted Nodes")._()
+          .th(".ui", "Tracking UI")
+          .th(".blacklisted", "Blacklisted Nodes")._()
           ._().tbody();
 
     StringBuilder appsTableData = new StringBuilder("[\n");
@@ -78,13 +84,28 @@ public class RMAppsBlock extends AppsBlock {
       }
 
       AppInfo app = new AppInfo(appReport);
+      ApplicationAttemptId appAttemptId = ApplicationAttemptId.fromString(
+          app.getCurrentAppAttemptId());
+      String queuePercent = "N/A";
+      String clusterPercent = "N/A";
+      if(appReport.getApplicationResourceUsageReport() != null) {
+        queuePercent = String.format("%.1f",
+            appReport.getApplicationResourceUsageReport()
+                .getQueueUsagePercentage());
+        clusterPercent = String.format("%.1f",
+            appReport.getApplicationResourceUsageReport().getClusterUsagePercentage());
+      }
+
       String blacklistedNodesCount = "N/A";
-      Set<String> nodes =
-          RMAppAttemptBlock
-            .getBlacklistedNodes(rm, ConverterUtils.toApplicationAttemptId(app
-              .getCurrentAppAttemptId()));
-      if (nodes != null) {
-        blacklistedNodesCount = String.valueOf(nodes.size());
+      RMApp rmApp = rm.getRMContext().getRMApps()
+          .get(appAttemptId.getApplicationId());
+      if (rmApp != null) {
+        RMAppAttempt appAttempt = rmApp.getRMAppAttempt(appAttemptId);
+        Set<String> nodes =
+            null == appAttempt ? null : appAttempt.getBlacklistedNodes();
+        if (nodes != null) {
+          blacklistedNodesCount = String.valueOf(nodes.size());
+        }
       }
       String percent = StringUtils.format("%.1f", app.getProgress());
       appsTableData
@@ -94,12 +115,12 @@ public class RMAppsBlock extends AppsBlock {
         .append(app.getAppId())
         .append("</a>\",\"")
         .append(
-          StringEscapeUtils.escapeJavaScript(StringEscapeUtils.escapeHtml(app
-            .getUser())))
+          StringEscapeUtils.escapeJavaScript(
+              StringEscapeUtils.escapeHtml(app.getUser())))
         .append("\",\"")
         .append(
-          StringEscapeUtils.escapeJavaScript(StringEscapeUtils.escapeHtml(app
-            .getName())))
+          StringEscapeUtils.escapeJavaScript(
+              StringEscapeUtils.escapeHtml(app.getName())))
         .append("\",\"")
         .append(
           StringEscapeUtils.escapeJavaScript(StringEscapeUtils.escapeHtml(app
@@ -122,11 +143,15 @@ public class RMAppsBlock extends AppsBlock {
         .append(app.getAllocatedCpuVcores() == -1 ? "N/A" : String
             .valueOf(app.getAllocatedCpuVcores()))
         .append("\",\"")
-        .append(app.getAllocatedMemoryMB() == -1 ? "N/A" : String
-            .valueOf(app.getAllocatedMemoryMB()))
+        .append(app.getAllocatedMemoryMB() == -1 ? "N/A" :
+            String.valueOf(app.getAllocatedMemoryMB()))
+        .append("\",\"")
+        .append(queuePercent)
+        .append("\",\"")
+        .append(clusterPercent)
         .append("\",\"")
         // Progress bar
-        .append("<br title='").append(percent).append("'> <div class='")
+          .append("<br title='").append(percent).append("'> <div class='")
         .append(C_PROGRESSBAR).append("' title='").append(join(percent, '%'))
         .append("'> ").append("<div class='").append(C_PROGRESSBAR_VALUE)
         .append("' style='").append(join("width:", percent, '%'))

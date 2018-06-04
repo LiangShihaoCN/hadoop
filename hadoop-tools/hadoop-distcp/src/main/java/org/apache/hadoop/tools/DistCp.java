@@ -19,6 +19,7 @@
 package org.apache.hadoop.tools;
 
 import java.io.IOException;
+import java.net.URL;
 import java.util.Random;
 
 import org.apache.commons.logging.Log;
@@ -175,11 +176,19 @@ public class DistCp extends Configured implements Tool {
         job = createJob();
       }
       if (inputOptions.shouldUseDiff()) {
-        if (!DistCpSync.sync(inputOptions, getConf())) {
-          inputOptions.disableUsingDiff();
+        DistCpSync distCpSync = new DistCpSync(inputOptions, getConf());
+        if (distCpSync.sync()) {
+          createInputFileListingWithDiff(job, distCpSync);
+        } else {
+          throw new Exception("DistCp sync failed, input options: "
+              + inputOptions);
         }
       }
-      createInputFileListing(job);
+
+      // Fallback to default DistCp if without "diff" option or sync failed.
+      if (!inputOptions.shouldUseDiff()) {
+        createInputFileListing(job);
+      }
 
       job.submit();
       submitted = true;
@@ -263,8 +272,14 @@ public class DistCp extends Configured implements Tool {
    */
   private void setupSSLConfig(Job job) throws IOException  {
     Configuration configuration = job.getConfiguration();
-    Path sslConfigPath = new Path(configuration.
-        getResource(inputOptions.getSslConfigurationFile()).toString());
+    URL sslFileUrl = configuration.getResource(inputOptions
+        .getSslConfigurationFile());
+    if (sslFileUrl == null) {
+      throw new IOException(
+          "Given ssl configuration file doesn't exist in class path : "
+              + inputOptions.getSslConfigurationFile());
+    }
+    Path sslConfigPath = new Path(sslFileUrl.toString());
 
     addSSLFilesToDistCache(job, sslConfigPath);
     configuration.set(DistCpConstants.CONF_LABEL_SSL_CONF, sslConfigPath.getName());
@@ -380,6 +395,22 @@ public class DistCp extends Configured implements Tool {
     Path fileListingPath = getFileListingPath();
     CopyListing copyListing = CopyListing.getCopyListing(job.getConfiguration(),
         job.getCredentials(), inputOptions);
+    copyListing.buildListing(fileListingPath, inputOptions);
+    return fileListingPath;
+  }
+
+  /**
+   * Create input listing based on snapshot diff report.
+   * @param job - Handle to job
+   * @param distCpSync the class wraps the snapshot diff report
+   * @return Returns the path where the copy listing is created
+   * @throws IOException - If any
+   */
+  private Path createInputFileListingWithDiff(Job job, DistCpSync distCpSync)
+      throws IOException {
+    Path fileListingPath = getFileListingPath();
+    CopyListing copyListing = new SimpleCopyListing(job.getConfiguration(),
+        job.getCredentials(), distCpSync);
     copyListing.buildListing(fileListingPath, inputOptions);
     return fileListingPath;
   }

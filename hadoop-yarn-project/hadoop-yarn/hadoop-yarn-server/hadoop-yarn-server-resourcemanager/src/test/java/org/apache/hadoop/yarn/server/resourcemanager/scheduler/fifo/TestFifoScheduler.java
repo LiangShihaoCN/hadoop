@@ -45,6 +45,7 @@ import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerState;
 import org.apache.hadoop.yarn.api.records.ContainerStatus;
 import org.apache.hadoop.yarn.api.records.NodeId;
+import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.api.records.Resource;
@@ -52,6 +53,9 @@ import org.apache.hadoop.yarn.api.records.ResourceOption;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.AsyncDispatcher;
+import org.apache.hadoop.yarn.event.Dispatcher;
+import org.apache.hadoop.yarn.event.Event;
+import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.event.InlineDispatcher;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
@@ -70,12 +74,14 @@ import org.apache.hadoop.yarn.server.resourcemanager.Task;
 import org.apache.hadoop.yarn.server.resourcemanager.ahs.RMApplicationHistoryWriter;
 import org.apache.hadoop.yarn.server.resourcemanager.metrics.SystemMetricsPublisher;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.NullRMNodeLabelsManager;
+import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Allocation;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
@@ -105,6 +111,7 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 public class TestFifoScheduler {
   private static final Log LOG = LogFactory.getLog(TestFifoScheduler.class);
@@ -112,7 +119,6 @@ public class TestFifoScheduler {
 
   private ResourceManager resourceManager = null;
   private static Configuration conf;
-  
   private static final RecordFactory recordFactory = 
       RecordFactoryProvider.getRecordFactory(null);
   
@@ -133,9 +139,15 @@ public class TestFifoScheduler {
       registerNode(String hostName, int containerManagerPort, int nmHttpPort,
           String rackName, Resource capability) throws IOException,
           YarnException {
-    return new org.apache.hadoop.yarn.server.resourcemanager.NodeManager(
-        hostName, containerManagerPort, nmHttpPort, rackName, capability,
-        resourceManager);
+    org.apache.hadoop.yarn.server.resourcemanager.NodeManager nm =
+        new org.apache.hadoop.yarn.server.resourcemanager.NodeManager(hostName,
+            containerManagerPort, nmHttpPort, rackName, capability,
+            resourceManager);
+    NodeAddedSchedulerEvent nodeAddEvent1 =
+        new NodeAddedSchedulerEvent(resourceManager.getRMContext().getRMNodes()
+            .get(nm.getNodeId()));
+    resourceManager.getResourceScheduler().handle(nodeAddEvent1);
+    return nm;
   }
   
   private ApplicationAttemptId createAppAttemptId(int appId, int attemptId) {
@@ -172,11 +184,12 @@ public class TestFifoScheduler {
     FifoScheduler scheduler = new FifoScheduler();
     RMApplicationHistoryWriter writer = mock(RMApplicationHistoryWriter.class);
     RMContext rmContext = new RMContextImpl(dispatcher, null,
-        null, null, null, null, null, null, null, writer, scheduler);
+        null, null, null, null, null, null, null, scheduler);
     ((RMContextImpl) rmContext).setSystemMetricsPublisher(
         mock(SystemMetricsPublisher.class));
 
     Configuration conf = new Configuration();
+    ((RMContextImpl) rmContext).setScheduler(scheduler);
     scheduler.setRMContext(rmContext);
     scheduler.init(conf);
     scheduler.start();
@@ -218,10 +231,10 @@ public class TestFifoScheduler {
     
     FifoScheduler scheduler = new FifoScheduler();
     RMContext rmContext = new RMContextImpl(dispatcher, null, null, null, null,
-        null, containerTokenSecretManager, nmTokenSecretManager, null, writer,
-        scheduler);
-    ((RMContextImpl) rmContext).setSystemMetricsPublisher(
-        mock(SystemMetricsPublisher.class));
+        null, containerTokenSecretManager, nmTokenSecretManager, null, scheduler);
+    rmContext.setSystemMetricsPublisher(mock(SystemMetricsPublisher.class));
+    rmContext.setRMApplicationHistoryWriter(
+        mock(RMApplicationHistoryWriter.class));
     ((RMContextImpl) rmContext).setYarnConfiguration(new YarnConfiguration());
 
     scheduler.setRMContext(rmContext);
@@ -263,7 +276,7 @@ public class TestFifoScheduler {
     ask.add(nodeLocal);
     ask.add(rackLocal);
     ask.add(any);
-    scheduler.allocate(appAttemptId, ask, new ArrayList<ContainerId>(), null, null);
+    scheduler.allocate(appAttemptId, ask, new ArrayList<ContainerId>(), null, null, null, null);
 
     NodeUpdateSchedulerEvent node0Update = new NodeUpdateSchedulerEvent(node0);
 
@@ -300,16 +313,16 @@ public class TestFifoScheduler {
       }
     };
     RMContext rmContext = new RMContextImpl(dispatcher, null, null, null, null,
-        null, containerTokenSecretManager, nmTokenSecretManager, null, writer,
-        scheduler);
-    ((RMContextImpl) rmContext).setSystemMetricsPublisher(
-        mock(SystemMetricsPublisher.class));
+        null, containerTokenSecretManager, nmTokenSecretManager, null, scheduler);
+    rmContext.setSystemMetricsPublisher(mock(SystemMetricsPublisher.class));
+    rmContext.setRMApplicationHistoryWriter(mock(RMApplicationHistoryWriter.class));
     ((RMContextImpl) rmContext).setYarnConfiguration(new YarnConfiguration());
     NullRMNodeLabelsManager nlm = new NullRMNodeLabelsManager();
     nlm.init(new Configuration());
     rmContext.setNodeLabelManager(nlm);
 
     scheduler.setRMContext(rmContext);
+    ((RMContextImpl) rmContext).setScheduler(scheduler);
     scheduler.init(conf);
     scheduler.start();
     scheduler.reinitialize(new Configuration(), rmContext);
@@ -328,14 +341,14 @@ public class TestFifoScheduler {
     
     NodeResourceUpdateSchedulerEvent node0ResourceUpdate = new 
         NodeResourceUpdateSchedulerEvent(node0, ResourceOption.newInstance(
-            newResource, RMNode.OVER_COMMIT_TIMEOUT_MILLIS_DEFAULT));
+            newResource, ResourceOption.OVER_COMMIT_TIMEOUT_MILLIS_DEFAULT));
     scheduler.handle(node0ResourceUpdate);
     
     // SchedulerNode's total resource and available resource are changed.
     assertEquals(schedulerNodes.get(node0.getNodeID()).getTotalResource()
-        .getMemory(), 1024);
+        .getMemorySize(), 1024);
     assertEquals(schedulerNodes.get(node0.getNodeID()).
-        getAvailableResource().getMemory(), 1024);
+        getAvailableResource().getMemorySize(), 1024);
     QueueInfo queueInfo = scheduler.getQueueInfo(null, false, false);
     Assert.assertEquals(0.0f, queueInfo.getCurrentCapacity(), 0.0f);
     
@@ -366,7 +379,7 @@ public class TestFifoScheduler {
     ask.add(nodeLocal);
     ask.add(rackLocal);
     ask.add(any);
-    scheduler.allocate(appAttemptId, ask, new ArrayList<ContainerId>(), null, null);
+    scheduler.allocate(appAttemptId, ask, new ArrayList<ContainerId>(), null, null, null, null);
 
     // Before the node update event, there are one local request
     Assert.assertEquals(1, nodeLocal.getNumContainers());
@@ -691,7 +704,7 @@ public class TestFifoScheduler {
     am1.registerAppAttempt();
     SchedulerNodeReport report_nm1 =
         rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
-    Assert.assertEquals(2 * GB, report_nm1.getUsedResource().getMemory());
+    Assert.assertEquals(2 * GB, report_nm1.getUsedResource().getMemorySize());
 
     RMApp app2 = rm.submitApp(2048);
     // kick the scheduling, 2GB given to AM, remaining 2 GB on nm2
@@ -701,7 +714,7 @@ public class TestFifoScheduler {
     am2.registerAppAttempt();
     SchedulerNodeReport report_nm2 =
         rm.getResourceScheduler().getNodeReport(nm2.getNodeId());
-    Assert.assertEquals(2 * GB, report_nm2.getUsedResource().getMemory());
+    Assert.assertEquals(2 * GB, report_nm2.getUsedResource().getMemorySize());
 
     // add request for containers
     am1.addRequests(new String[] { "127.0.0.1", "127.0.0.2" }, GB, 1, 1);
@@ -727,27 +740,27 @@ public class TestFifoScheduler {
 
     List<Container> allocated1 = alloc1Response.getAllocatedContainers();
     Assert.assertEquals(1, allocated1.size());
-    Assert.assertEquals(1 * GB, allocated1.get(0).getResource().getMemory());
+    Assert.assertEquals(1 * GB, allocated1.get(0).getResource().getMemorySize());
     Assert.assertEquals(nm1.getNodeId(), allocated1.get(0).getNodeId());
 
     List<Container> allocated2 = alloc2Response.getAllocatedContainers();
     Assert.assertEquals(1, allocated2.size());
-    Assert.assertEquals(3 * GB, allocated2.get(0).getResource().getMemory());
+    Assert.assertEquals(3 * GB, allocated2.get(0).getResource().getMemorySize());
     Assert.assertEquals(nm1.getNodeId(), allocated2.get(0).getNodeId());
 
     report_nm1 = rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
     report_nm2 = rm.getResourceScheduler().getNodeReport(nm2.getNodeId());
-    Assert.assertEquals(0, report_nm1.getAvailableResource().getMemory());
-    Assert.assertEquals(2 * GB, report_nm2.getAvailableResource().getMemory());
+    Assert.assertEquals(0, report_nm1.getAvailableResource().getMemorySize());
+    Assert.assertEquals(2 * GB, report_nm2.getAvailableResource().getMemorySize());
 
-    Assert.assertEquals(6 * GB, report_nm1.getUsedResource().getMemory());
-    Assert.assertEquals(2 * GB, report_nm2.getUsedResource().getMemory());
+    Assert.assertEquals(6 * GB, report_nm1.getUsedResource().getMemorySize());
+    Assert.assertEquals(2 * GB, report_nm2.getUsedResource().getMemorySize());
 
     Container c1 = allocated1.get(0);
-    Assert.assertEquals(GB, c1.getResource().getMemory());
+    Assert.assertEquals(GB, c1.getResource().getMemorySize());
     ContainerStatus containerStatus =
         BuilderUtils.newContainerStatus(c1.getId(), ContainerState.COMPLETE,
-            "", 0);
+            "", 0, c1.getResource());
     nm1.containerStatus(containerStatus);
     int waitCount = 0;
     while (attempt1.getJustFinishedContainers().size() < 1 && waitCount++ != 20) {
@@ -759,7 +772,7 @@ public class TestFifoScheduler {
     Assert.assertEquals(1, am1.schedule().getCompletedContainersStatuses()
         .size());
     report_nm1 = rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
-    Assert.assertEquals(5 * GB, report_nm1.getUsedResource().getMemory());
+    Assert.assertEquals(5 * GB, report_nm1.getUsedResource().getMemorySize());
 
     rm.stop();
   }
@@ -816,7 +829,7 @@ public class TestFifoScheduler {
     int checkAlloc =
         conf.getInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB,
             YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_MB);
-    Assert.assertEquals(checkAlloc, report_nm1.getUsedResource().getMemory());
+    Assert.assertEquals(checkAlloc, report_nm1.getUsedResource().getMemorySize());
 
     rm.stop();
   }
@@ -938,11 +951,13 @@ public class TestFifoScheduler {
     // Ask for a 1 GB container for app 1
     List<ResourceRequest> ask1 = new ArrayList<ResourceRequest>();
     ask1.add(BuilderUtils.newResourceRequest(BuilderUtils.newPriority(0),
-        "rack1", BuilderUtils.newResource(GB, 1), 1));
+        "rack1", BuilderUtils.newResource(GB, 1), 1,
+        RMNodeLabelsManager.NO_LABEL));
     ask1.add(BuilderUtils.newResourceRequest(BuilderUtils.newPriority(0),
-        ResourceRequest.ANY, BuilderUtils.newResource(GB, 1), 1));
+        ResourceRequest.ANY, BuilderUtils.newResource(GB, 1), 1,
+        RMNodeLabelsManager.NO_LABEL));
     fs.allocate(appAttemptId1, ask1, emptyId,
-        Collections.singletonList(host_1_0), null);
+        Collections.singletonList(host_1_0), null, null, null);
 
     // Trigger container assignment
     fs.handle(new NodeUpdateSchedulerEvent(n3));
@@ -950,14 +965,14 @@ public class TestFifoScheduler {
     // Get the allocation for the application and verify no allocation on
     // blacklist node
     Allocation allocation1 =
-        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null, null, null);
 
     Assert.assertEquals("allocation1", 0, allocation1.getContainers().size());
 
     // verify host_1_1 can get allocated as not in blacklist
     fs.handle(new NodeUpdateSchedulerEvent(n4));
     Allocation allocation2 =
-        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null, null, null);
     Assert.assertEquals("allocation2", 1, allocation2.getContainers().size());
     List<Container> containerList = allocation2.getContainers();
     for (Container container : containerList) {
@@ -972,29 +987,29 @@ public class TestFifoScheduler {
     ask2.add(BuilderUtils.newResourceRequest(BuilderUtils.newPriority(0),
         ResourceRequest.ANY, BuilderUtils.newResource(GB, 1), 1));
     fs.allocate(appAttemptId1, ask2, emptyId,
-        Collections.singletonList("rack0"), null);
+        Collections.singletonList("rack0"), null, null, null);
 
     // verify n1 is not qualified to be allocated
     fs.handle(new NodeUpdateSchedulerEvent(n1));
     Allocation allocation3 =
-        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null, null, null);
     Assert.assertEquals("allocation3", 0, allocation3.getContainers().size());
 
     // verify n2 is not qualified to be allocated
     fs.handle(new NodeUpdateSchedulerEvent(n2));
     Allocation allocation4 =
-        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null, null, null);
     Assert.assertEquals("allocation4", 0, allocation4.getContainers().size());
 
     // verify n3 is not qualified to be allocated
     fs.handle(new NodeUpdateSchedulerEvent(n3));
     Allocation allocation5 =
-        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null, null, null);
     Assert.assertEquals("allocation5", 0, allocation5.getContainers().size());
 
     fs.handle(new NodeUpdateSchedulerEvent(n4));
     Allocation allocation6 =
-        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null, null, null);
     Assert.assertEquals("allocation6", 1, allocation6.getContainers().size());
 
     containerList = allocation6.getContainers();
@@ -1053,33 +1068,34 @@ public class TestFifoScheduler {
     List<ResourceRequest> ask1 = new ArrayList<ResourceRequest>();
     ask1.add(BuilderUtils.newResourceRequest(BuilderUtils.newPriority(0),
         ResourceRequest.ANY, BuilderUtils.newResource(GB, 1), 1));
-    fs.allocate(appAttemptId1, ask1, emptyId, null, null);
+    fs.allocate(appAttemptId1, ask1, emptyId, null, null, null, null);
 
     // Ask for a 2 GB container for app 2
     List<ResourceRequest> ask2 = new ArrayList<ResourceRequest>();
     ask2.add(BuilderUtils.newResourceRequest(BuilderUtils.newPriority(0),
         ResourceRequest.ANY, BuilderUtils.newResource(2 * GB, 1), 1));
-    fs.allocate(appAttemptId2, ask2, emptyId, null, null);
+    fs.allocate(appAttemptId2, ask2, emptyId, null, null, null, null);
 
     // Trigger container assignment
     fs.handle(new NodeUpdateSchedulerEvent(n1));
 
     // Get the allocation for the applications and verify headroom
     Allocation allocation1 =
-        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId1, emptyAsk, emptyId, null, null, null, null);
     Assert.assertEquals("Allocation headroom", 1 * GB, allocation1
-        .getResourceLimit().getMemory());
+        .getResourceLimit().getMemorySize());
 
     Allocation allocation2 =
-        fs.allocate(appAttemptId2, emptyAsk, emptyId, null, null);
+        fs.allocate(appAttemptId2, emptyAsk, emptyId, null, null, null, null);
     Assert.assertEquals("Allocation headroom", 1 * GB, allocation2
-        .getResourceLimit().getMemory());
+        .getResourceLimit().getMemorySize());
 
     rm.stop();
   }
 
   @Test(timeout = 60000)
   public void testResourceOverCommit() throws Exception {
+    int waitCount;
     MockRM rm = new MockRM(conf);
     rm.start();
 
@@ -1094,8 +1110,8 @@ public class TestFifoScheduler {
     SchedulerNodeReport report_nm1 =
         rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
     // check node report, 2 GB used and 2 GB available
-    Assert.assertEquals(2 * GB, report_nm1.getUsedResource().getMemory());
-    Assert.assertEquals(2 * GB, report_nm1.getAvailableResource().getMemory());
+    Assert.assertEquals(2 * GB, report_nm1.getUsedResource().getMemorySize());
+    Assert.assertEquals(2 * GB, report_nm1.getAvailableResource().getMemorySize());
 
     // add request for containers
     am1.addRequests(new String[] { "127.0.0.1", "127.0.0.2" }, 2 * GB, 1, 1);
@@ -1111,17 +1127,17 @@ public class TestFifoScheduler {
 
     List<Container> allocated1 = alloc1Response.getAllocatedContainers();
     Assert.assertEquals(1, allocated1.size());
-    Assert.assertEquals(2 * GB, allocated1.get(0).getResource().getMemory());
+    Assert.assertEquals(2 * GB, allocated1.get(0).getResource().getMemorySize());
     Assert.assertEquals(nm1.getNodeId(), allocated1.get(0).getNodeId());
 
     report_nm1 = rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
     // check node report, 4 GB used and 0 GB available
-    Assert.assertEquals(0, report_nm1.getAvailableResource().getMemory());
-    Assert.assertEquals(4 * GB, report_nm1.getUsedResource().getMemory());
+    Assert.assertEquals(0, report_nm1.getAvailableResource().getMemorySize());
+    Assert.assertEquals(4 * GB, report_nm1.getUsedResource().getMemorySize());
 
     // check container is assigned with 2 GB.
     Container c1 = allocated1.get(0);
-    Assert.assertEquals(2 * GB, c1.getResource().getMemory());
+    Assert.assertEquals(2 * GB, c1.getResource().getMemorySize());
 
     // update node resource to 2 GB, so resource is over-consumed.
     Map<NodeId, ResourceOption> nodeResourceMap =
@@ -1132,19 +1148,30 @@ public class TestFifoScheduler {
         UpdateNodeResourceRequest.newInstance(nodeResourceMap);
     rm.getAdminService().updateNodeResource(request);
 
+    waitCount = 0;
+    while (waitCount++ != 20) {
+      report_nm1 = rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
+      if (null != report_nm1 &&
+          report_nm1.getAvailableResource().getMemorySize() != 0) {
+        break;
+      }
+      LOG.info("Waiting for RMNodeResourceUpdateEvent to be handled... Tried "
+          + waitCount + " times already..");
+      Thread.sleep(1000);
+    }
     // Now, the used resource is still 4 GB, and available resource is minus
     // value.
     report_nm1 = rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
-    Assert.assertEquals(4 * GB, report_nm1.getUsedResource().getMemory());
-    Assert.assertEquals(-2 * GB, report_nm1.getAvailableResource().getMemory());
+    Assert.assertEquals(4 * GB, report_nm1.getUsedResource().getMemorySize());
+    Assert.assertEquals(-2 * GB, report_nm1.getAvailableResource().getMemorySize());
 
     // Check container can complete successfully in case of resource
     // over-commitment.
     ContainerStatus containerStatus =
         BuilderUtils.newContainerStatus(c1.getId(), ContainerState.COMPLETE,
-            "", 0);
+            "", 0, c1.getResource());
     nm1.containerStatus(containerStatus);
-    int waitCount = 0;
+    waitCount = 0;
     while (attempt1.getJustFinishedContainers().size() < 1 && waitCount++ != 20) {
       LOG.info("Waiting for containers to be finished for app 1... Tried "
           + waitCount + " times already..");
@@ -1154,20 +1181,109 @@ public class TestFifoScheduler {
     Assert.assertEquals(1, am1.schedule().getCompletedContainersStatuses()
         .size());
     report_nm1 = rm.getResourceScheduler().getNodeReport(nm1.getNodeId());
-    Assert.assertEquals(2 * GB, report_nm1.getUsedResource().getMemory());
+    Assert.assertEquals(2 * GB, report_nm1.getUsedResource().getMemorySize());
     // As container return 2 GB back, the available resource becomes 0 again.
-    Assert.assertEquals(0 * GB, report_nm1.getAvailableResource().getMemory());
+    Assert.assertEquals(0 * GB, report_nm1.getAvailableResource().getMemorySize());
     rm.stop();
+  }
+
+  @Test
+  public void testResourceUpdateDecommissioningNode() throws Exception {
+    // Mock the RMNodeResourceUpdate event handler to update SchedulerNode
+    // to have 0 available resource
+    RMContext spyContext = Mockito.spy(resourceManager.getRMContext());
+    Dispatcher mockDispatcher = mock(AsyncDispatcher.class);
+    when(mockDispatcher.getEventHandler()).thenReturn(new EventHandler() {
+      @Override
+      public void handle(Event event) {
+        if (event instanceof RMNodeResourceUpdateEvent) {
+          RMNodeResourceUpdateEvent resourceEvent =
+              (RMNodeResourceUpdateEvent) event;
+          resourceManager
+              .getResourceScheduler()
+              .getSchedulerNode(resourceEvent.getNodeId())
+              .updateTotalResource(resourceEvent.getResourceOption().getResource());
+        }
+      }
+    });
+    Mockito.doReturn(mockDispatcher).when(spyContext).getDispatcher();
+    ((FifoScheduler) resourceManager.getResourceScheduler())
+        .setRMContext(spyContext);
+    ((AsyncDispatcher) mockDispatcher).start();
+    // Register node
+    String host_0 = "host_0";
+    org.apache.hadoop.yarn.server.resourcemanager.NodeManager nm_0 =
+        registerNode(host_0, 1234, 2345, NetworkTopology.DEFAULT_RACK,
+            Resources.createResource(8 * GB, 4));
+    // ResourceRequest priorities
+    Priority priority_0 =
+        org.apache.hadoop.yarn.server.resourcemanager.resource.Priority
+            .create(0);
+
+    // Submit an application
+    Application application_0 =
+        new Application("user_0", "a1", resourceManager);
+    application_0.submit();
+
+    application_0.addNodeManager(host_0, 1234, nm_0);
+
+    Resource capability_0_0 = Resources.createResource(1 * GB, 1);
+    application_0.addResourceRequestSpec(priority_0, capability_0_0);
+
+    Task task_0_0 =
+        new Task(application_0, priority_0, new String[] { host_0 });
+    application_0.addTask(task_0_0);
+
+    // Send resource requests to the scheduler
+    application_0.schedule();
+
+    RMNode node =
+        resourceManager.getRMContext().getRMNodes().get(nm_0.getNodeId());
+    // Send a heartbeat to kick the tires on the Scheduler
+    NodeUpdateSchedulerEvent nodeUpdate = new NodeUpdateSchedulerEvent(node);
+    resourceManager.getResourceScheduler().handle(nodeUpdate);
+
+    // Kick off another heartbeat with the node state mocked to decommissioning
+    // This should update the schedulernodes to have 0 available resource
+    RMNode spyNode =
+        Mockito.spy(resourceManager.getRMContext().getRMNodes()
+            .get(nm_0.getNodeId()));
+    when(spyNode.getState()).thenReturn(NodeState.DECOMMISSIONING);
+    resourceManager.getResourceScheduler().handle(
+        new NodeUpdateSchedulerEvent(spyNode));
+
+    // Get allocations from the scheduler
+    application_0.schedule();
+
+    // Check the used resource is 1 GB 1 core
+    // Assert.assertEquals(1 * GB, nm_0.getUsed().getMemory());
+    Resource usedResource =
+        resourceManager.getResourceScheduler()
+            .getSchedulerNode(nm_0.getNodeId()).getUsedResource();
+    Assert.assertEquals(usedResource.getMemorySize(), 1 * GB);
+    Assert.assertEquals(usedResource.getVirtualCores(), 1);
+    // Check total resource of scheduler node is also changed to 1 GB 1 core
+    Resource totalResource =
+        resourceManager.getResourceScheduler()
+            .getSchedulerNode(nm_0.getNodeId()).getTotalResource();
+    Assert.assertEquals(totalResource.getMemorySize(), 1 * GB);
+    Assert.assertEquals(totalResource.getVirtualCores(), 1);
+    // Check the available resource is 0/0
+    Resource availableResource =
+        resourceManager.getResourceScheduler()
+            .getSchedulerNode(nm_0.getNodeId()).getAvailableResource();
+    Assert.assertEquals(availableResource.getMemorySize(), 0);
+    Assert.assertEquals(availableResource.getVirtualCores(), 0);
   }
 
   private void checkApplicationResourceUsage(int expected, 
       Application application) {
-    Assert.assertEquals(expected, application.getUsedResources().getMemory());
+    Assert.assertEquals(expected, application.getUsedResources().getMemorySize());
   }
   
   private void checkNodeResourceUsage(int expected,
       org.apache.hadoop.yarn.server.resourcemanager.NodeManager node) {
-    Assert.assertEquals(expected, node.getUsed().getMemory());
+    Assert.assertEquals(expected, node.getUsed().getMemorySize());
     node.checkResourceUsage();
   }
 

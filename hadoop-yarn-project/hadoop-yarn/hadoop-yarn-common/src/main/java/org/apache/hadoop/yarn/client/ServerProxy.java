@@ -63,7 +63,8 @@ public class ServerProxy {
     RetryPolicy retryPolicy = null;
     if (maxWaitTime == -1) {
       // wait forever.
-      retryPolicy = RetryPolicies.RETRY_FOREVER;
+      retryPolicy = RetryPolicies.retryForeverWithFixedSleep(retryIntervalMS,
+          TimeUnit.MILLISECONDS);
     } else {
       retryPolicy =
           RetryPolicies.retryUpToMaximumTimeWithFixedSleep(maxWaitTime,
@@ -76,6 +77,7 @@ public class ServerProxy {
     exceptionToPolicyMap.put(ConnectException.class, retryPolicy);
     exceptionToPolicyMap.put(NoRouteToHostException.class, retryPolicy);
     exceptionToPolicyMap.put(UnknownHostException.class, retryPolicy);
+    exceptionToPolicyMap.put(ConnectTimeoutException.class, retryPolicy);
     exceptionToPolicyMap.put(RetriableException.class, retryPolicy);
     exceptionToPolicyMap.put(SocketException.class, retryPolicy);
     exceptionToPolicyMap.put(NMNotYetReadyException.class, retryPolicy);

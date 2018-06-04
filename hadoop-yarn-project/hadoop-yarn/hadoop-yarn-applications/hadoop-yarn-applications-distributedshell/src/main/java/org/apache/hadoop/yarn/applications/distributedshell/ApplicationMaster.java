@@ -87,7 +87,9 @@ import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.api.records.URL;
+import org.apache.hadoop.yarn.api.records.UpdatedContainer;
 import org.apache.hadoop.yarn.api.records.timeline.TimelineEntity;
+import org.apache.hadoop.yarn.api.records.timeline.TimelineEntityGroupId;
 import org.apache.hadoop.yarn.api.records.timeline.TimelineEvent;
 import org.apache.hadoop.yarn.api.records.timeline.TimelinePutResponse;
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest;
@@ -99,9 +101,11 @@ import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.util.ConverterUtils;
+import org.apache.hadoop.yarn.util.timeline.TimelineUtils;
 import org.apache.log4j.LogManager;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.sun.jersey.api.client.ClientHandlerException;
 
 /**
  * An ApplicationMaster for executing shell commands on a set of launched
@@ -218,7 +222,7 @@ public class ApplicationMaster {
   @VisibleForTesting
   protected int numTotalContainers = 1;
   // Memory to request for the container on which the shell command will run
-  private int containerMemory = 10;
+  private long containerMemory = 10;
   // VirtualCores to request for the container on which the shell command will run
   private int containerVirtualCores = 1;
   // Priority of the request
@@ -277,6 +281,9 @@ public class ApplicationMaster {
   // Timeline Client
   @VisibleForTesting
   TimelineClient timelineClient;
+  static final String CONTAINER_ENTITY_GROUP_ID = "CONTAINERS";
+  static final String APPID_TIMELINE_FILTER_NAME = "appId";
+  static final String USER_TIMELINE_FILTER_NAME = "user";
 
   private final String linux_bash_command = "bash";
   private final String windows_command = "cmd /c";
@@ -406,13 +413,13 @@ public class ApplicationMaster {
     if (!envs.containsKey(Environment.CONTAINER_ID.name())) {
       if (cliParser.hasOption("app_attempt_id")) {
         String appIdStr = cliParser.getOptionValue("app_attempt_id", "");
-        appAttemptID = ConverterUtils.toApplicationAttemptId(appIdStr);
+        appAttemptID = ApplicationAttemptId.fromString(appIdStr);
       } else {
         throw new IllegalArgumentException(
             "Application Attempt Id not set in the environment");
       }
     } else {
-      ContainerId containerId = ConverterUtils.toContainerId(envs
+      ContainerId containerId = ContainerId.fromString(envs
           .get(Environment.CONTAINER_ID.name()));
       appAttemptID = containerId.getApplicationAttemptId();
     }
@@ -556,7 +563,8 @@ public class ApplicationMaster {
     appSubmitterUgi.addCredentials(credentials);
 
 
-    AMRMClientAsync.CallbackHandler allocListener = new RMCallbackHandler();
+    AMRMClientAsync.AbstractCallbackHandler allocListener =
+        new RMCallbackHandler();
     amRMClient = AMRMClientAsync.createAMRMClientAsync(1000, allocListener);
     amRMClient.init(conf);
     amRMClient.start();
@@ -586,7 +594,7 @@ public class ApplicationMaster {
             appMasterTrackingUrl);
     // Dump out information about cluster capability as seen by the
     // resource manager
-    int maxMem = response.getMaximumResourceCapability().getMemory();
+    long maxMem = response.getMaximumResourceCapability().getMemorySize();
     LOG.info("Max mem capability of resources in this cluster " + maxMem);
     
     int maxVCores = response.getMaximumResourceCapability().getVirtualCores();
@@ -731,7 +739,7 @@ public class ApplicationMaster {
   }
 
   @VisibleForTesting
-  class RMCallbackHandler implements AMRMClientAsync.CallbackHandler {
+  class RMCallbackHandler extends AMRMClientAsync.AbstractCallbackHandler {
     @SuppressWarnings("unchecked")
     @Override
     public void onContainersCompleted(List<ContainerStatus> completedContainers) {
@@ -816,7 +824,7 @@ public class ApplicationMaster {
             + ":" + allocatedContainer.getNodeId().getPort()
             + ", containerNodeURI=" + allocatedContainer.getNodeHttpAddress()
             + ", containerResourceMemory"
-            + allocatedContainer.getResource().getMemory()
+            + allocatedContainer.getResource().getMemorySize()
             + ", containerResourceVirtualCores"
             + allocatedContainer.getResource().getVirtualCores());
         // + ", containerToken"
@@ -833,6 +841,10 @@ public class ApplicationMaster {
         launchThread.start();
       }
     }
+
+    @Override
+    public void onContainersUpdated(
+        List<UpdatedContainer> containers) {}
 
     @Override
     public void onShutdownRequest() {
@@ -852,14 +864,14 @@ public class ApplicationMaster {
 
     @Override
     public void onError(Throwable e) {
+      LOG.error("Error in RMCallbackHandler: ", e);
       done = true;
       amRMClient.stop();
     }
   }
 
   @VisibleForTesting
-  static class NMCallbackHandler
-    implements NMClientAsync.CallbackHandler {
+  static class NMCallbackHandler extends NMClientAsync.AbstractCallbackHandler {
 
     private ConcurrentMap<ContainerId, Container> containers =
         new ConcurrentHashMap<ContainerId, Container>();
@@ -901,11 +913,15 @@ public class ApplicationMaster {
         applicationMaster.nmClientAsync.getContainerStatusAsync(containerId, container.getNodeId());
       }
       if(applicationMaster.timelineClient != null) {
-        ApplicationMaster.publishContainerStartEvent(
+        applicationMaster.publishContainerStartEvent(
             applicationMaster.timelineClient, container,
             applicationMaster.domainId, applicationMaster.appSubmitterUgi);
       }
     }
+
+    @Override
+    public void onContainerResourceIncreased(
+        ContainerId containerId, Resource resource) {}
 
     @Override
     public void onStartContainerError(ContainerId containerId, Throwable t) {
@@ -926,6 +942,11 @@ public class ApplicationMaster {
       LOG.error("Failed to stop Container " + containerId);
       containers.remove(containerId);
     }
+
+    @Override
+    public void onIncreaseContainerResourceError(
+        ContainerId containerId, Throwable t) {}
+
   }
 
   /**
@@ -992,8 +1013,7 @@ public class ApplicationMaster {
 
         URL yarnUrl = null;
         try {
-          yarnUrl = ConverterUtils.getYarnUrlFromURI(
-            new URI(renamedScriptPath.toString()));
+          yarnUrl = URL.fromURI(new URI(renamedScriptPath.toString()));
         } catch (URISyntaxException e) {
           LOG.error("Error when trying to use shell script path specified"
               + " in env, path=" + renamedScriptPath, e);
@@ -1108,15 +1128,17 @@ public class ApplicationMaster {
       org.apache.commons.io.IOUtils.closeQuietly(ds);
     }
   }
-  
-  private static void publishContainerStartEvent(
-      final TimelineClient timelineClient, Container container, String domainId,
-      UserGroupInformation ugi) {
+
+  private void publishContainerStartEvent(
+      final TimelineClient timelineClient, final Container container,
+      String domainId, UserGroupInformation ugi) {
     final TimelineEntity entity = new TimelineEntity();
     entity.setEntityId(container.getId().toString());
     entity.setEntityType(DSEntity.DS_CONTAINER.toString());
     entity.setDomainId(domainId);
-    entity.addPrimaryFilter("user", ugi.getShortUserName());
+    entity.addPrimaryFilter(USER_TIMELINE_FILTER_NAME, ugi.getShortUserName());
+    entity.addPrimaryFilter(APPID_TIMELINE_FILTER_NAME, container.getId()
+        .getApplicationAttemptId().getApplicationId().toString());
     TimelineEvent event = new TimelineEvent();
     event.setTimestamp(System.currentTimeMillis());
     event.setEventType(DSEvent.DS_CONTAINER_START.toString());
@@ -1125,27 +1147,28 @@ public class ApplicationMaster {
     entity.addEvent(event);
 
     try {
-      ugi.doAs(new PrivilegedExceptionAction<TimelinePutResponse>() {
-        @Override
-        public TimelinePutResponse run() throws Exception {
-          return timelineClient.putEntities(entity);
-        }
-      });
-    } catch (Exception e) {
+      processTimelineResponseErrors(
+          putContainerEntity(timelineClient,
+              container.getId().getApplicationAttemptId(),
+              entity));
+    } catch (YarnException | IOException | ClientHandlerException e) {
       LOG.error("Container start event could not be published for "
-          + container.getId().toString(),
-          e instanceof UndeclaredThrowableException ? e.getCause() : e);
+          + container.getId().toString(), e);
     }
   }
 
-  private static void publishContainerEndEvent(
+  @VisibleForTesting
+  void publishContainerEndEvent(
       final TimelineClient timelineClient, ContainerStatus container,
       String domainId, UserGroupInformation ugi) {
     final TimelineEntity entity = new TimelineEntity();
     entity.setEntityId(container.getContainerId().toString());
     entity.setEntityType(DSEntity.DS_CONTAINER.toString());
     entity.setDomainId(domainId);
-    entity.addPrimaryFilter("user", ugi.getShortUserName());
+    entity.addPrimaryFilter(USER_TIMELINE_FILTER_NAME, ugi.getShortUserName());
+    entity.addPrimaryFilter(APPID_TIMELINE_FILTER_NAME,
+        container.getContainerId().getApplicationAttemptId()
+            .getApplicationId().toString());
     TimelineEvent event = new TimelineEvent();
     event.setTimestamp(System.currentTimeMillis());
     event.setEventType(DSEvent.DS_CONTAINER_END.toString());
@@ -1153,33 +1176,67 @@ public class ApplicationMaster {
     event.addEventInfo("Exit Status", container.getExitStatus());
     entity.addEvent(event);
     try {
-      timelineClient.putEntities(entity);
-    } catch (YarnException | IOException e) {
+      processTimelineResponseErrors(
+          putContainerEntity(timelineClient,
+              container.getContainerId().getApplicationAttemptId(),
+              entity));
+    } catch (YarnException | IOException | ClientHandlerException e) {
       LOG.error("Container end event could not be published for "
           + container.getContainerId().toString(), e);
     }
   }
 
-  private static void publishApplicationAttemptEvent(
+  private TimelinePutResponse putContainerEntity(
+      TimelineClient timelineClient, ApplicationAttemptId currAttemptId,
+      TimelineEntity entity)
+      throws YarnException, IOException {
+    if (TimelineUtils.timelineServiceV1_5Enabled(conf)) {
+      TimelineEntityGroupId groupId = TimelineEntityGroupId.newInstance(
+          currAttemptId.getApplicationId(),
+          CONTAINER_ENTITY_GROUP_ID);
+      return timelineClient.putEntities(currAttemptId, groupId, entity);
+    } else {
+      return timelineClient.putEntities(entity);
+    }
+  }
+
+  private void publishApplicationAttemptEvent(
       final TimelineClient timelineClient, String appAttemptId,
       DSEvent appEvent, String domainId, UserGroupInformation ugi) {
     final TimelineEntity entity = new TimelineEntity();
     entity.setEntityId(appAttemptId);
     entity.setEntityType(DSEntity.DS_APP_ATTEMPT.toString());
     entity.setDomainId(domainId);
-    entity.addPrimaryFilter("user", ugi.getShortUserName());
+    entity.addPrimaryFilter(USER_TIMELINE_FILTER_NAME, ugi.getShortUserName());
     TimelineEvent event = new TimelineEvent();
     event.setEventType(appEvent.toString());
     event.setTimestamp(System.currentTimeMillis());
     entity.addEvent(event);
     try {
-      timelineClient.putEntities(entity);
-    } catch (YarnException | IOException e) {
+      TimelinePutResponse response = timelineClient.putEntities(entity);
+      processTimelineResponseErrors(response);
+    } catch (YarnException | IOException | ClientHandlerException e) {
       LOG.error("App Attempt "
           + (appEvent.equals(DSEvent.DS_APP_ATTEMPT_START) ? "start" : "end")
           + " event could not be published for "
           + appAttemptId.toString(), e);
     }
+  }
+
+  private TimelinePutResponse processTimelineResponseErrors(
+      TimelinePutResponse response) {
+    List<TimelinePutResponse.TimelinePutError> errors = response.getErrors();
+    if (errors.size() == 0) {
+      LOG.debug("Timeline entities are successfully put");
+    } else {
+      for (TimelinePutResponse.TimelinePutError error : errors) {
+        LOG.error(
+            "Error when publishing entity [" + error.getEntityType() + ","
+                + error.getEntityId() + "], server side error code: "
+                + error.getErrorCode());
+      }
+    }
+    return response;
   }
 
   RMCallbackHandler getRMCallbackHandler() {

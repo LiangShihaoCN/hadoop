@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
@@ -49,6 +50,7 @@ import org.apache.hadoop.mapreduce.JobCounter;
 import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.mapreduce.TaskType;
 import org.apache.hadoop.mapreduce.TypeConverter;
+import org.apache.hadoop.mapreduce.util.MRJobConfUtil;
 import org.apache.hadoop.mapreduce.v2.api.records.JobId;
 import org.apache.hadoop.mapreduce.v2.api.records.JobState;
 import org.apache.hadoop.mapreduce.v2.app.AppContext;
@@ -58,11 +60,13 @@ import org.apache.hadoop.mapreduce.v2.jobhistory.FileNameIndexUtils;
 import org.apache.hadoop.mapreduce.v2.jobhistory.JHAdminConfig;
 import org.apache.hadoop.mapreduce.v2.jobhistory.JobHistoryUtils;
 import org.apache.hadoop.mapreduce.v2.jobhistory.JobIndexInfo;
+import org.apache.hadoop.mapreduce.v2.util.MRWebAppUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.yarn.api.records.timeline.TimelineEntity;
 import org.apache.hadoop.yarn.api.records.timeline.TimelineEvent;
+import org.apache.hadoop.yarn.api.records.timeline.TimelinePutResponse;
 import org.apache.hadoop.yarn.client.api.TimelineClient;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.EventHandler;
@@ -71,9 +75,12 @@ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.codehaus.jackson.JsonNode;
 import org.codehaus.jackson.map.ObjectMapper;
 import org.codehaus.jackson.node.ArrayNode;
+import org.codehaus.jackson.node.JsonNodeFactory;
 import org.codehaus.jackson.node.ObjectNode;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.sun.jersey.api.client.ClientHandlerException;
+
 /**
  * The job history events get routed to this class. This class writes the Job
  * history events to the DFS directly into a staging dir and then moved to a
@@ -82,6 +89,8 @@ import com.google.common.annotations.VisibleForTesting;
  */
 public class JobHistoryEventHandler extends AbstractService
     implements EventHandler<JobHistoryEvent> {
+  private static final JsonNodeFactory FACTORY =
+      new ObjectMapper().getNodeFactory();
 
   private final AppContext context;
   private final int startCount;
@@ -485,16 +494,16 @@ public class JobHistoryEventHandler extends AbstractService
       if (conf != null) {
         // TODO Ideally this should be written out to the job dir
         // (.staging/jobid/files - RecoveryService will need to be patched)
-        FSDataOutputStream jobFileOut = null;
-        try {
-          if (logDirConfPath != null) {
-            jobFileOut = stagingDirFS.create(logDirConfPath, true);
-            conf.writeXml(jobFileOut);
-            jobFileOut.close();
+        if (logDirConfPath != null) {
+          Configuration redactedConf = new Configuration(conf);
+          MRJobConfUtil.redact(redactedConf);
+          try (FSDataOutputStream jobFileOut = stagingDirFS
+              .create(logDirConfPath, true)) {
+            redactedConf.writeXml(jobFileOut);
+          } catch (IOException e) {
+            LOG.info("Failed to write the job configuration file", e);
+            throw e;
           }
-        } catch (IOException e) {
-          LOG.info("Failed to write the job configuration file", e);
-          throw e;
         }
       }
     }
@@ -682,9 +691,9 @@ public class JobHistoryEventHandler extends AbstractService
       NormalizedResourceEvent normalizedResourceEvent = 
             (NormalizedResourceEvent) event;
       if (normalizedResourceEvent.getTaskType() == TaskType.MAP) {
-        summary.setResourcesPerMap(normalizedResourceEvent.getMemory());
+        summary.setResourcesPerMap((int) normalizedResourceEvent.getMemory());
       } else if (normalizedResourceEvent.getTaskType() == TaskType.REDUCE) {
-        summary.setResourcesPerReduce(normalizedResourceEvent.getMemory());
+        summary.setResourcesPerReduce((int) normalizedResourceEvent.getMemory());
       }
       break;  
     case JOB_INITED:
@@ -826,7 +835,7 @@ public class JobHistoryEventHandler extends AbstractService
         tEvent.addEventInfo("FINISHED_MAPS", jfe.getFinishedMaps());
         tEvent.addEventInfo("FINISHED_REDUCES", jfe.getFinishedReduces());
         tEvent.addEventInfo("MAP_COUNTERS_GROUPS",
-                countersToJSON(jfe.getTotalCounters()));
+                countersToJSON(jfe.getMapCounters()));
         tEvent.addEventInfo("REDUCE_COUNTERS_GROUPS",
                 countersToJSON(jfe.getReduceCounters()));
         tEvent.addEventInfo("TOTAL_COUNTERS_GROUPS",
@@ -1013,20 +1022,30 @@ public class JobHistoryEventHandler extends AbstractService
     }
 
     try {
-      timelineClient.putEntities(tEntity);
-    } catch (IOException ex) {
+      TimelinePutResponse response = timelineClient.putEntities(tEntity);
+      List<TimelinePutResponse.TimelinePutError> errors = response.getErrors();
+      if (errors.size() == 0) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Timeline entities are successfully put in event " + event
+              .getEventType());
+        }
+      } else {
+        for (TimelinePutResponse.TimelinePutError error : errors) {
+          LOG.error(
+              "Error when publishing entity [" + error.getEntityType() + ","
+                  + error.getEntityId() + "], server side error code: "
+                  + error.getErrorCode());
+        }
+      }
+    } catch (YarnException | IOException | ClientHandlerException ex) {
       LOG.error("Error putting entity " + tEntity.getEntityId() + " to Timeline"
-      + "Server", ex);
-    } catch (YarnException ex) {
-      LOG.error("Error putting entity " + tEntity.getEntityId() + " to Timeline"
-      + "Server", ex);
+          + "Server", ex);
     }
   }
 
   @Private
   public JsonNode countersToJSON(Counters counters) {
-    ObjectMapper mapper = new ObjectMapper();
-    ArrayNode nodes = mapper.createArrayNode();
+    ArrayNode nodes = FACTORY.arrayNode();
     if (counters != null) {
       for (CounterGroup counterGroup : counters) {
         ObjectNode groupNode = nodes.addObject();
@@ -1133,7 +1152,12 @@ public class JobHistoryEventHandler extends AbstractService
         qualifiedDoneFile =
             doneDirFS.makeQualified(new Path(doneDirPrefixPath,
                 doneJobHistoryFileName));
-        moveToDoneNow(qualifiedLogFile, qualifiedDoneFile);
+        if(moveToDoneNow(qualifiedLogFile, qualifiedDoneFile)) {
+          String historyUrl = MRWebAppUtil.getApplicationWebURLOnJHSWithScheme(
+              getConfig(), context.getApplicationID());
+          context.setHistoryUrl(historyUrl);
+          LOG.info("Set historyUrl to " + historyUrl);
+        }
       }
 
       // Move confFile to Done Folder
@@ -1339,7 +1363,7 @@ public class JobHistoryEventHandler extends AbstractService
     }
   }
 
-  private void moveTmpToDone(Path tmpPath) throws IOException {
+  protected void moveTmpToDone(Path tmpPath) throws IOException {
     if (tmpPath != null) {
       String tmpFileName = tmpPath.getName();
       String fileName = getFileNameFromTmpFN(tmpFileName);
@@ -1351,7 +1375,9 @@ public class JobHistoryEventHandler extends AbstractService
   
   // TODO If the FS objects are the same, this should be a rename instead of a
   // copy.
-  private void moveToDoneNow(Path fromPath, Path toPath) throws IOException {
+  protected boolean moveToDoneNow(Path fromPath, Path toPath)
+      throws IOException {
+    boolean success = false;
     // check if path exists, in case of retries it may not exist
     if (stagingDirFS.exists(fromPath)) {
       LOG.info("Copying " + fromPath.toString() + " to " + toPath.toString());
@@ -1362,13 +1388,18 @@ public class JobHistoryEventHandler extends AbstractService
       boolean copied = FileUtil.copy(stagingDirFS, fromPath, doneDirFS, toPath,
           false, getConfig());
 
-      if (copied)
-        LOG.info("Copied to done location: " + toPath);
-      else 
-        LOG.info("copy failed");
       doneDirFS.setPermission(toPath, new FsPermission(
           JobHistoryUtils.HISTORY_INTERMEDIATE_FILE_PERMISSIONS));
+      if (copied) {
+        LOG.info("Copied from: " + fromPath.toString()
+            + " to done location: " + toPath.toString());
+        success = true;
+      } else {
+        LOG.info("Copy failed from: " + fromPath.toString()
+            + " to done location: " + toPath.toString());
+      }
     }
+    return success;
   }
 
   boolean pathExists(FileSystem fileSys, Path path) throws IOException {

@@ -48,7 +48,6 @@ import org.apache.hadoop.mapred.QueueACL;
 
 import static org.apache.hadoop.mapred.QueueManager.toFullPropertyName;
 
-import org.apache.hadoop.mapreduce.counters.Limits;
 import org.apache.hadoop.mapreduce.filecache.DistributedCache;
 import org.apache.hadoop.mapreduce.protocol.ClientProtocol;
 import org.apache.hadoop.mapreduce.security.TokenCache;
@@ -63,6 +62,7 @@ import org.apache.hadoop.yarn.api.records.ReservationId;
 import org.codehaus.jackson.JsonParseException;
 import org.codehaus.jackson.map.JsonMappingException;
 import org.codehaus.jackson.map.ObjectMapper;
+import org.codehaus.jackson.map.ObjectReader;
 
 import com.google.common.base.Charsets;
 
@@ -70,6 +70,8 @@ import com.google.common.base.Charsets;
 @InterfaceStability.Unstable
 class JobSubmitter {
   protected static final Log LOG = LogFactory.getLog(JobSubmitter.class);
+  private static final ObjectReader READER =
+      new ObjectMapper().reader(Map.class);
   private static final String SHUFFLE_KEYGEN_ALGORITHM = "HmacSHA1";
   private static final int SHUFFLE_KEY_LENGTH = 64;
   private FileSystem jtFs;
@@ -232,7 +234,6 @@ class JobSubmitter {
 
       // Write job file to submit dir
       writeConf(conf, submitJobFile);
-      Limits.reset(conf);
       
       //
       // Now, actually submit the job (using the submit name)
@@ -396,9 +397,7 @@ class JobSubmitter {
       boolean json_error = false;
       try {
         // read JSON
-        ObjectMapper mapper = new ObjectMapper();
-        Map<String, String> nm = 
-          mapper.readValue(new File(localFileName), Map.class);
+        Map<String, String> nm = READER.readValue(new File(localFileName));
 
         for(Map.Entry<String, String> ent: nm.entrySet()) {
           credentials.addSecretKey(new Text(ent.getKey()), ent.getValue()
@@ -451,7 +450,7 @@ class JobSubmitter {
       // resolve any symlinks in the URI path so using a "current" symlink
       // to point to a specific version shows the specific version
       // in the distributed cache configuration
-      FileSystem fs = FileSystem.get(conf);
+      FileSystem fs = FileSystem.get(uri, conf);
       Path frameworkPath = fs.makeQualified(
           new Path(uri.getScheme(), uri.getAuthority(), uri.getPath()));
       FileContext fc = FileContext.getFileContext(frameworkPath.toUri(), conf);

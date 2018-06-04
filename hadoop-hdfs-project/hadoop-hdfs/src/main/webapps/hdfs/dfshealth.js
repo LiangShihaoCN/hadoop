@@ -24,11 +24,19 @@
   dust.loadSource(dust.compile($('#tmpl-datanode-volume-failures').html(), 'datanode-volume-failures'));
   dust.loadSource(dust.compile($('#tmpl-snapshot').html(), 'snapshot-info'));
 
+  $.fn.dataTable.ext.order['ng-value'] = function (settings, col)
+  {
+    return this.api().column(col, {order:'index'} ).nodes().map(function (td, i) {
+      return $(td).attr('ng-value');
+    });
+  };
+
   function load_overview() {
     var BEANS = [
       {"name": "nn",      "url": "/jmx?qry=Hadoop:service=NameNode,name=NameNodeInfo"},
       {"name": "nnstat",  "url": "/jmx?qry=Hadoop:service=NameNode,name=NameNodeStatus"},
       {"name": "fs",      "url": "/jmx?qry=Hadoop:service=NameNode,name=FSNamesystemState"},
+      {"name": "fsn",     "url": "/jmx?qry=Hadoop:service=NameNode,name=FSNamesystem"},
       {"name": "blockstats",      "url": "/jmx?qry=Hadoop:service=NameNode,name=BlockStats"},
       {"name": "mem",     "url": "/jmx?qry=java.lang:type=Memory"}
     ];
@@ -50,7 +58,7 @@
 
       'helper_date_tostring' : function (chunk, ctx, bodies, params) {
         var value = dust.helpers.tap(params.value, chunk, ctx);
-        return chunk.write('' + new Date(Number(value)).toLocaleString());
+        return chunk.write('' + moment(Number(value)).format('ddd MMM DD HH:mm:ss ZZ YYYY'));
       }
     };
 
@@ -96,6 +104,9 @@
           b.capacityUsedPercentage = b.capacityUsed * 100.0 / b.capacityTotal;
           b.capacityRemainingPercentage = b.capacityRemaining * 100.0 / b.capacityTotal;
         }
+
+        data.fs.ObjectsTotal = data.fs.FilesTotal + data.fs.BlocksTotal;
+
         render();
       }),
       function (url, jqxhr, text, err) {
@@ -168,7 +179,7 @@
     var HELPERS = {
       'helper_relative_time' : function (chunk, ctx, bodies, params) {
         var value = dust.helpers.tap(params.value, chunk, ctx);
-        return chunk.write(moment().subtract(Number(value), 'seconds').format('YYYY-MM-DD HH:mm:ss'));
+        return chunk.write(moment().subtract(Number(value), 'seconds').format('ddd MMM DD HH:mm:ss ZZ YYYY'));
       },
       'helper_usage_bar' : function (chunk, ctx, bodies, params) {
         var value = dust.helpers.tap(params.value, chunk, ctx);
@@ -176,7 +187,7 @@
         var r = null;
         if (v < 70) {
           r = 'progress-bar-success';
-        } else if (u.usedPercentage < 85) {
+        } else if (v < 85) {
           r = 'progress-bar-warning';
         } else {
           r = "progress-bar-danger";
@@ -200,6 +211,15 @@
         for (var i = 0, e = nodes.length; i < e; ++i) {
           var n = nodes[i];
           n.usedPercentage = Math.round((n.used + n.nonDfsUsedSpace) * 1.0 / n.capacity * 100);
+
+          var port = n.infoAddr.split(":")[1];
+          var securePort = n.infoSecureAddr.split(":")[1];
+          var dnHost = n.name.split(":")[0];
+          n.dnWebAddress = "http://" + dnHost + ":" + port;
+          if (securePort != 0) {
+            n.dnWebAddress = "https://" + dnHost + ":" + securePort;
+          }
+
           if (n.adminState === "In Service") {
             n.state = "alive";
           } else if (nodes[i].adminState === "Decommission In Progress") {
@@ -228,6 +248,70 @@
       return r;
     }
 
+    function renderHistogram(dnData) {
+      var data = dnData.LiveNodes.map(function(dn) {
+        return (dn.usedSpace / dn.capacity) * 100.0;
+      });
+
+      var formatCount = d3.format(",.0f");
+
+      var widthCap = $("div.container").width();
+      var heightCap = 150;
+
+      var margin = {top: 10, right: 60, bottom: 30, left: 30},
+          width = widthCap * 0.9,
+          height = heightCap - margin.top - margin.bottom;
+
+      var x = d3.scaleLinear()
+          .domain([0.0, 100.0])
+          .range([0, width]);
+
+      var bins = d3.histogram()
+          .domain(x.domain())
+          .thresholds(x.ticks(20))
+          (data);
+
+      var y = d3.scaleLinear()
+          .domain([0, d3.max(bins, function(d) { return d.length; })])
+          .range([height, 0]);
+
+      var svg = d3.select("#datanode-usage-histogram").append("svg")
+          .attr("width", width + 50.0)
+          .attr("height", height + margin.top + margin.bottom)
+          .append("g")
+          .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+      svg.append("text")
+          .attr("x", (width / 2))
+          .attr("y", heightCap - 6 - (margin.top / 2))
+          .attr("text-anchor", "middle")
+          .style("font-size", "15px")
+          .text("Disk usage of each DataNode (%)");
+
+      var bar = svg.selectAll(".bar")
+          .data(bins)
+          .enter().append("g")
+          .attr("class", "bar")
+          .attr("transform", function(d) { return "translate(" + x(d.x0) + "," + y(d.length) + ")"; });
+
+      bar.append("rect")
+          .attr("x", 1)
+          .attr("width", x(bins[0].x1) - x(bins[0].x0) - 1)
+          .attr("height", function(d) { return height - y(d.length); });
+
+      bar.append("text")
+          .attr("dy", ".75em")
+          .attr("y", 6)
+          .attr("x", (x(bins[0].x1) - x(bins[0].x0)) / 2)
+          .attr("text-anchor", "middle")
+          .text(function(d) { return formatCount(d.length); });
+
+      svg.append("g")
+          .attr("class", "axis axis--x")
+          .attr("transform", "translate(0," + height + ")")
+          .call(d3.axisBottom(x));
+    }
+
     $.get(
       '/jmx?qry=Hadoop:service=NameNode,name=NameNodeInfo',
       guard_with_startup_progress(function (resp) {
@@ -235,6 +319,18 @@
         var base = dust.makeBase(HELPERS);
         dust.render('datanode-info', base.push(data), function(err, out) {
           $('#tab-datanode').html(out);
+          $('#table-datanodes').dataTable( {
+            'lengthMenu': [ [25, 50, 100, -1], [25, 50, 100, "All"] ],
+            'columns': [
+              { 'orderDataType': 'ng-value', 'searchable': true },
+              { 'orderDataType': 'ng-value', 'searchable': true },
+              { 'orderDataType': 'ng-value', 'type': 'num' },
+              { 'orderDataType': 'ng-value', 'type': 'num' },
+              { 'type': 'num' },
+              { 'orderDataType': 'ng-value', 'type': 'num'},
+              { 'type': 'string' }
+            ]});
+          renderHistogram(data);
           $('#ui-tabs a[href="#tab-datanode"]').tab('show');
         });
       })).error(ajax_error_handler);
@@ -245,7 +341,7 @@
     var HELPERS = {
       'helper_date_tostring' : function (chunk, ctx, bodies, params) {
         var value = dust.helpers.tap(params.value, chunk, ctx);
-        return chunk.write('' + new Date(Number(value)).toLocaleString());
+        return chunk.write('' + moment(Number(value)).format('ddd MMM DD HH:mm:ss ZZ YYYY'));
       }
     };
 

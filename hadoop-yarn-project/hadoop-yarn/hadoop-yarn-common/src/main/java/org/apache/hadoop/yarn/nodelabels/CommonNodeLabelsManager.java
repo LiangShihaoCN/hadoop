@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -42,6 +43,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.service.AbstractService;
+import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeLabel;
 import org.apache.hadoop.yarn.api.records.Resource;
@@ -73,7 +75,9 @@ public class CommonNodeLabelsManager extends AbstractService {
   private static final Pattern LABEL_PATTERN = Pattern
       .compile("^[0-9a-zA-Z][0-9a-zA-Z-_]*");
   public static final int WILDCARD_PORT = 0;
-  
+  // Flag to identify startup for removelabel
+  private boolean initNodeLabelStoreInProgress = false;
+
   /**
    * Error messages
    */
@@ -95,13 +99,15 @@ public class CommonNodeLabelsManager extends AbstractService {
   protected ConcurrentMap<String, Host> nodeCollections =
       new ConcurrentHashMap<String, Host>();
 
+  protected RMNodeLabel noNodeLabel;
+
   protected final ReadLock readLock;
   protected final WriteLock writeLock;
 
   protected NodeLabelsStore store;
   private boolean nodeLabelsEnabled = false;
 
-  private boolean isDistributedNodeLabelConfiguration = false;
+  private boolean isCentralizedNodeLabelConfiguration = true;
 
   /**
    * A <code>Host</code> can have multiple <code>Node</code>s 
@@ -216,20 +222,36 @@ public class CommonNodeLabelsManager extends AbstractService {
   @Override
   protected void serviceInit(Configuration conf) throws Exception {
     // set if node labels enabled
-    nodeLabelsEnabled =
-        conf.getBoolean(YarnConfiguration.NODE_LABELS_ENABLED,
-            YarnConfiguration.DEFAULT_NODE_LABELS_ENABLED);
+    nodeLabelsEnabled = YarnConfiguration.areNodeLabelsEnabled(conf);
 
-    isDistributedNodeLabelConfiguration  =
-        YarnConfiguration.isDistributedNodeLabelConfiguration(conf);
-    
-    labelCollections.put(NO_LABEL, new RMNodeLabel(NO_LABEL));
+    isCentralizedNodeLabelConfiguration  =
+        YarnConfiguration.isCentralizedNodeLabelConfiguration(conf);
+
+    noNodeLabel = new RMNodeLabel(NO_LABEL);
+    labelCollections.put(NO_LABEL, noNodeLabel);
+  }
+
+  /**
+   * @return the isStartup
+   */
+  protected boolean isInitNodeLabelStoreInProgress() {
+    return initNodeLabelStoreInProgress;
+  }
+
+  boolean isCentralizedConfiguration() {
+    return isCentralizedNodeLabelConfiguration;
   }
 
   protected void initNodeLabelStore(Configuration conf) throws Exception {
-    this.store = new FileSystemNodeLabelsStore(this);
+    this.store =
+        ReflectionUtils
+            .newInstance(
+                conf.getClass(YarnConfiguration.FS_NODE_LABELS_STORE_IMPL_CLASS,
+                    FileSystemNodeLabelsStore.class, NodeLabelsStore.class),
+                conf);
+    this.store.setNodeLabelsManager(this);
     this.store.init(conf);
-    this.store.recover(isDistributedNodeLabelConfiguration);
+    this.store.recover();
   }
 
   // for UT purpose
@@ -242,7 +264,9 @@ public class CommonNodeLabelsManager extends AbstractService {
   @Override
   protected void serviceStart() throws Exception {
     if (nodeLabelsEnabled) {
+      setInitNodeLabelStoreInProgress(true);
       initNodeLabelStore(getConfig());
+      setInitNodeLabelStoreInProgress(false);
     }
     
     // init dispatcher only when service start, because recover will happen in
@@ -624,10 +648,14 @@ public class CommonNodeLabelsManager extends AbstractService {
       }
     }
     
-    if (null != dispatcher && !isDistributedNodeLabelConfiguration) {
-      // In case of DistributedNodeLabelConfiguration, no need to save the the
+    if (null != dispatcher && isCentralizedNodeLabelConfiguration) {
+      // In case of DistributedNodeLabelConfiguration or
+      // DelegatedCentralizedNodeLabelConfiguration, no need to save the the
       // NodeLabels Mapping to the back-end store, as on RM restart/failover
       // NodeLabels are collected from NM through Register/Heartbeat again
+      // in case of DistributedNodeLabelConfiguration and collected from
+      // RMNodeLabelsMappingProvider in case of
+      // DelegatedCentralizedNodeLabelConfiguration
       dispatcher.getEventHandler().handle(
           new UpdateNodeToLabelsMappingsEvent(newNMToLabels));
     }
@@ -827,7 +855,7 @@ public class CommonNodeLabelsManager extends AbstractService {
   /**
    * Get mapping of labels info to nodes for specified set of labels.
    *
-   * @param nodelabels
+   * @param labels
    *          set of nodelabels for which labels to nodes mapping will be
    *          returned.
    * @return labels to nodes map
@@ -900,6 +928,9 @@ public class CommonNodeLabelsManager extends AbstractService {
   }
 
   public boolean isExclusiveNodeLabel(String nodeLabel) throws IOException {
+    if (nodeLabel.equals(NO_LABEL)) {
+      return noNodeLabel.getIsExclusive();
+    }
     try {
       readLock.lock();
       RMNodeLabel label = labelCollections.get(nodeLabel);
@@ -916,7 +947,7 @@ public class CommonNodeLabelsManager extends AbstractService {
     }
   }
 
-  private void checkAndThrowLabelName(String label) throws IOException {
+  public static void checkAndThrowLabelName(String label) throws IOException {
     if (label == null || label.isEmpty() || label.length() > MAX_LABEL_LENGTH) {
       throw new IOException("label added is empty or exceeds "
           + MAX_LABEL_LENGTH + " character(s)");
@@ -1061,12 +1092,17 @@ public class CommonNodeLabelsManager extends AbstractService {
   
   protected Map<NodeId, Set<String>> normalizeNodeIdToLabels(
       Map<NodeId, Set<String>> nodeIdToLabels) {
-    Map<NodeId, Set<String>> newMap = new HashMap<NodeId, Set<String>>();
+    Map<NodeId, Set<String>> newMap = new TreeMap<NodeId, Set<String>>();
     for (Entry<NodeId, Set<String>> entry : nodeIdToLabels.entrySet()) {
       NodeId id = entry.getKey();
       Set<String> labels = entry.getValue();
       newMap.put(id, normalizeLabels(labels)); 
     }
     return newMap;
+  }
+
+  public void setInitNodeLabelStoreInProgress(
+      boolean initNodeLabelStoreInProgress) {
+    this.initNodeLabelStoreInProgress = initNodeLabelStoreInProgress;
   }
 }

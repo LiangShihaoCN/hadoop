@@ -38,6 +38,7 @@ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
+import org.apache.hadoop.yarn.api.records.UpdateContainerRequest;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
@@ -138,6 +139,18 @@ public class MockAM {
     }
   }
 
+  public boolean setApplicationLastResponseId(int newLastResponseId) {
+    ApplicationMasterService applicationMasterService =
+        (ApplicationMasterService) amRMProtocol;
+    responseId = newLastResponseId;
+    return applicationMasterService.setAttemptLastResponseId(attemptId,
+        newLastResponseId);
+  }
+
+  public int getResponseId() {
+    return responseId;
+  }
+
   public void addRequests(String[] hosts, int memory, int priority,
       int containers) throws Exception {
     requests.addAll(createReq(hosts, memory, priority, containers));
@@ -219,7 +232,7 @@ public class MockAM {
     pri.setPriority(priority);
     req.setPriority(pri);
     Resource capability = Records.newRecord(Resource.class);
-    capability.setMemory(memory);
+    capability.setMemorySize(memory);
     req.setCapability(capability);
     if (labelExpression != null) {
      req.setNodeLabelExpression(labelExpression); 
@@ -233,6 +246,13 @@ public class MockAM {
     final AllocateRequest req =
         AllocateRequest.newInstance(0, 0F, resourceRequest,
           releases, null);
+    return allocate(req);
+  }
+  
+  public AllocateResponse sendContainerResizingRequest(
+      List<UpdateContainerRequest> updateRequests) throws Exception {
+    final AllocateRequest req = AllocateRequest.newInstance(0, 0F, null, null,
+        updateRequests, null);
     return allocate(req);
   }
 
@@ -250,19 +270,22 @@ public class MockAM {
 
   public AllocateResponse doAllocateAs(UserGroupInformation ugi,
       final AllocateRequest req) throws Exception {
-    req.setResponseId(++responseId);
+    req.setResponseId(responseId);
     try {
-      return ugi.doAs(new PrivilegedExceptionAction<AllocateResponse>() {
-        @Override
-        public AllocateResponse run() throws Exception {
-          return amRMProtocol.allocate(req);
-        }
-      });
+      AllocateResponse response =
+          ugi.doAs(new PrivilegedExceptionAction<AllocateResponse>() {
+            @Override
+            public AllocateResponse run() throws Exception {
+              return amRMProtocol.allocate(req);
+            }
+          });
+      responseId = response.getResponseId();
+      return response;
     } catch (UndeclaredThrowableException e) {
       throw (Exception) e.getCause();
     }
   }
-  
+
   public AllocateResponse doHeartbeat() throws Exception {
     return allocate(null, null);
   }

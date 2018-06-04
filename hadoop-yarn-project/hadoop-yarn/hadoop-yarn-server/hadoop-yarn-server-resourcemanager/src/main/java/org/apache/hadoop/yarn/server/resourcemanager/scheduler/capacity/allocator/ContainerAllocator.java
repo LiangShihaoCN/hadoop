@@ -18,98 +18,62 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator;
 
-import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
-import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceLimits;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSAssignment;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.SchedulingMode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerApp;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerNode;
 import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
 import org.apache.hadoop.yarn.util.resource.Resources;
 
-/**
- * For an application, resource limits and resource requests, decide how to
- * allocate container. This is to make application resource allocation logic
- * extensible.
- */
-public abstract class ContainerAllocator {
-  FiCaSchedulerApp application;
-  final ResourceCalculator rc;
-  final RMContext rmContext;
-  
+public class ContainerAllocator extends AbstractContainerAllocator {
+  AbstractContainerAllocator increaseContainerAllocator;
+  AbstractContainerAllocator regularContainerAllocator;
+
   public ContainerAllocator(FiCaSchedulerApp application,
       ResourceCalculator rc, RMContext rmContext) {
-    this.application = application;
-    this.rc = rc;
-    this.rmContext = rmContext;
+    super(application, rc, rmContext);
+
+    increaseContainerAllocator =
+        new IncreaseContainerAllocator(application, rc, rmContext);
+    regularContainerAllocator =
+        new RegularContainerAllocator(application, rc, rmContext);
   }
-  
-  /**
-   * preAllocation is to perform checks, etc. to see if we can/cannot allocate
-   * container. It will put necessary information to returned
-   * {@link ContainerAllocation}. 
-   */
-  abstract ContainerAllocation preAllocation(
-      Resource clusterResource, FiCaSchedulerNode node,
-      SchedulingMode schedulingMode, ResourceLimits resourceLimits,
-      Priority priority, RMContainer reservedContainer);
-  
-  /**
-   * doAllocation is to update application metrics, create containers, etc.
-   * According to allocating conclusion decided by preAllocation.
-   */
-  abstract ContainerAllocation doAllocation(
-      ContainerAllocation allocationResult, Resource clusterResource,
-      FiCaSchedulerNode node, SchedulingMode schedulingMode, Priority priority,
-      RMContainer reservedContainer);
-  
-  boolean checkHeadroom(Resource clusterResource,
-      ResourceLimits currentResourceLimits, Resource required,
-      FiCaSchedulerNode node) {
-    // If headroom + currentReservation < required, we cannot allocate this
-    // require
-    Resource resourceCouldBeUnReserved = application.getCurrentReservation();
-    if (!application.getCSLeafQueue().getReservationContinueLooking()
-        || !node.getPartition().equals(RMNodeLabelsManager.NO_LABEL)) {
-      // If we don't allow reservation continuous looking, OR we're looking at
-      // non-default node partition, we won't allow to unreserve before
-      // allocation.
-      resourceCouldBeUnReserved = Resources.none();
-    }
-    return Resources.greaterThanOrEqual(rc, clusterResource, Resources.add(
-        currentResourceLimits.getHeadroom(), resourceCouldBeUnReserved),
-        required);
-  }
-  
-  /**
-   * allocate needs to handle following stuffs:
-   * 
-   * <ul>
-   * <li>Select request: Select a request to allocate. E.g. select a resource
-   * request based on requirement/priority/locality.</li>
-   * <li>Check if a given resource can be allocated based on resource
-   * availability</li>
-   * <li>Do allocation: this will decide/create allocated/reserved
-   * container, this will also update metrics</li>
-   * </ul>
-   */
-  public ContainerAllocation allocate(Resource clusterResource,
+
+  @Override
+  public CSAssignment assignContainers(Resource clusterResource,
       FiCaSchedulerNode node, SchedulingMode schedulingMode,
-      ResourceLimits resourceLimits, Priority priority,
-      RMContainer reservedContainer) {
-    ContainerAllocation result =
-        preAllocation(clusterResource, node, schedulingMode,
-            resourceLimits, priority, reservedContainer);
-    
-    if (AllocationState.ALLOCATED == result.state
-        || AllocationState.RESERVED == result.state) {
-      result = doAllocation(result, clusterResource, node,
-          schedulingMode, priority, reservedContainer);
+      ResourceLimits resourceLimits, RMContainer reservedContainer) {
+    if (reservedContainer != null) {
+      if (reservedContainer.getState() == RMContainerState.RESERVED) {
+        // It's a regular container
+        return regularContainerAllocator.assignContainers(clusterResource,
+            node, schedulingMode, resourceLimits, reservedContainer);
+      } else {
+        // It's a increase container
+        return increaseContainerAllocator.assignContainers(clusterResource,
+            node, schedulingMode, resourceLimits, reservedContainer);
+      }
+    } else {
+      /*
+       * Try to allocate increase container first, and if we failed to allocate
+       * anything, we will try to allocate regular container
+       */
+      CSAssignment assign =
+          increaseContainerAllocator.assignContainers(clusterResource, node,
+              schedulingMode, resourceLimits, null);
+      if (Resources.greaterThan(rc, clusterResource, assign.getResource(),
+          Resources.none())) {
+        return assign;
+      }
+
+      return regularContainerAllocator.assignContainers(clusterResource, node,
+          schedulingMode, resourceLimits, null);
     }
-    
-    return result;
   }
+
 }

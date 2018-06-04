@@ -23,7 +23,6 @@ import java.io.PrintWriter;
 import java.sql.Time;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -51,6 +50,7 @@ class PendingReplicationBlocks {
   private final ArrayList<BlockInfo> timedOutItems;
   Daemon timerThread = null;
   private volatile boolean fsRunning = true;
+  private long timedOutCount = 0L;
 
   //
   // It might take anywhere between 5 to 10 minutes before
@@ -77,7 +77,7 @@ class PendingReplicationBlocks {
    * @param block The corresponding block
    * @param targets The DataNodes where replicas of the block should be placed
    */
-  void increment(BlockInfo block, DatanodeDescriptor[] targets) {
+  void increment(BlockInfo block, DatanodeDescriptor... targets) {
     synchronized (pendingReplications) {
       PendingBlockInfo found = pendingReplications.get(block);
       if (found == null) {
@@ -126,6 +126,7 @@ class PendingReplicationBlocks {
     synchronized (pendingReplications) {
       pendingReplications.clear();
       timedOutItems.clear();
+      timedOutCount = 0L;
     }
   }
 
@@ -150,6 +151,16 @@ class PendingReplicationBlocks {
   }
 
   /**
+   * Used for metrics.
+   * @return The number of timeouts
+   */
+  long getNumTimedOuts() {
+    synchronized (timedOutItems) {
+      return timedOutCount + timedOutItems.size();
+    }
+  }
+
+  /**
    * Returns a list of blocks that have timed out their 
    * replication requests. Returns null if no blocks have
    * timed out.
@@ -159,9 +170,11 @@ class PendingReplicationBlocks {
       if (timedOutItems.size() <= 0) {
         return null;
       }
+      int size = timedOutItems.size();
       BlockInfo[] blockList = timedOutItems.toArray(
-          new BlockInfo[timedOutItems.size()]);
+          new BlockInfo[size]);
       timedOutItems.clear();
+      timedOutCount += size;
       return blockList;
     }
   }
@@ -193,7 +206,11 @@ class PendingReplicationBlocks {
 
     void incrementReplicas(DatanodeDescriptor... newTargets) {
       if (newTargets != null) {
-        Collections.addAll(targets, newTargets);
+        for (DatanodeDescriptor newTarget : newTargets) {
+          if (!targets.contains(newTarget)) {
+            targets.add(newTarget);
+          }
+        }
       }
     }
 

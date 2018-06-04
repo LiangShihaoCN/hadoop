@@ -21,6 +21,8 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileWriter;
 
+import org.apache.hadoop.test.GenericTestUtils;
+import org.apache.hadoop.util.HostsFileReader.HostDetails;
 import org.junit.*;
 import static org.junit.Assert.*;
 
@@ -31,8 +33,7 @@ import static org.junit.Assert.*;
 public class TestHostsFileReader {
 
   // Using /test/build/data/tmp directory to store temprory files
-  final String HOSTS_TEST_DIR = new File(System.getProperty(
-          "test.build.data", "/tmp")).getAbsolutePath();
+  final String HOSTS_TEST_DIR = GenericTestUtils.getTestDir().getAbsolutePath();
   File EXCLUDES_FILE = new File(HOSTS_TEST_DIR, "dfs.exclude");
   File INCLUDES_FILE = new File(HOSTS_TEST_DIR, "dfs.include");
   String excludesFile = HOSTS_TEST_DIR + "/dfs.exclude";
@@ -96,6 +97,30 @@ public class TestHostsFileReader {
     assertTrue(hfp.getExcludedHosts().contains("somehost5"));
     assertFalse(hfp.getExcludedHosts().contains("host4"));
 
+    // test for refreshing hostreader wit new include/exclude host files
+    String newExcludesFile = HOSTS_TEST_DIR + "/dfs1.exclude";
+    String newIncludesFile = HOSTS_TEST_DIR + "/dfs1.include";
+
+    efw = new FileWriter(newExcludesFile);
+    ifw = new FileWriter(newIncludesFile);
+
+    efw.write("#DFS-Hosts-excluded\n");
+    efw.write("node1\n");
+    efw.close();
+
+    ifw.write("#Hosts-in-DFS\n");
+    ifw.write("node2\n");
+    ifw.close();
+
+    hfp.refresh(newIncludesFile, newExcludesFile);
+    assertTrue(hfp.getExcludedHosts().contains("node1"));
+    assertTrue(hfp.getHosts().contains("node2"));
+
+    HostDetails hostDetails = hfp.getHostDetails();
+    assertTrue(hostDetails.getExcludedHosts().contains("node1"));
+    assertTrue(hostDetails.getIncludedHosts().contains("node2"));
+    assertEquals(newIncludesFile, hostDetails.getIncludesFile());
+    assertEquals(newExcludesFile, hostDetails.getExcludesFile());
   }
 
   /*

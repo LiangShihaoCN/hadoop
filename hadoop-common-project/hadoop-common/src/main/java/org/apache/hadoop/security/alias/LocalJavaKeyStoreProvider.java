@@ -121,9 +121,9 @@ public final class LocalJavaKeyStoreProvider extends
   }
 
   @Override
-  protected void initFileSystem(URI uri, Configuration conf)
+  protected void initFileSystem(URI uri)
       throws IOException {
-    super.initFileSystem(uri, conf);
+    super.initFileSystem(uri);
     try {
       file = new File(new URI(getPath().toString()));
       if (LOG.isDebugEnabled()) {
@@ -151,7 +151,7 @@ public final class LocalJavaKeyStoreProvider extends
   public void flush() throws IOException {
     super.flush();
     if (LOG.isDebugEnabled()) {
-      LOG.debug("Reseting permissions to '" + permissions + "'");
+      LOG.debug("Resetting permissions to '" + permissions + "'");
     }
     if (!Shell.WINDOWS) {
       Files.setPosixFilePermissions(Paths.get(file.getCanonicalPath()),

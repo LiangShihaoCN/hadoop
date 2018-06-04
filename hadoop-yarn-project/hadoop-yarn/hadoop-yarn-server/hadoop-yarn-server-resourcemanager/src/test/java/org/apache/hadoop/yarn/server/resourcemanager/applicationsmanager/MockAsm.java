@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.ipc.CallerContext;
 import org.apache.hadoop.yarn.MockApps;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
@@ -180,7 +181,7 @@ public abstract class MockAsm extends MockApps {
 
     @Override
     public RMAppMetrics getRMAppMetrics() {
-      return new RMAppMetrics(Resource.newInstance(0, 0), 0, 0, 0, 0);
+      return new RMAppMetrics(Resource.newInstance(0, 0), 0, 0, 0, 0, 0, 0);
     }
 
     @Override
@@ -200,6 +201,20 @@ public abstract class MockAsm extends MockApps {
 
     @Override
     public LogAggregationStatus getLogAggregationStatusForAppReport() {
+      throw new UnsupportedOperationException("Not supported yet.");
+    }
+
+    @Override
+    public String getAmNodeLabelExpression() {
+      throw new UnsupportedOperationException("Not supported yet.");
+    }
+
+    @Override
+    public String getAppNodeLabelExpression() {
+      throw new UnsupportedOperationException("Not supported yet.");
+    }
+
+    public CallerContext getCallerContext() {
       throw new UnsupportedOperationException("Not supported yet.");
     }
   }
@@ -295,7 +310,7 @@ public abstract class MockAsm extends MockApps {
           String clientUserName, boolean allowAccess) {
         ApplicationResourceUsageReport usageReport =
             ApplicationResourceUsageReport.newInstance(0, 0, null, null, null, 
-            0, 0);
+            0, 0, 0, 0, 0, 0);
         ApplicationReport report = ApplicationReport.newInstance(
             getApplicationId(), appAttemptId, getUser(), getQueue(), 
             getName(), null, 0, null, null, getDiagnostics().toString(), 

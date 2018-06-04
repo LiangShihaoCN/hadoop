@@ -194,7 +194,7 @@ public class Application {
     Resource currentSpec = requestSpec.put(priority, capability);
     if (currentSpec != null) {
       throw new IllegalStateException("Resource spec already exists for " +
-      		"priority " + priority.getPriority() + " - " + currentSpec.getMemory());
+		"priority " + priority.getPriority() + " - " + currentSpec.getMemorySize());
     }
   }
   
@@ -323,7 +323,7 @@ public class Application {
     // Get resources from the ResourceManager
     Allocation allocation = resourceManager.getResourceScheduler().allocate(
         applicationAttemptId, new ArrayList<ResourceRequest>(ask),
-        new ArrayList<ContainerId>(), null, null);
+        new ArrayList<ContainerId>(), null, null, null, null);
     System.out.println("-=======" + applicationAttemptId);
     System.out.println("----------" + resourceManager.getRMContext().getRMApps()
         .get(applicationId).getRMAppAttempt(applicationAttemptId));

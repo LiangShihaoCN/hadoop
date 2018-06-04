@@ -43,7 +43,6 @@ import org.apache.hadoop.hdfs.util.ReadOnlyList;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 
 import static org.apache.hadoop.hdfs.protocol.HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED;
 
@@ -66,8 +65,11 @@ public class INodeDirectory extends INodeWithAdditionalFields
     return inode.asDirectory(); 
   }
 
-  protected static final int DEFAULT_FILES_PER_DIRECTORY = 5;
-  final static byte[] ROOT_NAME = DFSUtil.string2Bytes("");
+  // Profiling shows that most of the file lists are between 1 and 4 elements.
+  // Thus allocate the corresponding ArrayLists with a small initial capacity.
+  public static final int DEFAULT_FILES_PER_DIRECTORY = 2;
+
+  static final byte[] ROOT_NAME = DFSUtil.string2Bytes("");
 
   private List<INode> children = null;
   
@@ -118,12 +120,10 @@ public class INodeDirectory extends INodeWithAdditionalFields
   @Override
   public byte getLocalStoragePolicyID() {
     XAttrFeature f = getXAttrFeature();
-    ImmutableList<XAttr> xattrs = f == null ? ImmutableList.<XAttr> of() : f
-        .getXAttrs();
-    for (XAttr xattr : xattrs) {
-      if (BlockStoragePolicySuite.isStoragePolicyXAttr(xattr)) {
-        return (xattr.getValue())[0];
-      }
+    XAttr xattr = f == null ? null : f.getXAttr(
+        BlockStoragePolicySuite.getStoragePolicyXAttrPrefixedName());
+    if (xattr != null) {
+      return (xattr.getValue())[0];
     }
     return BLOCK_STORAGE_POLICY_ID_UNSPECIFIED;
   }
@@ -629,18 +629,25 @@ public class INodeDirectory extends INodeWithAdditionalFields
   }
 
   @Override
-  public ContentSummaryComputationContext computeContentSummary(
+  public ContentSummaryComputationContext computeContentSummary(int snapshotId,
       ContentSummaryComputationContext summary) {
     final DirectoryWithSnapshotFeature sf = getDirectoryWithSnapshotFeature();
-    if (sf != null) {
+    if (sf != null && snapshotId == Snapshot.CURRENT_STATE_ID) {
+      final ContentCounts counts = new ContentCounts.Builder().build();
+      // if the getContentSummary call is against a non-snapshot path, the
+      // computation should include all the deleted files/directories
       sf.computeContentSummary4Snapshot(summary.getBlockStoragePolicySuite(),
-          summary.getCounts());
+          counts);
+      summary.getCounts().addContents(counts);
+      // Also add ContentSummary to snapshotCounts (So we can extract it
+      // later from the ContentSummary of all).
+      summary.getSnapshotCounts().addContents(counts);
     }
     final DirectoryWithQuotaFeature q = getDirectoryWithQuotaFeature();
-    if (q != null) {
+    if (q != null && snapshotId == Snapshot.CURRENT_STATE_ID) {
       return q.computeContentSummary(this, summary);
     } else {
-      return computeDirectoryContentSummary(summary, Snapshot.CURRENT_STATE_ID);
+      return computeDirectoryContentSummary(summary, snapshotId);
     }
   }
 
@@ -654,7 +661,7 @@ public class INodeDirectory extends INodeWithAdditionalFields
       byte[] childName = child.getLocalNameBytes();
 
       long lastYieldCount = summary.getYieldCount();
-      child.computeContentSummary(summary);
+      child.computeContentSummary(snapshotId, summary);
 
       // Check whether the computation was paused in the subtree.
       // The counts may be off, but traversing the rest of children
@@ -663,7 +670,7 @@ public class INodeDirectory extends INodeWithAdditionalFields
         continue;
       }
       // The locks were released and reacquired. Check parent first.
-      if (getParent() == null) {
+      if (!isRoot() && getParent() == null) {
         // Stop further counting and return whatever we have so far.
         break;
       }

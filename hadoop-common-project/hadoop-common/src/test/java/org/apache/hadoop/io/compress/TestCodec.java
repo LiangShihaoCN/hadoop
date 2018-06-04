@@ -60,6 +60,7 @@ import org.apache.hadoop.io.compress.zlib.BuiltInZlibInflater;
 import org.apache.hadoop.io.compress.zlib.ZlibCompressor;
 import org.apache.hadoop.io.compress.zlib.ZlibCompressor.CompressionLevel;
 import org.apache.hadoop.io.compress.zlib.ZlibCompressor.CompressionStrategy;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.io.compress.zlib.ZlibFactory;
 import org.apache.hadoop.io.compress.bzip2.Bzip2Factory;
 import org.apache.hadoop.util.LineReader;
@@ -194,66 +195,83 @@ public class TestCodec {
     
     // Compress data
     DataOutputBuffer compressedDataBuffer = new DataOutputBuffer();
-    CompressionOutputStream deflateFilter = 
+    int leasedCompressorsBefore = codec.getCompressorType() == null ? -1
+        : CodecPool.getLeasedCompressorsCount(codec);
+    try (CompressionOutputStream deflateFilter =
       codec.createOutputStream(compressedDataBuffer);
-    DataOutputStream deflateOut = 
-      new DataOutputStream(new BufferedOutputStream(deflateFilter));
-    deflateOut.write(data.getData(), 0, data.getLength());
-    deflateOut.flush();
-    deflateFilter.finish();
+      DataOutputStream deflateOut =
+        new DataOutputStream(new BufferedOutputStream(deflateFilter))) {
+      deflateOut.write(data.getData(), 0, data.getLength());
+      deflateOut.flush();
+      deflateFilter.finish();
+    }
+    if (leasedCompressorsBefore > -1) {
+      assertEquals("leased compressor not returned to the codec pool",
+          leasedCompressorsBefore, CodecPool.getLeasedCompressorsCount(codec));
+    }
     LOG.info("Finished compressing data");
     
     // De-compress data
     DataInputBuffer deCompressedDataBuffer = new DataInputBuffer();
     deCompressedDataBuffer.reset(compressedDataBuffer.getData(), 0, 
                                  compressedDataBuffer.getLength());
-    CompressionInputStream inflateFilter = 
-      codec.createInputStream(deCompressedDataBuffer);
-    DataInputStream inflateIn = 
-      new DataInputStream(new BufferedInputStream(inflateFilter));
-
-    // Check
     DataInputBuffer originalData = new DataInputBuffer();
-    originalData.reset(data.getData(), 0, data.getLength());
-    DataInputStream originalIn = new DataInputStream(new BufferedInputStream(originalData));
-    for(int i=0; i < count; ++i) {
-      RandomDatum k1 = new RandomDatum();
-      RandomDatum v1 = new RandomDatum();
-      k1.readFields(originalIn);
-      v1.readFields(originalIn);
+    int leasedDecompressorsBefore =
+        CodecPool.getLeasedDecompressorsCount(codec);
+    try (CompressionInputStream inflateFilter =
+      codec.createInputStream(deCompressedDataBuffer);
+      DataInputStream inflateIn =
+        new DataInputStream(new BufferedInputStream(inflateFilter))) {
+
+      // Check
+      originalData.reset(data.getData(), 0, data.getLength());
+      DataInputStream originalIn =
+          new DataInputStream(new BufferedInputStream(originalData));
+      for(int i=0; i < count; ++i) {
+        RandomDatum k1 = new RandomDatum();
+        RandomDatum v1 = new RandomDatum();
+        k1.readFields(originalIn);
+        v1.readFields(originalIn);
       
-      RandomDatum k2 = new RandomDatum();
-      RandomDatum v2 = new RandomDatum();
-      k2.readFields(inflateIn);
-      v2.readFields(inflateIn);
-      assertTrue("original and compressed-then-decompressed-output not equal",
-                 k1.equals(k2) && v1.equals(v2));
+        RandomDatum k2 = new RandomDatum();
+        RandomDatum v2 = new RandomDatum();
+        k2.readFields(inflateIn);
+        v2.readFields(inflateIn);
+        assertTrue("original and compressed-then-decompressed-output not equal",
+                   k1.equals(k2) && v1.equals(v2));
       
-      // original and compressed-then-decompressed-output have the same hashCode
-      Map<RandomDatum, String> m = new HashMap<RandomDatum, String>();
-      m.put(k1, k1.toString());
-      m.put(v1, v1.toString());
-      String result = m.get(k2);
-      assertEquals("k1 and k2 hashcode not equal", result, k1.toString());
-      result = m.get(v2);
-      assertEquals("v1 and v2 hashcode not equal", result, v1.toString());
+        // original and compressed-then-decompressed-output have the same
+        // hashCode
+        Map<RandomDatum, String> m = new HashMap<RandomDatum, String>();
+        m.put(k1, k1.toString());
+        m.put(v1, v1.toString());
+        String result = m.get(k2);
+        assertEquals("k1 and k2 hashcode not equal", result, k1.toString());
+        result = m.get(v2);
+        assertEquals("v1 and v2 hashcode not equal", result, v1.toString());
+      }
     }
+    assertEquals("leased decompressor not returned to the codec pool",
+        leasedDecompressorsBefore,
+        CodecPool.getLeasedDecompressorsCount(codec));
 
     // De-compress data byte-at-a-time
     originalData.reset(data.getData(), 0, data.getLength());
     deCompressedDataBuffer.reset(compressedDataBuffer.getData(), 0, 
                                  compressedDataBuffer.getLength());
-    inflateFilter = 
+    try (CompressionInputStream inflateFilter =
       codec.createInputStream(deCompressedDataBuffer);
+      DataInputStream originalIn =
+        new DataInputStream(new BufferedInputStream(originalData))) {
 
-    // Check
-    originalIn = new DataInputStream(new BufferedInputStream(originalData));
-    int expected;
-    do {
-      expected = originalIn.read();
-      assertEquals("Inflated stream read by byte does not match",
-        expected, inflateFilter.read());
-    } while (expected != -1);
+      // Check
+      int expected;
+      do {
+        expected = originalIn.read();
+        assertEquals("Inflated stream read by byte does not match",
+            expected, inflateFilter.read());
+      } while (expected != -1);
+    }
 
     LOG.info("SUCCESS! Completed checking " + count + " records");
   }
@@ -328,9 +346,9 @@ public class TestCodec {
   private static Path writeSplitTestFile(FileSystem fs, Random rand,
       CompressionCodec codec, long infLen) throws IOException {
     final int REC_SIZE = 1024;
-    final Path wd = new Path(new Path(
-          System.getProperty("test.build.data", "/tmp")).makeQualified(fs),
-        codec.getClass().getSimpleName());
+    final Path wd = new Path(GenericTestUtils.getTempPath(
+        codec.getClass().getSimpleName())).makeQualified(
+            fs.getUri(), fs.getWorkingDirectory());
     final Path file = new Path(wd, "test" + codec.getDefaultExtension());
     final byte[] b = new byte[REC_SIZE];
     final Base64 b64 = new Base64(0, null);
@@ -590,9 +608,8 @@ public class TestCodec {
     FileSystem fs = FileSystem.get(conf);
     LOG.info("Creating MapFiles with " + records  + 
             " records using codec " + clazz.getSimpleName());
-    Path path = new Path(new Path(
-        System.getProperty("test.build.data", "/tmp")),
-      clazz.getSimpleName() + "-" + type + "-" + records);
+    Path path = new Path(GenericTestUtils.getTempPath(
+        clazz.getSimpleName() + "-" + type + "-" + records));
 
     LOG.info("Writing " + path);
     createMapFile(conf, fs, path, clazz.newInstance(), type, records);
@@ -749,8 +766,7 @@ public class TestCodec {
     CodecPool.returnDecompressor(zlibDecompressor);
 
     // Now create a GZip text file.
-    String tmpDir = System.getProperty("test.build.data", "/tmp/");
-    Path f = new Path(new Path(tmpDir), "testGzipCodecRead.txt.gz");
+    Path f = new Path(GenericTestUtils.getTempPath("testGzipCodecRead.txt.gz"));
     BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(
       new GZIPOutputStream(new FileOutputStream(f.toString()))));
     final String msg = "This is the message in the file!";
@@ -801,8 +817,7 @@ public class TestCodec {
     CodecPool.returnDecompressor(zlibDecompressor);
 
     // Now create a GZip text file.
-    String tmpDir = System.getProperty("test.build.data", "/tmp/");
-    Path f = new Path(new Path(tmpDir), "testGzipLongOverflow.bin.gz");
+    Path f = new Path(GenericTestUtils.getTempPath("testGzipLongOverflow.bin.gz"));
     BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(
       new GZIPOutputStream(new FileOutputStream(f.toString()))));
 
@@ -865,9 +880,8 @@ public class TestCodec {
                codec instanceof GzipCodec);
 
     final String msg = "This is the message we are going to compress.";
-    final String tmpDir = System.getProperty("test.build.data", "/tmp/");
-    final String fileName = new Path(new Path(tmpDir),
-        "testGzipCodecWrite.txt.gz").toString();
+    final String fileName = new Path(GenericTestUtils.getTempPath(
+        "testGzipCodecWrite.txt.gz")).toString();
 
     BufferedWriter w = null;
     Compressor gzipCompressor = CodecPool.getCompressor(codec);

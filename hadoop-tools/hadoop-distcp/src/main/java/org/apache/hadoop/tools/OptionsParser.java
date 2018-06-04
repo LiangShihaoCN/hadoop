@@ -41,7 +41,7 @@ import com.google.common.base.Preconditions;
  */
 public class OptionsParser {
 
-  private static final Log LOG = LogFactory.getLog(OptionsParser.class);
+  static final Log LOG = LogFactory.getLog(OptionsParser.class);
 
   private static final Options cliOptions = new Options();
 

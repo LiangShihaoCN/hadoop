@@ -1,4 +1,4 @@
-﻿<!---
+<!---
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
   You may obtain a copy of the License at
@@ -46,7 +46,8 @@ HDFS Commands Guide
     * [storagepolicies](#storagepolicies)
     * [zkfc](#zkfc)
 * [Debug Commands](#Debug_Commands)
-    * [verify](#verify)
+    * [verifyMeta](#verifyMeta)
+    * [computeMeta](#computeMeta)
     * [recoverLease](#recoverLease)
 
 Overview
@@ -109,7 +110,7 @@ Usage:
        hdfs fsck <path>
               [-list-corruptfileblocks |
               [-move | -delete | -openforwrite]
-              [-files [-blocks [-locations | -racks | -replicaDetails]]]
+              [-files [-blocks [-locations | -racks | -replicaDetails | -upgradedomains]]]
               [-includeSnapshots]
               [-storagepolicies] [-blockId <blk_Id>]
 
@@ -122,6 +123,7 @@ Usage:
 | `-files` `-blocks` `-locations` | Print out locations for every block. |
 | `-files` `-blocks` `-racks` | Print out network topology for data-node locations. |
 | `-files` `-blocks` `-replicaDetails` | Print out each replica details. |
+| `-files` `-blocks` `-upgradedomains` | Print out upgrade domains for every block. |
 | `-includeSnapshots` | Include snapshot data if the given path indicates a snapshottable directory or there are snapshottable directories under it. |
 | `-list-corruptfileblocks` | Print out list of missing blocks and files they belong to. |
 | `-move` | Move corrupted files to /lost+found. |
@@ -265,6 +267,8 @@ Usage:
               [-policy <policy>]
               [-exclude [-f <hosts-file> | <comma-separated list of hosts>]]
               [-include [-f <hosts-file> | <comma-separated list of hosts>]]
+              [-source [-f <hosts-file> | <comma-separated list of hosts>]]
+              [-blockpools <comma-separated list of blockpool ids>]
               [-idleiterations <idleiterations>]
 
 | COMMAND\_OPTION | Description |
@@ -273,11 +277,15 @@ Usage:
 | `-threshold` \<threshold\> | Percentage of disk capacity. This overwrites the default threshold. |
 | `-exclude -f` \<hosts-file\> \| \<comma-separated list of hosts\> | Excludes the specified datanodes from being balanced by the balancer. |
 | `-include -f` \<hosts-file\> \| \<comma-separated list of hosts\> | Includes only the specified datanodes to be balanced by the balancer. |
+| `-source -f` \<hosts-file\> \| \<comma-separated list of hosts\> | Pick only the specified datanodes as source nodes. |
+| `-blockpools` \<comma-separated list of blockpool ids\> | The balancer will only run on blockpools included in this list. |
 | `-idleiterations` \<iterations\> | Maximum number of idle iterations before exit. This overwrites the default idleiterations(5). |
 
 Runs a cluster balancing utility. An administrator can simply press Ctrl-C to stop the rebalancing process. See [Balancer](./HdfsUserGuide.html#Balancer) for more details.
 
 Note that the `blockpool` policy is more strict than the `datanode` policy.
+
+Besides the above command options, a pinning feature is introduced starting from 2.7.0 to prevent certain replicas from getting moved by balancer/mover. This pinning feature is disabled by default, and can be enabled by configuration property "dfs.datanode.block-pinning.enabled". When enabled, this feature only affects blocks that are written to favored nodes specified in the create() call. This feature is useful when we want to maintain the data locality, for applications such as HBase regionserver.
 
 ### `cacheadmin`
 
@@ -290,8 +298,9 @@ See the [HDFS Cache Administration Documentation](./CentralizedCacheManagement.h
 Usage:
 
       hdfs crypto -createZone -keyName <keyName> -path <path>
-      hdfs crypto -help <command-name>
       hdfs crypto -listZones
+      hdfs crypto -provisionTrash -path <path>
+      hdfs crypto -help <command-name>
 
 See the [HDFS Transparent Encryption Documentation](./TransparentEncryption.html#crypto_command-line_interface) for more information.
 
@@ -313,7 +322,7 @@ Usage:
 
         hdfs dfsadmin [GENERIC_OPTIONS]
               [-report [-live] [-dead] [-decommissioning]]
-              [-safemode enter | leave | get | wait]
+              [-safemode enter | leave | get | wait | forceExit]
               [-saveNamespace]
               [-rollEdits]
               [-restoreFailedStorage true |false |check]
@@ -335,18 +344,21 @@ Usage:
               [-refreshNamenodes datanodehost:port]
               [-deleteBlockPool datanode-host:port blockpoolId [force]]
               [-setBalancerBandwidth <bandwidth in bytes per second>]
+              [-getBalancerBandwidth <datanode_host:ipc_port>]
               [-allowSnapshot <snapshotDir>]
               [-disallowSnapshot <snapshotDir>]
               [-fetchImage <local directory>]
               [-shutdownDatanode <datanode_host:ipc_port> [upgrade]]
               [-getDatanodeInfo <datanode_host:ipc_port>]
+              [-evictWriters <datanode_host:ipc_port>]
               [-triggerBlockReport [-incremental] <datanode_host:ipc_port>]
+              [-listOpenFiles]
               [-help [cmd]]
 
 | COMMAND\_OPTION | Description |
 |:---- |:---- |
 | `-report` `[-live]` `[-dead]` `[-decommissioning]` | Reports basic filesystem information and statistics, The dfs usage can be different from "du" usage, because it measures raw space used by replication, checksums, snapshots and etc. on all the DNs. Optional flags may be used to filter the list of displayed DataNodes. |
-| `-safemode` enter\|leave\|get\|wait | Safe mode maintenance command. Safe mode is a Namenode state in which it <br/>1. does not accept changes to the name space (read-only) <br/>2. does not replicate or delete blocks. <br/>Safe mode is entered automatically at Namenode startup, and leaves safe mode automatically when the configured minimum percentage of blocks satisfies the minimum replication condition. Safe mode can also be entered manually, but then it can only be turned off manually as well. |
+| `-safemode` enter\|leave\|get\|wait\|forceExit | Safe mode maintenance command. Safe mode is a Namenode state in which it <br/>1. does not accept changes to the name space (read-only) <br/>2. does not replicate or delete blocks. <br/>Safe mode is entered automatically at Namenode startup, and leaves safe mode automatically when the configured minimum percentage of blocks satisfies the minimum replication condition. If Namenode detects any anomaly then it will linger in safe mode till that issue is resolved. If that anomaly is the consequence of a deliberate action, then administrator can use -safemode forceExit to exit safe mode. The cases where forceExit may be required are<br/> 1. Namenode metadata is not consistent. If Namenode detects that metadata has been modified out of band and can cause data loss, then Namenode will enter forceExit state. At that point user can either restart Namenode with correct metadata files or forceExit (if data loss is acceptable).<br/>2. Rollback causes metadata to be replaced and rarely it can trigger safe mode forceExit state in Namenode. In that case you may proceed by issuing -safemode forceExit.<br/> Safe mode can also be entered manually, but then it can only be turned off manually as well. |
 | `-saveNamespace` | Save current namespace into storage directories and reset edits log. Requires safe mode. |
 | `-rollEdits` | Rolls the edit log on the active NameNode. |
 | `-restoreFailedStorage` true\|false\|check | This option will turn on/off automatic attempt to restore failed storage replicas. If a failed storage becomes available again the system will attempt to restore edits and/or fsimage during checkpoint. 'check' option will return current setting. |
@@ -367,13 +379,16 @@ Usage:
 | `-printTopology` | Print a tree of the racks and their nodes as reported by the Namenode |
 | `-refreshNamenodes` datanodehost:port | For the given datanode, reloads the configuration files, stops serving the removed block-pools and starts serving new block-pools. |
 | `-deleteBlockPool` datanode-host:port blockpoolId [force] | If force is passed, block pool directory for the given blockpool id on the given datanode is deleted along with its contents, otherwise the directory is deleted only if it is empty. The command will fail if datanode is still serving the block pool. Refer to refreshNamenodes to shutdown a block pool service on a datanode. |
-| `-setBalancerBandwidth` \<bandwidth in bytes per second\> | Changes the network bandwidth used by each datanode during HDFS block balancing. \<bandwidth\> is the maximum number of bytes per second that will be used by each datanode. This value overrides the dfs.balance.bandwidthPerSec parameter. NOTE: The new value is not persistent on the DataNode. |
+| `-setBalancerBandwidth` \<bandwidth in bytes per second\> | Changes the network bandwidth used by each datanode during HDFS block balancing. \<bandwidth\> is the maximum number of bytes per second that will be used by each datanode. This value overrides the dfs.balance.bandwidthPerSec parameter. NOTE: The new value is not persistent on the DataNode. |
+| `-getBalancerBandwidth` \<datanode\_host:ipc\_port\> | Get the network bandwidth(in bytes per second) for the given datanode. This is the maximum network bandwidth used by the datanode during HDFS block balancing.|
 | `-allowSnapshot` \<snapshotDir\> | Allowing snapshots of a directory to be created. If the operation completes successfully, the directory becomes snapshottable. See the [HDFS Snapshot Documentation](./HdfsSnapshots.html) for more information. |
 | `-disallowSnapshot` \<snapshotDir\> | Disallowing snapshots of a directory to be created. All snapshots of the directory must be deleted before disallowing snapshots. See the [HDFS Snapshot Documentation](./HdfsSnapshots.html) for more information. |
 | `-fetchImage` \<local directory\> | Downloads the most recent fsimage from the NameNode and saves it in the specified local directory. |
 | `-shutdownDatanode` \<datanode\_host:ipc\_port\> [upgrade] | Submit a shutdown request for the given datanode. See [Rolling Upgrade document](./HdfsRollingUpgrade.html#dfsadmin_-shutdownDatanode) for the detail. |
+| `-evictWriters` \<datanode\_host:ipc\_port\> | Make the datanode evict all clients that are writing a block. This is useful if decommissioning is hung due to slow writers. |
 | `-getDatanodeInfo` \<datanode\_host:ipc\_port\> | Get the information about the given datanode. See [Rolling Upgrade document](./HdfsRollingUpgrade.html#dfsadmin_-getDatanodeInfo) for the detail. |
 | `-triggerBlockReport` `[-incremental]` \<datanode\_host:ipc\_port\> | Trigger a block report for the given datanode. If 'incremental' is specified, it will be otherwise, it will be a full block report. |
+| `-listOpenFiles` | List all open files currently managed by the NameNode along with client name and client machine accessing them. |
 | `-help` [cmd] | Displays help for the given command or all commands if none is specified. |
 
 Runs a HDFS dfsadmin client.
@@ -385,6 +400,7 @@ Usage:
         hdfs haadmin -checkHealth <serviceId>
         hdfs haadmin -failover [--forcefence] [--forceactive] <serviceId> <serviceId>
         hdfs haadmin -getServiceState <serviceId>
+        hdfs haadmin -getAllServiceState
         hdfs haadmin -help <command>
         hdfs haadmin -transitionToActive <serviceId> [--forceactive]
         hdfs haadmin -transitionToStandby <serviceId>
@@ -394,6 +410,7 @@ Usage:
 | `-checkHealth` | check the health of the given NameNode |
 | `-failover` | initiate a failover between two NameNodes |
 | `-getServiceState` | determine whether the given NameNode is Active or Standby |
+| `-getAllServiceState` | returns the state of all the NameNodes | |
 | `-transitionToActive` | transition the state of the given NameNode to Active (Warning: No fencing is done) |
 | `-transitionToStandby` | transition the state of the given NameNode to Standby (Warning: No fencing is done) |
 
@@ -418,6 +435,8 @@ Runs the data migration utility. See [Mover](./ArchivalStorage.html#Mover_-_A_Ne
 
 Note that, when both -p and -f options are omitted, the default path is the root directory.
 
+In addition, a pinning feature is introduced starting from 2.7.0 to prevent certain replicas from getting moved by balancer/mover. This pinning feature is disabled by default, and can be enabled by configuration property "dfs.datanode.block-pinning.enabled". When enabled, this feature only affects blocks that are written to favored nodes specified in the create() call. This feature is useful when we want to maintain the data locality, for applications such as HBase regionserver.
+
 ### `namenode`
 
 Usage:
@@ -432,7 +451,7 @@ Usage:
               [-finalize] |
               [-importCheckpoint] |
               [-initializeSharedEdits] |
-              [-bootstrapStandby] |
+              [-bootstrapStandby [-force] [-nonInteractive] [-skipSharedEditsCheck] ] |
               [-recover [-force] ] |
               [-metadataVersion ]
 
@@ -440,15 +459,15 @@ Usage:
 |:---- |:---- |
 | `-backup` | Start backup node. |
 | `-checkpoint` | Start checkpoint node. |
-| `-format` `[-clusterid cid]` `[-force]` `[-nonInteractive]` | Formats the specified NameNode. It starts the NameNode, formats it and then shut it down. -force option formats if the name directory exists. -nonInteractive option aborts if the name directory exists, unless -force option is specified. |
+| `-format` `[-clusterid cid]` | Formats the specified NameNode. It starts the NameNode, formats it and then shut it down. Will throw NameNodeFormatException if name dir already exist and if reformat is disabled for cluster. |
 | `-upgrade` `[-clusterid cid]` [`-renameReserved` \<k-v pairs\>] | Namenode should be started with upgrade option after the distribution of new Hadoop version. |
 | `-upgradeOnly` `[-clusterid cid]` [`-renameReserved` \<k-v pairs\>] | Upgrade the specified NameNode and then shutdown it. |
 | `-rollback` | Rollback the NameNode to the previous version. This should be used after stopping the cluster and distributing the old Hadoop version. |
 | `-rollingUpgrade` \<downgrade\|rollback\|started\> | See [Rolling Upgrade document](./HdfsRollingUpgrade.html#NameNode_Startup_Options) for the detail. |
 | `-finalize` | No longer supported. Use `dfsadmin -finalizeUpgrade` instead. |
-| `-importCheckpoint` | Loads image from a checkpoint directory and save it into the current one. Checkpoint dir is read from property fs.checkpoint.dir |
+| `-importCheckpoint` | Loads image from a checkpoint directory and save it into the current one. Checkpoint dir is read from property dfs.namenode.checkpoint.dir |
 | `-initializeSharedEdits` | Format a new shared edits dir and copy in enough edit log segments so that the standby NameNode can start up. |
-| `-bootstrapStandby` | Allows the standby NameNode's storage directories to be bootstrapped by copying the latest namespace snapshot from the active NameNode. This is used when first configuring an HA cluster. |
+| `-bootstrapStandby` `[-force]` `[-nonInteractive]` `[-skipSharedEditsCheck]` | Allows the standby NameNode's storage directories to be bootstrapped by copying the latest namespace snapshot from the active NameNode. This is used when first configuring an HA cluster. The option -force or -nonInteractive has the same meaning as that described in namenode -format command. -skipSharedEditsCheck option skips edits check which ensures that we have enough edits already in the shared directory to start up from the last checkpoint on the active. |
 | `-recover` `[-force]` | Recover lost metadata on a corrupt filesystem. See [HDFS User Guide](./HdfsUserGuide.html#Recovery_Mode) for the detail. |
 | `-metadataVersion` | Verify that configured directories exist, then print the metadata versions of the software and the image. |
 
@@ -490,7 +509,7 @@ Usage: `hdfs zkfc [-formatZK [-force] [-nonInteractive]]`
 
 | COMMAND\_OPTION | Description |
 |:---- |:---- |
-| `-formatZK` | Format the Zookeeper instance |
+| `-formatZK` | Format the Zookeeper instance. -force: formats the znode if the znode exists. -nonInteractive: formats the znode aborts if the znode exists, unless -force option is specified. |
 | `-h` | Display help |
 
 This comamnd starts a Zookeeper Failover Controller process for use with [HDFS HA with QJM](./HDFSHighAvailabilityWithQJM.html#Administrative_commands).
@@ -498,11 +517,11 @@ This comamnd starts a Zookeeper Failover Controller process for use with [HDFS H
 Debug Commands
 --------------
 
-Useful commands to help administrators debug HDFS issues, like validating block files and calling recoverLease.
+Useful commands to help administrators debug HDFS issues. These commands are for advanced users only.
 
-### `verify`
+### `verifyMeta`
 
-Usage: `hdfs debug verify [-meta <metadata-file>] [-block <block-file>]`
+Usage: `hdfs debug verifyMeta -meta <metadata-file> [-block <block-file>]`
 
 | COMMAND\_OPTION | Description |
 |:---- |:---- |
@@ -511,9 +530,22 @@ Usage: `hdfs debug verify [-meta <metadata-file>] [-block <block-file>]`
 
 Verify HDFS metadata and block files. If a block file is specified, we will verify that the checksums in the metadata file match the block file.
 
+### `computeMeta`
+
+Usage: `hdfs debug computeMeta -block <block-file> -out <output-metadata-file>`
+
+| COMMAND\_OPTION | Description |
+|:---- |:---- |
+| `-block` *block-file* | Absolute path for the block file on the local file system of the data node. |
+| `-out` *output-metadata-file* | Absolute path for the output metadata file to store the checksum computation result from the block file. |
+
+Compute HDFS metadata from block files. If a block file is specified, we will compute the checksums from the block file, and save it to the specified output metadata file.
+
+**NOTE**: Use at your own risk! If the block file is corrupt and you overwrite it's meta file, it will show up as 'good' in HDFS, but you can't read the data. Only use as a last measure, and when you are 100% certain the block file is good.
+
 ### `recoverLease`
 
-Usage: `hdfs debug recoverLease [-path <path>] [-retries <num-retries>]`
+Usage: `hdfs debug recoverLease -path <path> [-retries <num-retries>]`
 
 | COMMAND\_OPTION | Description |
 |:---- |:---- |

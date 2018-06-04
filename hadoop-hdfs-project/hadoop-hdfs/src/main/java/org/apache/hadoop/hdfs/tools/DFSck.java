@@ -41,7 +41,6 @@ import org.apache.hadoop.hdfs.server.namenode.NamenodeFsck;
 import org.apache.hadoop.hdfs.web.URLConnectionFactory;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authentication.client.AuthenticationException;
-import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
@@ -78,7 +77,8 @@ public class DFSck extends Configured implements Tool {
   private static final String USAGE = "Usage: hdfs fsck <path> "
       + "[-list-corruptfileblocks | "
       + "[-move | -delete | -openforwrite] "
-      + "[-files [-blocks [-locations | -racks | -replicaDetails]]]] "
+      + "[-files [-blocks [-locations | -racks | -replicaDetails | " +
+          "-upgradedomains]]]] "
       + "[-includeSnapshots] "
       + "[-storagepolicies] [-blockId <blk_Id>]\n"
       + "\t<path>\tstart checking from this path\n"
@@ -96,6 +96,8 @@ public class DFSck extends Configured implements Tool {
       + "\t-files -blocks -racks" 
       + "\tprint out network topology for data-node locations\n"
       + "\t-files -blocks -replicaDetails\tprint out each replica details \n"
+      + "\t-files -blocks -upgradedomains\tprint out upgrade domains for " +
+          "every block\n"
       + "\t-storagepolicies\tprint out storage policy summary for the blocks\n"
       + "\t-blockId\tprint out which file this blockId belongs to, locations"
       + " (nodes, racks) of this block, and other diagnostics info"
@@ -272,9 +274,11 @@ public class DFSck extends Configured implements Tool {
       else if (args[idx].equals("-racks")) { url.append("&racks=1"); }
       else if (args[idx].equals("-replicaDetails")) {
         url.append("&replicadetails=1");
-      }
-      else if (args[idx].equals("-storagepolicies")) { url.append("&storagepolicies=1"); }
-      else if (args[idx].equals("-list-corruptfileblocks")) {
+      } else if (args[idx].equals("-upgradedomains")) {
+        url.append("&upgradedomains=1");
+      } else if (args[idx].equals("-storagepolicies")) {
+        url.append("&storagepolicies=1");
+      } else if (args[idx].equals("-list-corruptfileblocks")) {
         url.append("&listcorruptfileblocks=1");
         doListCorruptFileBlocks = true;
       } else if (args[idx].equals("-includeSnapshots")) {
@@ -315,7 +319,7 @@ public class DFSck extends Configured implements Tool {
       namenodeAddress = getCurrentNamenodeAddress(dirpath);
     } catch (IOException ioe) {
       System.err.println("FileSystem is inaccessible due to:\n"
-          + StringUtils.stringifyException(ioe));
+          + ioe.toString());
     }
 
     if (namenodeAddress == null) {

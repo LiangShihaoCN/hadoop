@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
 
+import org.junit.Assert;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -38,6 +39,7 @@ import org.apache.hadoop.yarn.factories.RecordFactory;
 import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
@@ -49,7 +51,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAddedSchedulerEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAttemptAddedSchedulerEvent;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
-import org.apache.hadoop.yarn.util.Clock;
+import org.apache.hadoop.yarn.util.resource.Resources;
 
 public class FairSchedulerTestBase {
   public final static String TEST_DIR =
@@ -64,6 +66,9 @@ public class FairSchedulerTestBase {
   protected Configuration conf;
   protected FairScheduler scheduler;
   protected ResourceManager resourceManager;
+  public static final float TEST_RESERVATION_THRESHOLD = 0.09f;
+  private static final int SLEEP_DURATION = 10;
+  private static final int SLEEP_RETRIES = 1000;
 
   // Helper methods
   public Configuration createConfiguration() {
@@ -76,6 +81,11 @@ public class FairSchedulerTestBase {
     conf.setInt(YarnConfiguration.RM_SCHEDULER_MAXIMUM_ALLOCATION_MB, 10240);
     conf.setBoolean(FairSchedulerConfiguration.ASSIGN_MULTIPLE, false);
     conf.setFloat(FairSchedulerConfiguration.PREEMPTION_THRESHOLD, 0f);
+
+    conf.setFloat(
+        FairSchedulerConfiguration
+           .RM_SCHEDULER_RESERVATION_THRESHOLD_INCERMENT_MULTIPLE,
+        TEST_RESERVATION_THRESHOLD);
     return conf;
   }
 
@@ -102,6 +112,7 @@ public class FairSchedulerTestBase {
     prio.setPriority(priority);
     request.setPriority(prio);
     request.setRelaxLocality(relaxLocality);
+    request.setNodeLabelExpression(RMNodeLabelsManager.NO_LABEL);
     return request;
   }
 
@@ -163,7 +174,7 @@ public class FairSchedulerTestBase {
     resourceManager.getRMContext().getRMApps()
         .put(id.getApplicationId(), rmApp);
 
-    scheduler.allocate(id, ask, new ArrayList<ContainerId>(), null, null);
+    scheduler.allocate(id, ask, new ArrayList<ContainerId>(), null, null, null, null);
     return id;
   }
   
@@ -189,7 +200,7 @@ public class FairSchedulerTestBase {
     resourceManager.getRMContext().getRMApps()
         .put(id.getApplicationId(), rmApp);
 
-    scheduler.allocate(id, ask, new ArrayList<ContainerId>(), null, null);
+    scheduler.allocate(id, ask, new ArrayList<ContainerId>(), null, null, null, null);
     return id;
   }
 
@@ -211,7 +222,7 @@ public class FairSchedulerTestBase {
       ResourceRequest request, ApplicationAttemptId attId) {
     List<ResourceRequest> ask = new ArrayList<ResourceRequest>();
     ask.add(request);
-    scheduler.allocate(attId, ask,  new ArrayList<ContainerId>(), null, null);
+    scheduler.allocate(attId, ask,  new ArrayList<ContainerId>(), null, null, null, null);
   }
 
   protected void createApplicationWithAMResource(ApplicationAttemptId attId,
@@ -220,7 +231,7 @@ public class FairSchedulerTestBase {
     ApplicationId appId = attId.getApplicationId();
     RMApp rmApp = new RMAppImpl(appId, rmContext, conf,
         null, user, null, ApplicationSubmissionContext.newInstance(appId, null,
-        queue, null, null, false, false, 0, amResource, null), null, null,
+        queue, null, null, false, false, 0, amResource, null), scheduler, null,
         0, null, null, null);
     rmContext.getRMApps().put(appId, rmApp);
     RMAppEvent event = new RMAppEvent(appId, RMAppEventType.START);
@@ -251,5 +262,22 @@ public class FairSchedulerTestBase {
     resourceManager.getRMContext().getRMApps()
         .put(attemptId.getApplicationId(), app);
     return app;
+  }
+
+  protected void checkAppConsumption(FSAppAttempt app, Resource resource)
+      throws InterruptedException {
+    for (int i = 0; i < SLEEP_RETRIES; i++) {
+      if (Resources.equals(resource, app.getCurrentConsumption())) {
+        break;
+      } else {
+        Thread.sleep(SLEEP_DURATION);
+      }
+    }
+
+    // available resource
+    Assert.assertEquals(resource.getMemory(),
+        app.getCurrentConsumption().getMemory());
+    Assert.assertEquals(resource.getVirtualCores(),
+        app.getCurrentConsumption().getVirtualCores());
   }
 }

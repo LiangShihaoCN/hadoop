@@ -26,7 +26,10 @@ import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.security.authorize.AccessControlList;
 import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainerLaunch;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
@@ -43,8 +46,12 @@ import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.Contai
 
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.LinuxContainerRuntimeConstants.*;
 
@@ -53,6 +60,12 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
 public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   private static final Log LOG = LogFactory.getLog(
       DockerLinuxContainerRuntime.class);
+
+  // This validates that the image is a proper docker image
+  public static final String DOCKER_IMAGE_PATTERN =
+      "^(([a-zA-Z0-9.-]+)(:\\d+)?/)?([a-z0-9_./-]+)(:[\\w.-]+)?$";
+  private static final Pattern dockerImagePattern =
+      Pattern.compile(DOCKER_IMAGE_PATTERN);
 
   @InterfaceAudience.Private
   public static final String ENV_DOCKER_CONTAINER_IMAGE =
@@ -63,11 +76,14 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   @InterfaceAudience.Private
   public static final String ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE =
       "YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE";
-
+  @InterfaceAudience.Private
+  public static final String ENV_DOCKER_CONTAINER_RUN_PRIVILEGED_CONTAINER =
+      "YARN_CONTAINER_RUNTIME_DOCKER_RUN_PRIVILEGED_CONTAINER";
 
   private Configuration conf;
   private DockerClient dockerClient;
   private PrivilegedOperationExecutor privilegedOperationExecutor;
+  private AccessControlList privilegedContainersAcl;
 
   public static boolean isDockerContainerRequested(
       Map<String, String> env) {
@@ -90,6 +106,16 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       throws ContainerExecutionException {
     this.conf = conf;
     dockerClient = new DockerClient(conf);
+    privilegedContainersAcl = new AccessControlList(conf.get(
+        YarnConfiguration.NM_DOCKER_PRIVILEGED_CONTAINERS_ACL,
+        YarnConfiguration.DEFAULT_NM_DOCKER_PRIVILEGED_CONTAINERS_ACL));
+  }
+
+  @Override
+  public boolean useWhitelistEnv(Map<String, String> env) {
+    // Avoid propagating nodemanager environment variables into the container
+    // so those variables can be picked up from the Docker image instead.
+    return false;
   }
 
   @Override
@@ -131,6 +157,70 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     }
   }
 
+  private boolean allowPrivilegedContainerExecution(Container container)
+      throws ContainerExecutionException {
+    //For a privileged container to be run all of the following three conditions
+    // must be satisfied:
+    //1) Submitting user must request for a privileged container
+    //2) Privileged containers must be enabled on the cluster
+    //3) Submitting user must be whitelisted to run a privileged container
+
+    Map<String, String> environment = container.getLaunchContext()
+        .getEnvironment();
+    String runPrivilegedContainerEnvVar = environment
+        .get(ENV_DOCKER_CONTAINER_RUN_PRIVILEGED_CONTAINER);
+
+    if (runPrivilegedContainerEnvVar == null) {
+      return false;
+    }
+
+    if (!runPrivilegedContainerEnvVar.equalsIgnoreCase("true")) {
+      LOG.warn("NOT running a privileged container. Value of " +
+          ENV_DOCKER_CONTAINER_RUN_PRIVILEGED_CONTAINER
+          + "is invalid: " + runPrivilegedContainerEnvVar);
+      return false;
+    }
+
+    if (LOG.isInfoEnabled()) {
+      LOG.info("Privileged container requested for : " + container
+          .getContainerId().toString());
+    }
+
+    //Ok, so we have been asked to run a privileged container. Security
+    // checks need to be run. Each violation is an error.
+
+    //check if privileged containers are enabled.
+    boolean privilegedContainersEnabledOnCluster = conf.getBoolean(
+        YarnConfiguration.NM_DOCKER_ALLOW_PRIVILEGED_CONTAINERS,
+            YarnConfiguration.DEFAULT_NM_DOCKER_ALLOW_PRIVILEGED_CONTAINERS);
+
+    if (!privilegedContainersEnabledOnCluster) {
+      String message = "Privileged container being requested but privileged "
+          + "containers are not enabled on this cluster";
+      LOG.warn(message);
+      throw new ContainerExecutionException(message);
+    }
+
+    //check if submitting user is in the whitelist.
+    String submittingUser = container.getUser();
+    UserGroupInformation submitterUgi = UserGroupInformation
+        .createRemoteUser(submittingUser);
+
+    if (!privilegedContainersAcl.isUserAllowed(submitterUgi)) {
+      String message = "Cannot launch privileged container. Submitting user ("
+          + submittingUser + ") fails ACL check.";
+      LOG.warn(message);
+      throw new ContainerExecutionException(message);
+    }
+
+    if (LOG.isInfoEnabled()) {
+      LOG.info("All checks pass. Launching privileged container for : "
+          + container.getContainerId().toString());
+    }
+
+    return true;
+  }
+
 
   @Override
   public void launchContainer(ContainerRuntimeContext ctx)
@@ -140,10 +230,7 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
         .getEnvironment();
     String imageName = environment.get(ENV_DOCKER_CONTAINER_IMAGE);
 
-    if (imageName == null) {
-      throw new ContainerExecutionException(ENV_DOCKER_CONTAINER_IMAGE
-          + " not set!");
-    }
+    validateImageName(imageName);
 
     String containerIdStr = container.getContainerId().toString();
     String runAsUser = ctx.getExecutionAttribute(RUN_AS_USER);
@@ -154,12 +241,17 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     List<String> localDirs = ctx.getExecutionAttribute(LOCAL_DIRS);
     @SuppressWarnings("unchecked")
     List<String> logDirs = ctx.getExecutionAttribute(LOG_DIRS);
+    Set<String> capabilities = new HashSet<>(Arrays.asList(conf.getStrings(
+        YarnConfiguration.NM_DOCKER_CONTAINER_CAPABILITIES,
+        YarnConfiguration.DEFAULT_NM_DOCKER_CONTAINER_CAPABILITIES)));
+
     @SuppressWarnings("unchecked")
     DockerRunCommand runCommand = new DockerRunCommand(containerIdStr,
         runAsUser, imageName)
         .detachOnRun()
         .setContainerWorkDir(containerWorkDir.toString())
         .setNetworkType("host")
+        .setCapabilities(capabilities)
         .addMountLocation("/etc/passwd", "/etc/password:ro");
     List<String> allDirs = new ArrayList<>(localDirs);
 
@@ -167,6 +259,10 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     allDirs.addAll(logDirs);
     for (String dir: allDirs) {
       runCommand.addMountLocation(dir, dir);
+    }
+
+    if (allowPrivilegedContainerExecution(container)) {
+      runCommand.setPrivileged();
     }
 
     String resourcesOpts = ctx.getExecutionAttribute(RESOURCES_OPTIONS);
@@ -200,8 +296,7 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     String commandFile = dockerClient.writeCommandToTempFile(runCommand,
         containerIdStr);
     PrivilegedOperation launchOp = new PrivilegedOperation(
-        PrivilegedOperation.OperationType.LAUNCH_DOCKER_CONTAINER, (String)
-        null);
+        PrivilegedOperation.OperationType.LAUNCH_DOCKER_CONTAINER);
 
     launchOp.appendArgs(runAsUser, ctx.getExecutionAttribute(USER),
         Integer.toString(PrivilegedOperation
@@ -226,8 +321,7 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
 
     try {
       privilegedOperationExecutor.executePrivilegedOperation(null,
-          launchOp, null, container.getLaunchContext().getEnvironment(),
-          false);
+          launchOp, null, null, false, false);
     } catch (PrivilegedOperationException e) {
       LOG.warn("Launch container failed. Exception: ", e);
 
@@ -239,9 +333,8 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   @Override
   public void signalContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
-    Container container = ctx.getContainer();
     PrivilegedOperation signalOp = new PrivilegedOperation(
-        PrivilegedOperation.OperationType.SIGNAL_CONTAINER, (String) null);
+        PrivilegedOperation.OperationType.SIGNAL_CONTAINER);
 
     signalOp.appendArgs(ctx.getExecutionAttribute(RUN_AS_USER),
         ctx.getExecutionAttribute(USER),
@@ -255,8 +348,7 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
           .getInstance(conf);
 
       executor.executePrivilegedOperation(null,
-          signalOp, null, container.getLaunchContext().getEnvironment(),
-          false);
+          signalOp, null, null, false, false);
     } catch (PrivilegedOperationException e) {
       LOG.warn("Signal container failed. Exception: ", e);
 
@@ -269,5 +361,17 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   public void reapContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
 
+  }
+
+  public static void validateImageName(String imageName)
+      throws ContainerExecutionException {
+    if (imageName == null || imageName.isEmpty()) {
+      throw new ContainerExecutionException(
+          ENV_DOCKER_CONTAINER_IMAGE + " not set!");
+    }
+    if (!dockerImagePattern.matcher(imageName).matches()) {
+      throw new ContainerExecutionException("Image name '" + imageName
+          + "' doesn't match docker image name pattern");
+    }
   }
 }

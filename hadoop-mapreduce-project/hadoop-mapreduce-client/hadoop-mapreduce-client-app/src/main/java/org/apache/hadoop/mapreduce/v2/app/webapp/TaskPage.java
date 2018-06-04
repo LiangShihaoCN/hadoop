@@ -125,7 +125,7 @@ public class TaskPage extends AppView {
 
       for (TaskAttempt attempt : getTaskAttempts()) {
         TaskAttemptInfo ta = new TaskAttemptInfo(attempt, true);
-        String progress = StringUtils.formatPercent(ta.getProgress() / 100, 2);
+        String progress = StringUtils.format("%.2f", ta.getProgress());
 
         String nodeHttpAddr = ta.getNode();
         String diag = ta.getNote() == null ? "" : ta.getNote();
@@ -221,7 +221,7 @@ public class TaskPage extends AppView {
     .append("\n{'aTargets': [ 5 ]")
     .append(", 'bSearchable': false }")
 
-    .append("\n, {'sType':'string', 'aTargets': [ 0 ]")
+    .append("\n, {'sType':'natural', 'aTargets': [ 0 ]")
     .append(", 'mRender': parseHadoopID }")
 
     .append("\n, {'sType':'numeric', 'aTargets': [ 6, 7")

@@ -24,10 +24,12 @@ import java.util.Set;
 
 import org.apache.hadoop.net.Node;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
+import org.apache.hadoop.yarn.api.records.Container;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.hadoop.yarn.api.records.ResourceUtilization;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NodeHeartbeatResponse;
 
 /**
@@ -37,9 +39,6 @@ import org.apache.hadoop.yarn.server.api.protocolrecords.NodeHeartbeatResponse;
  */
 public interface RMNode {
 
-  /** negative value means no timeout */
-  public static final int OVER_COMMIT_TIMEOUT_MILLIS_DEFAULT = -1;
-  
   /**
    * the node id of of this node.
    * @return the node id of this node.
@@ -100,7 +99,19 @@ public interface RMNode {
    * @return the total available resource.
    */
   public Resource getTotalCapability();
-  
+
+  /**
+   * the aggregated resource utilization of the containers.
+   * @return the aggregated resource utilization of the containers.
+   */
+  public ResourceUtilization getAggregatedContainersUtilization();
+
+  /**
+   * the total resource utilization of the node.
+   * @return the total resource utilization of the node.
+   */
+  public ResourceUtilization getNodeUtilization();
+
   /**
    * The rack name for this node manager.
    * @return the rack name.
@@ -123,13 +134,19 @@ public interface RMNode {
 
   /**
    * Update a {@link NodeHeartbeatResponse} with the list of containers and
-   * applications to clean up for this node.
+   * applications to clean up for this node, and the containers to be updated.
+   *
    * @param response the {@link NodeHeartbeatResponse} to update
    */
-  public void updateNodeHeartbeatResponseForCleanup(NodeHeartbeatResponse response);
+  void setAndUpdateNodeHeartbeatResponse(NodeHeartbeatResponse response);
 
   public NodeHeartbeatResponse getLastNodeHeartBeatResponse();
-  
+
+  /**
+   * Reset lastNodeHeartbeatResponse's ID to 0.
+   */
+  void resetLastNodeHeartBeatResponse();
+
   /**
    * Get and clear the list of containerUpdates accumulated across NM
    * heartbeats.
@@ -144,4 +161,10 @@ public interface RMNode {
    * @return labels in this node
    */
   public Set<String> getNodeLabels();
+
+  public List<Container> pullNewlyIncreasedContainers();
+
+  long getUntrackedTimeStamp();
+
+  void setUntrackedTimeStamp(long timeStamp);
 }

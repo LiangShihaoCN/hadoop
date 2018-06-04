@@ -11,9 +11,9 @@ Requirements:
 * CMake 2.6 or newer (if compiling native code), must be 3.0 or newer on Mac
 * Zlib devel (if compiling native code)
 * openssl devel (if compiling native hadoop-pipes and to get the best HDFS encryption performance)
-* Jansson C XML parsing library (if compiling libwebhdfs)
 * Linux FUSE (Filesystem in Userspace) version 2.6 or above (if compiling fuse_dfs)
 * Internet connection for first build (to fetch all Maven and Hadoop dependencies)
+* python (for releasedocs)
 
 ----------------------------------------------------------------------------------
 The easiest way to get an environment with all the appropriate tools is by means
@@ -26,11 +26,11 @@ On Linux:
     $ ./start-build-env.sh
 
 On Mac:
-    First make sure Homebrew has been installed ( http://brew.sh/ )
-    $ brew install docker boot2docker
-    $ boot2docker init -m 4096
-    $ boot2docker start
-    $ $(boot2docker shellinit)
+    First make sure Virtualbox and docker toolbox are installed.
+    You can use docker toolbox as described in http://docs.docker.com/mac/step_one/.
+    $ docker-machine create --driver virtualbox \
+                            --virtualbox-memory "4096" hadoopdev
+    $ eval $(docker-machine env hadoopdev)
     $ ./start-build-env.sh
 
 The prompt which is then presented is located at a mounted version of the source tree
@@ -38,7 +38,7 @@ and all required tools for testing and building have been installed and configur
 
 Note that from within this docker environment you ONLY have access to the Hadoop source
 tree from where you started. So if you need to run
-    dev-support/test-patch.sh /path/to/my.patch
+    dev-support/bin/test-patch /path/to/my.patch
 then the patch must be placed inside the hadoop source tree.
 
 Known issues:
@@ -258,10 +258,10 @@ If the build process fails with an out of memory error, you should be able to fi
 it by increasing the memory used by maven which can be done via the environment
 variable MAVEN_OPTS.
 
-Here is an example setting to allocate between 256 and 512 MB of heap space to
+Here is an example setting to allocate between 256 MB and 1.5 GB of heap space to
 Maven
 
-export MAVEN_OPTS="-Xms256m -Xmx512m"
+export MAVEN_OPTS="-Xms256m -Xmx1536m"
 
 ----------------------------------------------------------------------------------
 
@@ -346,3 +346,14 @@ http://www.zlib.net/
 Building distributions:
 
  * Build distribution with native code    : mvn package [-Pdist][-Pdocs][-Psrc][-Dtar]
+
+----------------------------------------------------------------------------------
+Running compatibility checks with checkcompatibility.py
+
+Invoke `./dev-support/bin/checkcompatibility.py` to run Java API Compliance Checker
+to compare the public Java APIs of two git objects. This can be used by release
+managers to compare the compatibility of a previous and current release.
+
+As an example, this invocation will check the compatibility of interfaces annotated as Public or LimitedPrivate:
+
+./dev-support/bin/checkcompatibility.py --annotation org.apache.hadoop.classification.InterfaceAudience.Public --annotation org.apache.hadoop.classification.InterfaceAudience.LimitedPrivate --include "hadoop.*" branch-2.7.2 trunk

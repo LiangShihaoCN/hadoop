@@ -189,9 +189,10 @@ public class RetriableFileCopyCommand extends RetriableCommand {
                                   throws IOException {
     final Path sourcePath = sourceFileStatus.getPath();
     FileSystem fs = sourcePath.getFileSystem(configuration);
-    if (fs.getFileStatus(sourcePath).getLen() != targetLen)
-      throw new IOException("Mismatch in length of source:" + sourcePath
-                + " and target:" + target);
+    long srcLen = fs.getFileStatus(sourcePath).getLen();
+    if (srcLen != targetLen)
+      throw new IOException("Mismatch in length of source:" + sourcePath + " (" + srcLen +
+          ") and target:" + target + " (" + targetLen + ")");
   }
 
   private void compareCheckSums(FileSystem sourceFS, Path source,
@@ -201,11 +202,13 @@ public class RetriableFileCopyCommand extends RetriableCommand {
         targetFS, target)) {
       StringBuilder errorMessage = new StringBuilder("Check-sum mismatch between ")
           .append(source).append(" and ").append(target).append(".");
-      if (sourceFS.getFileStatus(source).getBlockSize() != targetFS.getFileStatus(target).getBlockSize()) {
+      if (sourceFS.getFileStatus(source).getBlockSize() !=
+          targetFS.getFileStatus(target).getBlockSize()) {
         errorMessage.append(" Source and target differ in block-size.")
             .append(" Use -pb to preserve block-sizes during copy.")
             .append(" Alternatively, skip checksum-checks altogether, using -skipCrc.")
-						.append(" (NOTE: By skipping checksums, one runs the risk of masking data-corruption during file-transfer.)");
+            .append(" (NOTE: By skipping checksums, one runs the risk of " +
+                "masking data-corruption during file-transfer.)");
       }
       throw new IOException(errorMessage.toString());
     }

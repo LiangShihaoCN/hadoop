@@ -38,6 +38,7 @@ import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.Ap
 import org.apache.hadoop.yarn.webapp.Controller.RequestContext;
 import com.google.inject.Injector;
 import com.sun.jersey.guice.spi.container.servlet.GuiceContainer;
+import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
 
 @Singleton
 public class NMWebAppFilter extends GuiceContainer{
@@ -58,8 +59,7 @@ public class NMWebAppFilter extends GuiceContainer{
   public void doFilter(HttpServletRequest request,
       HttpServletResponse response, FilterChain chain) throws IOException,
       ServletException {
-    String uri = HtmlQuoting.quoteHtmlChars(request.getRequestURI());
-    String redirectPath = containerLogPageRedirectPath(uri);
+    String redirectPath = containerLogPageRedirectPath(request);
     if (redirectPath != null) {
       String redirectMsg =
           "Redirecting to log server" + " : " + redirectPath;
@@ -72,12 +72,17 @@ public class NMWebAppFilter extends GuiceContainer{
     super.doFilter(request, response, chain);
   }
 
-  private String containerLogPageRedirectPath(String uri) {
+  private String containerLogPageRedirectPath(HttpServletRequest request) {
+    String uri = HtmlQuoting.quoteHtmlChars(request.getRequestURI());
     String redirectPath = null;
     if (!uri.contains("/ws/v1/node") && uri.contains("/containerlogs")) {
       String[] parts = uri.split("/");
       String containerIdStr = parts[3];
       String appOwner = parts[4];
+      String logType = null;
+      if (parts.length > 5) {
+        logType = parts[5];
+      }
       if (containerIdStr != null && !containerIdStr.isEmpty()) {
         ContainerId containerId = null;
         try {
@@ -105,7 +110,12 @@ public class NMWebAppFilter extends GuiceContainer{
             sb.append(containerIdStr);
             sb.append("/");
             sb.append(appOwner);
-            redirectPath = sb.toString();
+            if (logType != null && !logType.isEmpty()) {
+              sb.append("/");
+              sb.append(logType);
+            }
+            redirectPath =
+                WebAppUtils.appendQueryParams(request, sb.toString());
           } else {
             injector.getInstance(RequestContext.class).set(
               ContainerLogsPage.REDIRECT_URL, "false");

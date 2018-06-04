@@ -18,19 +18,22 @@
 package org.apache.hadoop.hdfs.server.namenode;
 
 import java.io.IOException;
+import java.util.Set;
 
 import org.apache.hadoop.HadoopIllegalArgumentException;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.UnresolvedLinkException;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
-import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.protocol.SnapshotAccessControlException;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoContiguousUnderConstruction;
+import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoContiguous;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+import org.apache.hadoop.hdfs.server.blockmanagement.BlockUnderConstructionFeature;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.BlockUCState;
+import org.apache.hadoop.hdfs.server.namenode.FSDirectory.DirOp;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem.RecoverLeaseOp;
 import org.apache.hadoop.hdfs.server.namenode.INode.BlocksMapUpdateInfo;
 
@@ -69,16 +72,14 @@ final class FSDirTruncateOp {
     assert fsn.hasWriteLock();
 
     FSDirectory fsd = fsn.getFSDirectory();
-    byte[][] pathComponents = FSDirectory
-        .getPathComponentsForReservedPath(srcArg);
     final String src;
     final INodesInPath iip;
     final boolean onBlockBoundary;
     Block truncateBlock = null;
     fsd.writeLock();
     try {
-      src = fsd.resolvePath(pc, srcArg, pathComponents);
-      iip = fsd.getINodesInPath4Write(src, true);
+      iip = fsd.resolvePath(pc, srcArg, DirOp.WRITE);
+      src = iip.getPath();
       if (fsd.isPermissionEnabled()) {
         fsd.checkPathAccess(pc, iip, FsAction.WRITE);
       }
@@ -95,7 +96,7 @@ final class FSDirTruncateOp {
       final BlockInfo last = file.getLastBlock();
       if (last != null && last.getBlockUCState()
           == BlockUCState.UNDER_RECOVERY) {
-        final Block truncatedBlock = ((BlockInfoContiguousUnderConstruction) last)
+        final BlockInfo truncatedBlock = last.getUnderConstructionFeature()
             .getTruncateBlock();
         if (truncatedBlock != null) {
           final long truncateLength = file.computeFileSize(false, false)
@@ -147,7 +148,7 @@ final class FSDirTruncateOp {
    * {@link FSDirTruncateOp#truncate}, this will not schedule block recovery.
    *
    * @param fsn namespace
-   * @param src path name
+   * @param iip path name
    * @param clientName client name
    * @param clientMachine client machine info
    * @param newLength the target file size
@@ -155,7 +156,8 @@ final class FSDirTruncateOp {
    * @param truncateBlock truncate block
    * @throws IOException
    */
-  static void unprotectedTruncate(final FSNamesystem fsn, final String src,
+  static void unprotectedTruncate(final FSNamesystem fsn,
+      final INodesInPath iip,
       final String clientName, final String clientMachine,
       final long newLength, final long mtime, final Block truncateBlock)
       throws UnresolvedLinkException, QuotaExceededException,
@@ -163,7 +165,6 @@ final class FSDirTruncateOp {
     assert fsn.hasWriteLock();
 
     FSDirectory fsd = fsn.getFSDirectory();
-    INodesInPath iip = fsd.getINodesInPath(src, true);
     INodeFile file = iip.getLastINode().asFile();
     BlocksMapUpdateInfo collectedBlocks = new BlocksMapUpdateInfo();
     boolean onBlockBoundary = unprotectedTruncate(fsn, iip, newLength,
@@ -178,6 +179,7 @@ final class FSDirTruncateOp {
           "Should be the same block.";
       if (oldBlock.getBlockId() != tBlk.getBlockId()
           && !file.isBlockInLatestSnapshot(oldBlock)) {
+        oldBlock.delete();
         fsd.getBlockManager().removeBlockFromMap(oldBlock);
       }
     }
@@ -222,42 +224,43 @@ final class FSDirTruncateOp {
               oldBlock)));
     }
 
-    BlockInfoContiguousUnderConstruction truncatedBlockUC;
+    final BlockInfo truncatedBlockUC;
     BlockManager blockManager = fsn.getFSDirectory().getBlockManager();
     if (shouldCopyOnTruncate) {
       // Add new truncateBlock into blocksMap and
       // use oldBlock as a source for copy-on-truncate recovery
-      truncatedBlockUC = new BlockInfoContiguousUnderConstruction(newBlock,
+      truncatedBlockUC = new BlockInfoContiguous(newBlock,
           file.getPreferredBlockReplication());
+      truncatedBlockUC.convertToBlockUnderConstruction(
+          BlockUCState.UNDER_CONSTRUCTION, blockManager.getStorages(oldBlock));
       truncatedBlockUC.setNumBytes(oldBlock.getNumBytes() - lastBlockDelta);
-      truncatedBlockUC.setTruncateBlock(oldBlock);
-      file.setLastBlock(truncatedBlockUC, blockManager.getStorages(oldBlock));
+      truncatedBlockUC.getUnderConstructionFeature().setTruncateBlock(oldBlock);
+      file.setLastBlock(truncatedBlockUC);
       blockManager.addBlockCollection(truncatedBlockUC, file);
 
       NameNode.stateChangeLog.debug(
           "BLOCK* prepareFileForTruncate: Scheduling copy-on-truncate to new"
               + " size {}  new block {} old block {}",
-          truncatedBlockUC.getNumBytes(), newBlock,
-          truncatedBlockUC.getTruncateBlock());
+          truncatedBlockUC.getNumBytes(), newBlock, oldBlock);
     } else {
       // Use new generation stamp for in-place truncate recovery
       blockManager.convertLastBlockToUnderConstruction(file, lastBlockDelta);
       oldBlock = file.getLastBlock();
       assert !oldBlock.isComplete() : "oldBlock should be under construction";
-      truncatedBlockUC = (BlockInfoContiguousUnderConstruction) oldBlock;
-      truncatedBlockUC.setTruncateBlock(new Block(oldBlock));
-      truncatedBlockUC.getTruncateBlock().setNumBytes(
-          oldBlock.getNumBytes() - lastBlockDelta);
-      truncatedBlockUC.getTruncateBlock().setGenerationStamp(
-          newBlock.getGenerationStamp());
+      BlockUnderConstructionFeature uc = oldBlock.getUnderConstructionFeature();
+      uc.setTruncateBlock(new BlockInfoContiguous(oldBlock,
+          oldBlock.getReplication()));
+      uc.getTruncateBlock().setNumBytes(oldBlock.getNumBytes() - lastBlockDelta);
+      uc.getTruncateBlock().setGenerationStamp(newBlock.getGenerationStamp());
+      truncatedBlockUC = oldBlock;
 
-      NameNode.stateChangeLog.debug(
-          "BLOCK* prepareFileForTruncate: {} Scheduling in-place block "
-              + "truncate to new size {}", truncatedBlockUC.getTruncateBlock()
-              .getNumBytes(), truncatedBlockUC);
+      NameNode.stateChangeLog.debug("BLOCK* prepareFileForTruncate: " +
+          "{} Scheduling in-place block truncate to new size {}",
+          uc, uc.getTruncateBlock().getNumBytes());
     }
     if (shouldRecoverNow) {
-      truncatedBlockUC.initializeBlockRecovery(newBlock.getGenerationStamp());
+      truncatedBlockUC.getUnderConstructionFeature().initializeBlockRecovery(
+          truncatedBlockUC, newBlock.getGenerationStamp(), true);
     }
 
     return newBlock;
@@ -288,9 +291,9 @@ final class FSDirTruncateOp {
 
     verifyQuotaForTruncate(fsn, iip, file, newLength, delta);
 
-    long remainingLength =
-        file.collectBlocksBeyondMax(newLength, collectedBlocks);
-    file.excludeSnapshotBlocks(latestSnapshot, collectedBlocks);
+    Set<BlockInfo> toRetain = file.getSnapshotBlocksToRetain(latestSnapshot);
+    long remainingLength = file.collectBlocksBeyondMax(newLength,
+        collectedBlocks, toRetain);
     file.setModificationTime(mtime);
     // return whether on a block boundary
     return (remainingLength - newLength) == 0;
@@ -335,9 +338,9 @@ final class FSDirTruncateOp {
    */
   static class TruncateResult {
     private final boolean result;
-    private final HdfsFileStatus stat;
+    private final FileStatus stat;
 
-    public TruncateResult(boolean result, HdfsFileStatus stat) {
+    public TruncateResult(boolean result, FileStatus stat) {
       this.result = result;
       this.stat = stat;
     }
@@ -353,7 +356,7 @@ final class FSDirTruncateOp {
     /**
      * @return file information.
      */
-    HdfsFileStatus getFileStatus() {
+    FileStatus getFileStatus() {
       return stat;
     }
   }

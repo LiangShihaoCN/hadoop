@@ -36,7 +36,6 @@ import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.protocol.*;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction;
 import org.apache.hadoop.hdfs.server.blockmanagement.*;
-import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
@@ -77,12 +76,12 @@ public class TestBlockStoragePolicy {
   static final long FILE_LEN = 1024;
   static final short REPLICATION = 3;
 
-  static final byte COLD = HdfsServerConstants.COLD_STORAGE_POLICY_ID;
-  static final byte WARM = HdfsServerConstants.WARM_STORAGE_POLICY_ID;
-  static final byte HOT  = HdfsServerConstants.HOT_STORAGE_POLICY_ID;
-  static final byte ONESSD  = HdfsServerConstants.ONESSD_STORAGE_POLICY_ID;
-  static final byte ALLSSD  = HdfsServerConstants.ALLSSD_STORAGE_POLICY_ID;
-  static final byte LAZY_PERSIST  = HdfsServerConstants.MEMORY_STORAGE_POLICY_ID;
+  static final byte COLD = HdfsConstants.COLD_STORAGE_POLICY_ID;
+  static final byte WARM = HdfsConstants.WARM_STORAGE_POLICY_ID;
+  static final byte HOT  = HdfsConstants.HOT_STORAGE_POLICY_ID;
+  static final byte ONESSD  = HdfsConstants.ONESSD_STORAGE_POLICY_ID;
+  static final byte ALLSSD  = HdfsConstants.ALLSSD_STORAGE_POLICY_ID;
+  static final byte LAZY_PERSIST  = HdfsConstants.MEMORY_STORAGE_POLICY_ID;
 
   @Test (timeout=300000)
   public void testConfigKeyEnabled() throws IOException {
@@ -1238,12 +1237,12 @@ public class TestBlockStoragePolicy {
 
     DatanodeStorageInfo[] targets = replicator.chooseTarget("/foo", 3,
         dataNodes[0], Collections.<DatanodeStorageInfo>emptyList(), false,
-        new HashSet<Node>(), 0, policy1);
+        new HashSet<Node>(), 0, policy1, null);
     System.out.println(Arrays.asList(targets));
     Assert.assertEquals(3, targets.length);
     targets = replicator.chooseTarget("/foo", 3,
         dataNodes[0], Collections.<DatanodeStorageInfo>emptyList(), false,
-        new HashSet<Node>(), 0, policy2);
+        new HashSet<Node>(), 0, policy2, null);
     System.out.println(Arrays.asList(targets));
     Assert.assertEquals(3, targets.length);
   }
@@ -1309,7 +1308,7 @@ public class TestBlockStoragePolicy {
 
     DatanodeStorageInfo[] targets = replicator.chooseTarget("/foo", 3,
         dataNodes[0], Collections.<DatanodeStorageInfo>emptyList(), false,
-        new HashSet<Node>(), 0, policy);
+        new HashSet<Node>(), 0, policy, null);
     System.out.println(policy.getName() + ": " + Arrays.asList(targets));
     Assert.assertEquals(2, targets.length);
     Assert.assertEquals(StorageType.SSD, targets[0].getStorageType());
@@ -1341,19 +1340,15 @@ public class TestBlockStoragePolicy {
       HdfsFileStatus status = fs.getClient().getFileInfo(file);
       // 5. get file policy, it should be parent policy.
       Assert
-          .assertTrue(
-              "File storage policy should be HOT",
-              status.getStoragePolicy()
-              == HdfsServerConstants.HOT_STORAGE_POLICY_ID);
+          .assertTrue("File storage policy should be HOT",
+              status.getStoragePolicy() == HOT);
       // 6. restart NameNode for reloading edits logs.
       cluster.restartNameNode(true);
       // 7. get file policy, it should be parent policy.
       status = fs.getClient().getFileInfo(file);
       Assert
-          .assertTrue(
-              "File storage policy should be HOT",
-              status.getStoragePolicy()
-              == HdfsServerConstants.HOT_STORAGE_POLICY_ID);
+          .assertTrue("File storage policy should be HOT",
+              status.getStoragePolicy() == HOT);
 
     } finally {
       cluster.shutdown();

@@ -44,6 +44,10 @@ public class SysInfoWindows extends SysInfo {
   private long cpuFrequencyKhz;
   private long cumulativeCpuTimeMs;
   private float cpuUsage;
+  private long storageBytesRead;
+  private long storageBytesWritten;
+  private long netBytesRead;
+  private long netBytesWritten;
 
   private long lastRefreshTime;
   static final int REFRESH_INTERVAL_MS = 1000;
@@ -55,7 +59,7 @@ public class SysInfoWindows extends SysInfo {
 
   @VisibleForTesting
   long now() {
-    return System.nanoTime();
+    return Time.monotonicNow();
   }
 
   void reset() {
@@ -67,12 +71,17 @@ public class SysInfoWindows extends SysInfo {
     cpuFrequencyKhz = -1;
     cumulativeCpuTimeMs = -1;
     cpuUsage = -1;
+    storageBytesRead = -1;
+    storageBytesWritten = -1;
+    netBytesRead = -1;
+    netBytesWritten = -1;
   }
 
   String getSystemInfoInfoFromShell() {
-    ShellCommandExecutor shellExecutor = new ShellCommandExecutor(
-        new String[] {Shell.WINUTILS, "systeminfo" });
     try {
+      ShellCommandExecutor shellExecutor = new ShellCommandExecutor(
+          new String[] {Shell.getWinUtilsFile().getCanonicalPath(),
+              "systeminfo" });
       shellExecutor.execute();
       return shellExecutor.getOutput();
     } catch (IOException e) {
@@ -90,28 +99,41 @@ public class SysInfoWindows extends SysInfo {
       reset();
       String sysInfoStr = getSystemInfoInfoFromShell();
       if (sysInfoStr != null) {
-        final int sysInfoSplitCount = 7;
-        String[] sysInfo = sysInfoStr.substring(0, sysInfoStr.indexOf("\r\n"))
-            .split(",");
-        if (sysInfo.length == sysInfoSplitCount) {
-          try {
-            vmemSize = Long.parseLong(sysInfo[0]);
-            memSize = Long.parseLong(sysInfo[1]);
-            vmemAvailable = Long.parseLong(sysInfo[2]);
-            memAvailable = Long.parseLong(sysInfo[3]);
-            numProcessors = Integer.parseInt(sysInfo[4]);
-            cpuFrequencyKhz = Long.parseLong(sysInfo[5]);
-            cumulativeCpuTimeMs = Long.parseLong(sysInfo[6]);
-            if (lastCumCpuTimeMs != -1) {
-              cpuUsage = (cumulativeCpuTimeMs - lastCumCpuTimeMs)
-                  / (refreshInterval * 1.0f);
+        final int sysInfoSplitCount = 11;
+        int index = sysInfoStr.indexOf("\r\n");
+        if (index >= 0) {
+          String[] sysInfo = sysInfoStr.substring(0, index).split(",");
+          if (sysInfo.length == sysInfoSplitCount) {
+            try {
+              vmemSize = Long.parseLong(sysInfo[0]);
+              memSize = Long.parseLong(sysInfo[1]);
+              vmemAvailable = Long.parseLong(sysInfo[2]);
+              memAvailable = Long.parseLong(sysInfo[3]);
+              numProcessors = Integer.parseInt(sysInfo[4]);
+              cpuFrequencyKhz = Long.parseLong(sysInfo[5]);
+              cumulativeCpuTimeMs = Long.parseLong(sysInfo[6]);
+              storageBytesRead = Long.parseLong(sysInfo[7]);
+              storageBytesWritten = Long.parseLong(sysInfo[8]);
+              netBytesRead = Long.parseLong(sysInfo[9]);
+              netBytesWritten = Long.parseLong(sysInfo[10]);
+              if (lastCumCpuTimeMs != -1) {
+                /**
+                 * This number will be the aggregated usage across all cores in
+                 * [0.0, 100.0]. For example, it will be 400.0 if there are 8
+                 * cores and each of them is running at 50% utilization.
+                 */
+                cpuUsage = (cumulativeCpuTimeMs - lastCumCpuTimeMs)
+                    * 100F / refreshInterval;
+              }
+            } catch (NumberFormatException nfe) {
+              LOG.warn("Error parsing sysInfo", nfe);
             }
-          } catch (NumberFormatException nfe) {
-            LOG.warn("Error parsing sysInfo", nfe);
+          } else {
+            LOG.warn("Expected split length of sysInfo to be "
+                + sysInfoSplitCount + ". Got " + sysInfo.length);
           }
         } else {
-          LOG.warn("Expected split length of sysInfo to be "
-              + sysInfoSplitCount + ". Got " + sysInfo.length);
+          LOG.warn("Wrong output from sysInfo: " + sysInfoStr);
         }
       }
     }
@@ -174,35 +196,50 @@ public class SysInfoWindows extends SysInfo {
 
   /** {@inheritDoc} */
   @Override
-  public float getCpuUsage() {
+  public float getCpuUsagePercentage() {
     refreshIfNeeded();
-    return cpuUsage;
+    float ret = cpuUsage;
+    if (ret != -1) {
+      ret = ret / numProcessors;
+    }
+    return ret;
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public float getNumVCoresUsed() {
+    refreshIfNeeded();
+    float ret = cpuUsage;
+    if (ret != -1) {
+      ret = ret / 100F;
+    }
+    return ret;
   }
 
   /** {@inheritDoc} */
   @Override
   public long getNetworkBytesRead() {
-    // TODO unimplemented
-    return 0L;
+    refreshIfNeeded();
+    return netBytesRead;
   }
 
   /** {@inheritDoc} */
   @Override
   public long getNetworkBytesWritten() {
-    // TODO unimplemented
-    return 0L;
+    refreshIfNeeded();
+    return netBytesWritten;
   }
 
   @Override
   public long getStorageBytesRead() {
-    // TODO unimplemented
-    return 0L;
+    refreshIfNeeded();
+    return storageBytesRead;
   }
 
   @Override
   public long getStorageBytesWritten() {
-    // TODO unimplemented
-    return 0L;
+    refreshIfNeeded();
+    return storageBytesWritten;
   }
 
 }

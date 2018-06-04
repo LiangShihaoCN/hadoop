@@ -18,17 +18,7 @@
 
 package org.apache.hadoop.tools.util;
 
-import java.io.IOException;
-import java.net.InetAddress;
-import java.net.URI;
-import java.net.UnknownHostException;
-import java.text.DecimalFormat;
-import java.util.EnumSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Map.Entry;
-
+import com.google.common.collect.Maps;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -49,9 +39,14 @@ import org.apache.hadoop.tools.CopyListingFileStatus;
 import org.apache.hadoop.tools.DistCpOptions;
 import org.apache.hadoop.tools.DistCpOptions.FileAttribute;
 import org.apache.hadoop.tools.mapred.UniformSizeInputFormat;
-
-import com.google.common.collect.Maps;
 import org.apache.hadoop.util.StringUtils;
+
+import java.io.IOException;
+import java.text.DecimalFormat;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 
 /**
  * Utility functions used in DistCp.
@@ -200,9 +195,13 @@ public class DistCpUtils {
                               EnumSet<FileAttribute> attributes,
                               boolean preserveRawXattrs) throws IOException {
 
-    FileStatus targetFileStatus = targetFS.getFileStatus(path);
-    String group = targetFileStatus.getGroup();
-    String user = targetFileStatus.getOwner();
+    // If not preserving anything from FileStatus, don't bother fetching it.
+    FileStatus targetFileStatus = attributes.isEmpty() ? null :
+        targetFS.getFileStatus(path);
+    String group = targetFileStatus == null ? null :
+        targetFileStatus.getGroup();
+    String user = targetFileStatus == null ? null :
+        targetFileStatus.getOwner();
     boolean chown = false;
 
     if (attributes.contains(FileAttribute.ACL)) {

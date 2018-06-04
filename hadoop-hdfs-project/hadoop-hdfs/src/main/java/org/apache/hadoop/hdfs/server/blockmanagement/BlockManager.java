@@ -17,25 +17,30 @@
  */
 package org.apache.hadoop.hdfs.server.blockmanagement;
 
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NAMENODES_KEY_PREFIX;
 import static org.apache.hadoop.util.ExitUtil.terminate;
 
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -44,6 +49,8 @@ import javax.management.ObjectName;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.AddBlockFlag;
+import org.apache.hadoop.fs.FileEncryptionInfo;
 import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
@@ -55,7 +62,6 @@ import org.apache.hadoop.hdfs.protocol.BlockListAsLongs.BlockReportReplica;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
-import org.apache.hadoop.fs.FileEncryptionInfo;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.protocol.UnregisteredNodeException;
@@ -67,12 +73,15 @@ import org.apache.hadoop.hdfs.security.token.block.ExportedBlockKeys;
 import org.apache.hadoop.hdfs.server.blockmanagement.CorruptReplicasMap.Reason;
 import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeStorageInfo.AddBlockResult;
 import org.apache.hadoop.hdfs.server.blockmanagement.PendingDataNodeMessages.ReportedBlockInfo;
+import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.BlockUCState;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.ReplicaState;
 import org.apache.hadoop.hdfs.server.namenode.CachedBlock;
+import org.apache.hadoop.hdfs.server.namenode.INodesInPath;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.namenode.NameNode.OperationCategory;
 import org.apache.hadoop.hdfs.server.namenode.Namesystem;
+import org.apache.hadoop.hdfs.server.namenode.ha.HAContext;
 import org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeMetrics;
 import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
 import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
@@ -85,17 +94,19 @@ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage.State;
 import org.apache.hadoop.hdfs.server.protocol.KeyUpdateCommand;
 import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
 import org.apache.hadoop.hdfs.server.protocol.StorageReceivedDeletedBlocks;
-import org.apache.hadoop.hdfs.util.LightWeightLinkedSet;
+import org.apache.hadoop.hdfs.util.LightWeightHashSet;
+import org.apache.hadoop.hdfs.server.namenode.CacheManager;
 import org.apache.hadoop.metrics2.util.MBeans;
 import org.apache.hadoop.net.Node;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.Daemon;
+import org.apache.hadoop.util.ExitUtil;
 import org.apache.hadoop.util.LightWeightGSet;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Sets;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -128,8 +139,11 @@ public class BlockManager implements BlockStatsMXBean {
   private volatile long corruptReplicaBlocksCount = 0L;
   private volatile long underReplicatedBlocksCount = 0L;
   private volatile long scheduledReplicationBlocksCount = 0L;
+
+  /** flag indicating whether replication queues have been initialized */
+  private boolean initializedReplQueues;
+
   private final AtomicLong excessBlocksCount = new AtomicLong(0L);
-  private final AtomicLong postponedMisreplicatedBlocksCount = new AtomicLong(0L);
   private final long startupDelayBlockDeletionInMs;
   private final BlockReportLeaseManager blockReportLeaseManager;
   private ObjectName mxBeanName;
@@ -164,11 +178,15 @@ public class BlockManager implements BlockStatsMXBean {
   }
   /** Used by metrics */
   public long getPostponedMisreplicatedBlocksCount() {
-    return postponedMisreplicatedBlocksCount.get();
+    return postponedMisreplicatedBlocks.size();
   }
   /** Used by metrics */
   public int getPendingDataNodeMessageCount() {
     return pendingDNMessages.count();
+  }
+  /** Used by metrics. */
+  public long getNumTimedOutPendingReplications() {
+    return pendingReplications.getNumTimedOuts();
   }
 
   /**replicationRecheckInterval is how often namenode checks for new replication work*/
@@ -183,6 +201,10 @@ public class BlockManager implements BlockStatsMXBean {
   /** Replication thread. */
   final Daemon replicationThread = new Daemon(new ReplicationMonitor());
   
+  /** Block report thread for handling async reports. */
+  private final BlockReportProcessingThread blockReportThread =
+      new BlockReportProcessingThread();
+
   /** Store blocks -> datanodedescriptor(s) map of corrupt replicas */
   final CorruptReplicasMap corruptReplicas = new CorruptReplicasMap();
 
@@ -196,14 +218,17 @@ public class BlockManager implements BlockStatsMXBean {
    * notified of all block deletions that might have been pending
    * when the failover happened.
    */
-  private final Set<Block> postponedMisreplicatedBlocks = Sets.newHashSet();
+  private final LinkedHashSet<Block> postponedMisreplicatedBlocks =
+      new LinkedHashSet<Block>();
+  private final int blocksPerPostpondedRescan;
+  private final ArrayList<Block> rescannedMisreplicatedBlocks;
 
   /**
    * Maps a StorageID to the set of blocks that are "extra" for this
    * DataNode. We'll eventually remove these extras.
    */
-  public final Map<String, LightWeightLinkedSet<Block>> excessReplicateMap =
-    new TreeMap<String, LightWeightLinkedSet<Block>>();
+  public final Map<String, LightWeightHashSet<Block>> excessReplicateMap =
+    new HashMap<>();
 
   /**
    * Store set of Blocks that need to be replicated 1 or more times.
@@ -236,9 +261,6 @@ public class BlockManager implements BlockStatsMXBean {
   final float blocksInvalidateWorkPct;
   final int blocksReplWorkMultiplier;
 
-  /** variable to enable check for enough racks */
-  final boolean shouldCheckForEnoughRacks;
-  
   // whether or not to issue block encryption keys.
   final boolean encryptDataTransfer;
   
@@ -264,6 +286,14 @@ public class BlockManager implements BlockStatsMXBean {
    * processed again after aquiring lock again.
    */
   private int numBlocksPerIteration;
+
+  /**
+   * Minimum size that a block can be sent to Balancer through getBlocks.
+   * And after HDFS-8824, the small blocks are unused anyway, so there's no
+   * point to send them to balancer.
+   */
+  private long getBlocksMinBlockSize = -1;
+
   /**
    * Progress of the Replication queues initialisation.
    */
@@ -276,12 +306,22 @@ public class BlockManager implements BlockStatsMXBean {
   /** Check whether name system is running before terminating */
   private boolean checkNSRunning = true;
 
+  /** Keeps track of how many bytes are in Future Generation blocks. */
+  private AtomicLong numberOfBytesInFutureBlocks;
+
+  /** Reports if Name node was started with Rollback option. */
+  private boolean inRollBack = false;
+
   public BlockManager(final Namesystem namesystem, final Configuration conf)
     throws IOException {
     this.namesystem = namesystem;
     datanodeManager = new DatanodeManager(this, namesystem, conf);
     heartbeatManager = datanodeManager.getHeartbeatManager();
 
+    blocksPerPostpondedRescan = (int)Math.min(Integer.MAX_VALUE,
+        datanodeManager.getBlocksPerPostponedMisreplicatedBlocksRescan());
+    rescannedMisreplicatedBlocks =
+        new ArrayList<Block>(blocksPerPostpondedRescan);
     startupDelayBlockDeletionInMs = conf.getLong(
         DFSConfigKeys.DFS_NAMENODE_STARTUP_DELAY_BLOCK_DELETION_SEC_KEY,
         DFSConfigKeys.DFS_NAMENODE_STARTUP_DELAY_BLOCK_DELETION_SEC_DEFAULT) * 1000L;
@@ -336,10 +376,6 @@ public class BlockManager implements BlockStatsMXBean {
         conf.getInt(
             DFSConfigKeys.DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_KEY,
             DFSConfigKeys.DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_DEFAULT);
-    this.shouldCheckForEnoughRacks =
-        conf.get(DFSConfigKeys.NET_TOPOLOGY_SCRIPT_FILE_NAME_KEY) == null
-            ? false : true;
-
     this.blocksInvalidateWorkPct = DFSUtil.getInvalidateWorkPctPerIteration(conf);
     this.blocksReplWorkMultiplier = DFSUtil.getReplWorkMultiplier(conf);
 
@@ -357,13 +393,17 @@ public class BlockManager implements BlockStatsMXBean {
     this.numBlocksPerIteration = conf.getInt(
         DFSConfigKeys.DFS_BLOCK_MISREPLICATION_PROCESSING_LIMIT,
         DFSConfigKeys.DFS_BLOCK_MISREPLICATION_PROCESSING_LIMIT_DEFAULT);
+    this.getBlocksMinBlockSize = conf.getLongBytes(
+        DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,
+        DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_DEFAULT);
     this.blockReportLeaseManager = new BlockReportLeaseManager(conf);
+    this.numberOfBytesInFutureBlocks = new AtomicLong();
+    this.inRollBack = isInRollBackMode(NameNode.getStartupOption(conf));
 
     LOG.info("defaultReplication         = " + defaultReplication);
     LOG.info("maxReplication             = " + maxReplication);
     LOG.info("minReplication             = " + minReplication);
     LOG.info("maxReplicationStreams      = " + maxReplicationStreams);
-    LOG.info("shouldCheckForEnoughRacks  = " + shouldCheckForEnoughRacks);
     LOG.info("replicationRecheckInterval = " + replicationRecheckInterval);
     LOG.info("encryptDataTransfer        = " + encryptDataTransfer);
     LOG.info("maxNumBlocksToLog          = " + maxNumBlocksToLog);
@@ -464,14 +504,18 @@ public class BlockManager implements BlockStatsMXBean {
   public void activate(Configuration conf) {
     pendingReplications.start();
     datanodeManager.activate(conf);
+    this.replicationThread.setName("ReplicationMonitor");
     this.replicationThread.start();
+    this.blockReportThread.start();
     mxBeanName = MBeans.register("NameNode", "BlockStats", this);
   }
 
   public void close() {
     try {
       replicationThread.interrupt();
+      blockReportThread.interrupt();
       replicationThread.join(3000);
+      blockReportThread.join(3000);
     } catch (InterruptedException ie) {
     }
     datanodeManager.close();
@@ -528,6 +572,48 @@ public class BlockManager implements BlockStatsMXBean {
     // Dump blocks that are waiting to be deleted
     invalidateBlocks.dump(out);
 
+    //Dump corrupt blocks and their storageIDs
+    Set<Block> corruptBlocks = corruptReplicas.getCorruptBlocks();
+    out.println("Corrupt Blocks:");
+    for(Block block : corruptBlocks) {
+      Collection<DatanodeDescriptor> corruptNodes =
+          corruptReplicas.getNodes(block);
+      if (corruptNodes == null) {
+        LOG.warn(block.getBlockId() +
+            " is corrupt but has no associated node.");
+        continue;
+      }
+      int numNodesToFind = corruptNodes.size();
+      for (DatanodeStorageInfo storage : blocksMap.getStorages(block)) {
+        DatanodeDescriptor node = storage.getDatanodeDescriptor();
+        if (corruptNodes.contains(node)) {
+          String storageId = storage.getStorageID();
+          DatanodeStorageInfo storageInfo = node.getStorageInfo(storageId);
+          State state = (storageInfo == null) ? null : storageInfo.getState();
+          out.println("Block=" + block.getBlockId() + "\tNode=" + node.getName()
+              + "\tStorageID=" + storageId + "\tStorageState=" + state
+              + "\tTotalReplicas=" +
+              blocksMap.numNodes(block)
+              + "\tReason=" + corruptReplicas.getCorruptReason(block, node));
+          numNodesToFind--;
+          if (numNodesToFind == 0) {
+            break;
+          }
+        }
+      }
+      if (numNodesToFind > 0) {
+        String[] corruptNodesList = new String[corruptNodes.size()];
+        int i = 0;
+        for (DatanodeDescriptor d : corruptNodes) {
+          corruptNodesList[i] = d.getHostName();
+          i++;
+        }
+        out.println(block.getBlockId() + " corrupt on " +
+            StringUtils.join(",", corruptNodesList) + " but not all nodes are" +
+            "found in its block locations");
+      }
+    }
+
     // Dump all datanodes
     getDatanodeManager().datanodeDump(out);
   }
@@ -555,7 +641,7 @@ public class BlockManager implements BlockStatsMXBean {
                          numReplicas.decommissionedAndDecommissioning();
     
     if (block instanceof BlockInfo) {
-      BlockCollection bc = ((BlockInfo) block).getBlockCollection();
+      BlockCollection bc = getBlockCollection((BlockInfo)block);
       String fileName = (bc == null) ? "[orphaned]" : bc.getName();
       out.print(fileName + ": ");
     }
@@ -600,6 +686,10 @@ public class BlockManager implements BlockStatsMXBean {
     return (countNodes(block).liveReplicas() >= minReplication);
   }
 
+  public short getMinReplication() {
+    return minReplication;
+  }
+
   /**
    * Commit a block of a file
    * 
@@ -609,15 +699,20 @@ public class BlockManager implements BlockStatsMXBean {
    * @throws IOException if the block does not have at least a minimal number
    * of replicas reported from data-nodes.
    */
-  private static boolean commitBlock(
-      final BlockInfoContiguousUnderConstruction block, final Block commitBlock)
-      throws IOException {
+  private boolean commitBlock(final BlockInfo block,
+      final Block commitBlock) throws IOException {
     if (block.getBlockUCState() == BlockUCState.COMMITTED)
       return false;
     assert block.getNumBytes() <= commitBlock.getNumBytes() :
       "commitBlock length is less than the stored one "
       + commitBlock.getNumBytes() + " vs. " + block.getNumBytes();
-    block.commitBlock(commitBlock);
+    if(block.getGenerationStamp() != commitBlock.getGenerationStamp()) {
+      throw new IOException("Commit block with mismatching GS. NN has " +
+        block + ", client submits " + commitBlock);
+    }
+    List<ReplicaUnderConstruction> staleReplicas =
+        block.commitBlock(commitBlock);
+    removeStaleReplicas(staleReplicas, block);
     return true;
   }
   
@@ -627,12 +722,13 @@ public class BlockManager implements BlockStatsMXBean {
    * 
    * @param bc block collection
    * @param commitBlock - contains client reported block length and generation
+   * @param iip - INodes in path to bc
    * @return true if the last block is changed to committed state.
    * @throws IOException if the block does not have at least a minimal number
    * of replicas reported from data-nodes.
    */
   public boolean commitOrCompleteLastBlock(BlockCollection bc,
-      Block commitBlock) throws IOException {
+      Block commitBlock, INodesInPath iip) throws IOException {
     if(commitBlock == null)
       return false; // not committing, this is a block allocation retry
     BlockInfo lastBlock = bc.getLastBlock();
@@ -641,40 +737,70 @@ public class BlockManager implements BlockStatsMXBean {
     if(lastBlock.isComplete())
       return false; // already completed (e.g. by syncBlock)
     
-    final boolean b = commitBlock(
-        (BlockInfoContiguousUnderConstruction) lastBlock, commitBlock);
-    if(countNodes(lastBlock).liveReplicas() >= minReplication)
-      completeBlock(bc, bc.numBlocks()-1, false);
-    return b;
+    final boolean committed = commitBlock(lastBlock, commitBlock);
+
+    // Count replicas on decommissioning nodes, as these will not be
+    // decommissioned unless recovery/completing last block has finished
+    NumberReplicas numReplicas = countNodes(lastBlock);
+    if (numReplicas.liveReplicas() + numReplicas.decommissioning() >=
+        minReplication) {
+      if (committed) {
+        addExpectedReplicasToPending(lastBlock);
+      }
+      completeBlock(lastBlock, iip, false);
+    }
+    return committed;
+  }
+
+  /**
+   * If IBR is not sent from expected locations yet, add the datanodes to
+   * pendingReplications in order to keep ReplicationMonitor from scheduling
+   * the block.
+   */
+  public void addExpectedReplicasToPending(BlockInfo blk) {
+    DatanodeStorageInfo[] expectedStorages =
+        blk.getUnderConstructionFeature().getExpectedStorageLocations();
+    if (expectedStorages.length - blk.numNodes() > 0) {
+      ArrayList<DatanodeDescriptor> pendingNodes =
+          new ArrayList<DatanodeDescriptor>();
+      for (DatanodeStorageInfo storage : expectedStorages) {
+        DatanodeDescriptor dnd = storage.getDatanodeDescriptor();
+        if (blk.findStorageInfo(dnd) == null) {
+          pendingNodes.add(dnd);
+        }
+        pendingReplications.increment(blk,
+            pendingNodes.toArray(new DatanodeDescriptor[pendingNodes.size()]));
+      }
+    }
   }
 
   /**
    * Convert a specified block of the file to a complete block.
-   * @param bc file
-   * @param blkIndex  block index in the file
+   * @param curBlock - block to be completed
+   * @param iip - INodes in path to file containing curBlock; if null,
+   *              this will be resolved internally
+   * @param force - force completion of the block
    * @throws IOException if the block does not have at least a minimal number
    * of replicas reported from data-nodes.
    */
-  private BlockInfo completeBlock(final BlockCollection bc,
-      final int blkIndex, boolean force) throws IOException {
-    if(blkIndex < 0)
-      return null;
-    BlockInfo curBlock = bc.getBlocks()[blkIndex];
-    if(curBlock.isComplete())
-      return curBlock;
-    BlockInfoContiguousUnderConstruction ucBlock =
-        (BlockInfoContiguousUnderConstruction) curBlock;
-    int numNodes = ucBlock.numNodes();
-    if (!force && numNodes < minReplication)
-      throw new IOException("Cannot complete block: " +
-          "block does not satisfy minimal replication requirement.");
-    if(!force && ucBlock.getBlockUCState() != BlockUCState.COMMITTED)
+  private void completeBlock(BlockInfo curBlock, INodesInPath iip,
+      boolean force) throws IOException {
+    if (curBlock.isComplete()) {
+      return;
+    }
+
+    int numNodes = curBlock.numNodes();
+    if (!force && numNodes < minReplication) {
+      throw new IOException("Cannot complete block: "
+          + "block does not satisfy minimal replication requirement.");
+    }
+    if (!force && curBlock.getBlockUCState() != BlockUCState.COMMITTED) {
       throw new IOException(
           "Cannot complete block: block has not been COMMITTED by the client");
-    BlockInfo completeBlock = ucBlock.convertToCompleteBlock();
-    // replace penultimate block in file
-    bc.setBlock(blkIndex, completeBlock);
-    
+    }
+
+    convertToCompleteBlock(curBlock, iip);
+
     // Since safe-mode only counts complete blocks, and we now have
     // one more complete block, we need to adjust the total up, and
     // also count it as safe, if we have at least the minimum replica
@@ -684,33 +810,35 @@ public class BlockManager implements BlockStatsMXBean {
     namesystem.adjustSafeModeBlockTotals(0, 1);
     namesystem.incrementSafeBlockCount(
         Math.min(numNodes, minReplication));
-    
-    // replace block in the blocksMap
-    return blocksMap.replaceBlock(completeBlock);
   }
 
-  private BlockInfo completeBlock(final BlockCollection bc,
-      final BlockInfo block, boolean force) throws IOException {
-    BlockInfo[] fileBlocks = bc.getBlocks();
-    for(int idx = 0; idx < fileBlocks.length; idx++)
-      if(fileBlocks[idx] == block) {
-        return completeBlock(bc, idx, force);
-      }
-    return block;
+  /**
+   * Convert a specified block of the file to a complete block.
+   * Skips validity checking and safe mode block total updates; use
+   * {@link BlockManager#completeBlock} to include these.
+   * @param curBlock - block to be completed
+   * @param iip - INodes in path to file containing curBlock; if null,
+   *              this will be resolved internally
+   * @throws IOException if the block does not have at least a minimal number
+   * of replicas reported from data-nodes.
+   */
+  private void convertToCompleteBlock(BlockInfo curBlock, INodesInPath iip)
+      throws IOException {
+    curBlock.convertToCompleteBlock();
+    namesystem.getFSDirectory().updateSpaceForCompleteBlock(curBlock, iip);
   }
-  
+
   /**
    * Force the given block in the given file to be marked as complete,
    * regardless of whether enough replicas are present. This is necessary
    * when tailing edit logs as a Standby.
    */
-  public BlockInfo forceCompleteBlock(final BlockCollection bc,
-      final BlockInfoContiguousUnderConstruction block) throws IOException {
-    block.commitBlock(block);
-    return completeBlock(bc, block, true);
+  public void forceCompleteBlock(final BlockInfo block) throws IOException {
+    List<ReplicaUnderConstruction> staleReplicas = block.commitBlock(block);
+    removeStaleReplicas(staleReplicas, block);
+    completeBlock(block, null, true);
   }
 
-  
   /**
    * Convert the last block of the file to an under construction block.<p>
    * The block is converted only if the file has blocks and the last one
@@ -727,28 +855,30 @@ public class BlockManager implements BlockStatsMXBean {
    */
   public LocatedBlock convertLastBlockToUnderConstruction(
       BlockCollection bc, long bytesToRemove) throws IOException {
-    BlockInfo oldBlock = bc.getLastBlock();
-    if(oldBlock == null ||
-       bc.getPreferredBlockSize() == oldBlock.getNumBytes() - bytesToRemove)
+    BlockInfo lastBlock = bc.getLastBlock();
+    if (lastBlock == null ||
+       bc.getPreferredBlockSize() == lastBlock.getNumBytes() - bytesToRemove) {
       return null;
-    assert oldBlock == getStoredBlock(oldBlock) :
+    }
+    assert lastBlock == getStoredBlock(lastBlock) :
       "last block of the file is not in blocksMap";
 
-    DatanodeStorageInfo[] targets = getStorages(oldBlock);
+    DatanodeStorageInfo[] targets = getStorages(lastBlock);
 
-    BlockInfoContiguousUnderConstruction ucBlock =
-        bc.setLastBlock(oldBlock, targets);
-    blocksMap.replaceBlock(ucBlock);
+    // convert the last block to under construction. note no block replacement
+    // is happening
+    bc.convertLastBlockToUC(lastBlock, targets);
 
     // Remove block from replication queue.
-    NumberReplicas replicas = countNodes(ucBlock);
-    neededReplications.remove(ucBlock, replicas.liveReplicas(),
-        replicas.decommissionedAndDecommissioning(), getReplication(ucBlock));
-    pendingReplications.remove(ucBlock);
+    NumberReplicas replicas = countNodes(lastBlock);
+    neededReplications.remove(lastBlock, replicas.liveReplicas(),
+        replicas.readOnlyReplicas(),
+        replicas.decommissionedAndDecommissioning(), getReplication(lastBlock));
+    pendingReplications.remove(lastBlock);
 
     // remove this block from the list of pending blocks to be deleted. 
     for (DatanodeStorageInfo storage : targets) {
-      invalidateBlocks.remove(storage.getDatanodeDescriptor(), oldBlock);
+      invalidateBlocks.remove(storage.getDatanodeDescriptor(), lastBlock);
     }
     
     // Adjust safe-mode totals, since under-construction blocks don't
@@ -759,9 +889,11 @@ public class BlockManager implements BlockStatsMXBean {
         // always decrement total blocks
         -1);
 
-    final long fileLength = bc.computeContentSummary(getStoragePolicySuite()).getLength();
-    final long pos = fileLength - ucBlock.getNumBytes();
-    return createLocatedBlock(ucBlock, pos, BlockTokenIdentifier.AccessMode.WRITE);
+    final long fileLength = bc.computeContentSummary(
+        getStoragePolicySuite()).getLength();
+    final long pos = fileLength - lastBlock.getNumBytes();
+    return createLocatedBlock(lastBlock, pos,
+        BlockTokenIdentifier.AccessMode.WRITE);
   }
 
   /**
@@ -838,15 +970,9 @@ public class BlockManager implements BlockStatsMXBean {
   /** @return a LocatedBlock for the given block */
   private LocatedBlock createLocatedBlock(final BlockInfo blk, final long pos
       ) throws IOException {
-    if (blk instanceof BlockInfoContiguousUnderConstruction) {
-      if (blk.isComplete()) {
-        throw new IOException(
-            "blk instanceof BlockInfoUnderConstruction && blk.isComplete()"
-            + ", blk=" + blk);
-      }
-      final BlockInfoContiguousUnderConstruction uc =
-          (BlockInfoContiguousUnderConstruction) blk;
-      final DatanodeStorageInfo[] storages = uc.getExpectedStorageLocations();
+    if (!blk.isComplete()) {
+      final DatanodeStorageInfo[] storages = blk.getUnderConstructionFeature()
+          .getExpectedStorageLocations();
       final ExtendedBlock eb = new ExtendedBlock(namesystem.getBlockPoolId(), blk);
       return newLocatedBlock(eb, storages, pos, false);
     }
@@ -861,18 +987,31 @@ public class BlockManager implements BlockStatsMXBean {
     }
 
     final int numNodes = blocksMap.numNodes(blk);
-    final boolean isCorrupt = numCorruptNodes == numNodes;
-    final int numMachines = isCorrupt ? numNodes: numNodes - numCorruptNodes;
-    final DatanodeStorageInfo[] machines = new DatanodeStorageInfo[numMachines];
+    final boolean isCorrupt = numCorruptReplicas == numNodes;
+    final int numMachines = isCorrupt ? numNodes: numNodes - numCorruptReplicas;
+    DatanodeStorageInfo[] machines = new DatanodeStorageInfo[numMachines];
     int j = 0;
     if (numMachines > 0) {
+      final boolean noCorrupt = (numCorruptReplicas == 0);
       for(DatanodeStorageInfo storage : blocksMap.getStorages(blk)) {
-        final DatanodeDescriptor d = storage.getDatanodeDescriptor();
-        final boolean replicaCorrupt = corruptReplicas.isReplicaCorrupt(blk, d);
-        if (isCorrupt || (!replicaCorrupt))
-          machines[j++] = storage;
+        if (storage.getState() != State.FAILED) {
+          if (noCorrupt) {
+            machines[j++] = storage;
+          } else {
+            final DatanodeDescriptor d = storage.getDatanodeDescriptor();
+            final boolean replicaCorrupt = isReplicaCorrupt(blk, d);
+            if (isCorrupt || !replicaCorrupt) {
+              machines[j++] = storage;
+            }
+          }
+        }
       }
     }
+
+    if(j < machines.length) {
+      machines = Arrays.copyOf(machines, j);
+    }
+
     assert j == machines.length :
       "isCorrupt: " + isCorrupt + 
       " numMachines: " + numMachines +
@@ -918,9 +1057,15 @@ public class BlockManager implements BlockStatsMXBean {
             fileSizeExcludeBlocksUnderConstruction, mode);
         isComplete = true;
       }
-      return new LocatedBlocks(
+      LocatedBlocks locations = new LocatedBlocks(
           fileSizeExcludeBlocksUnderConstruction, isFileUnderConstruction,
           locatedblocks, lastlb, isComplete, feInfo);
+      // Set caching information for the located blocks.
+      CacheManager cm = namesystem.getCacheManager();
+      if (cm != null) {
+        cm.setCachedLocations(locations);
+      }
+      return locations;
     }
   }
 
@@ -944,9 +1089,9 @@ public class BlockManager implements BlockStatsMXBean {
   void addKeyUpdateCommand(final List<DatanodeCommand> cmds,
       final DatanodeDescriptor nodeinfo) {
     // check access key update
-    if (isBlockTokenEnabled() && nodeinfo.needKeyUpdate) {
+    if (isBlockTokenEnabled() && nodeinfo.needKeyUpdate()) {
       cmds.add(new KeyUpdateCommand(blockTokenSecretManager.exportKeys()));
-      nodeinfo.needKeyUpdate = false;
+      nodeinfo.setNeedKeyUpdate(false);
     }
   }
   
@@ -969,28 +1114,29 @@ public class BlockManager implements BlockStatsMXBean {
 
   /**
    * Check whether the replication parameter is within the range
-   * determined by system configuration.
+   * determined by system configuration and throw an exception if it's not.
+   *
+   * @param src the path to the target file
+   * @param replication the requested replication factor
+   * @param clientName the name of the client node making the request
+   * @throws java.io.IOException thrown if the requested replication factor
+   * is out of bounds
    */
    public void verifyReplication(String src,
                           short replication,
                           String clientName) throws IOException {
-
-    if (replication >= minReplication && replication <= maxReplication) {
-      //common case. avoid building 'text'
-      return;
+    String err = null;
+    if (replication > maxReplication) {
+      err = " exceeds maximum of " + maxReplication;
+    } else if (replication < minReplication) {
+      err = " is less than the required minimum of " + minReplication;
     }
-    
-    String text = "file " + src 
-      + ((clientName != null) ? " on client " + clientName : "")
-      + ".\n"
-      + "Requested replication " + replication;
 
-    if (replication > maxReplication)
-      throw new IOException(text + " exceeds maximum " + maxReplication);
-
-    if (replication < minReplication)
-      throw new IOException(text + " is less than the required minimum " +
-                            minReplication);
+    if (err != null) {
+      throw new IOException("Requested replication factor of " + replication
+          + err + " for " + src
+          + (clientName == null? "": ", clientName=" + clientName));
+    }
   }
 
   /**
@@ -1037,19 +1183,18 @@ public class BlockManager implements BlockStatsMXBean {
     if(numBlocks == 0) {
       return new BlocksWithLocations(new BlockWithLocations[0]);
     }
-    Iterator<BlockInfo> iter = node.getBlockIterator();
     // starting from a random block
     int startBlock = ThreadLocalRandom.current().nextInt(numBlocks);
-    // skip blocks
-    for(int i=0; i<startBlock; i++) {
-      iter.next();
-    }
+    Iterator<BlockInfo> iter = node.getBlockIterator(startBlock);
     List<BlockWithLocations> results = new ArrayList<BlockWithLocations>();
     long totalSize = 0;
     BlockInfo curBlock;
     while(totalSize<size && iter.hasNext()) {
       curBlock = iter.next();
       if(!curBlock.isComplete())  continue;
+      if (curBlock.getNumBytes() < getBlocksMinBlockSize) {
+        continue;
+      }
       totalSize += addBlock(curBlock, results);
     }
     if(totalSize<size) {
@@ -1057,6 +1202,9 @@ public class BlockManager implements BlockStatsMXBean {
       for(int i=0; i<startBlock&&totalSize<size; i++) {
         curBlock = iter.next();
         if(!curBlock.isComplete())  continue;
+        if (curBlock.getNumBytes() < getBlocksMinBlockSize) {
+          continue;
+        }
         totalSize += addBlock(curBlock, results);
       }
     }
@@ -1090,6 +1238,8 @@ public class BlockManager implements BlockStatsMXBean {
       invalidateBlocks.remove(node, block);
     }
     namesystem.checkSafeMode();
+    LOG.info("Removed blocks associated with storage {} from DataNode {}",
+        storageInfo, node);
   }
 
   /**
@@ -1097,7 +1247,7 @@ public class BlockManager implements BlockStatsMXBean {
    * datanode and log the operation
    */
   void addToInvalidates(final Block block, final DatanodeInfo datanode) {
-    if (!namesystem.isPopulatingReplQueues()) {
+    if (!isPopulatingReplQueues()) {
       return;
     }
     invalidateBlocks.add(block, datanode, true);
@@ -1108,18 +1258,20 @@ public class BlockManager implements BlockStatsMXBean {
    * datanodes.
    */
   private void addToInvalidates(Block b) {
-    if (!namesystem.isPopulatingReplQueues()) {
+    if (!isPopulatingReplQueues()) {
       return;
     }
     StringBuilder datanodes = new StringBuilder();
-    for(DatanodeStorageInfo storage : blocksMap.getStorages(b, State.NORMAL)) {
+    for (DatanodeStorageInfo storage : blocksMap.getStorages(b)) {
+      if (storage.getState() != State.NORMAL) {
+        continue;
+      }
       final DatanodeDescriptor node = storage.getDatanodeDescriptor();
       invalidateBlocks.add(b, node, false);
       datanodes.append(node).append(" ");
     }
     if (datanodes.length() != 0) {
-      blockLog.debug("BLOCK* addToInvalidates: {} {}", b,
-          datanodes.toString());
+      blockLog.debug("BLOCK* addToInvalidates: {} {}", b, datanodes);
     }
   }
 
@@ -1129,7 +1281,7 @@ public class BlockManager implements BlockStatsMXBean {
    * is wiped.
    */
   void removeFromInvalidates(final DatanodeInfo datanode) {
-    if (!namesystem.isPopulatingReplQueues()) {
+    if (!isPopulatingReplQueues()) {
       return;
     }
     invalidateBlocks.remove(datanode);
@@ -1162,11 +1314,23 @@ public class BlockManager implements BlockStatsMXBean {
           + " as corrupt because datanode " + dn + " (" + dn.getDatanodeUuid()
           + ") does not exist");
     }
-    
+
+    DatanodeStorageInfo storage = null;
+    if (storageID != null) {
+      storage = node.getStorageInfo(storageID);
+    }
+    if (storage == null) {
+      storage = storedBlock.findStorageInfo(node);
+    }
+
+    if (storage == null) {
+      blockLog.debug("BLOCK* findAndMarkBlockAsCorrupt: {} not found on {}",
+          blk, dn);
+      return;
+    }
     markBlockAsCorrupt(new BlockToMarkCorrupt(storedBlock,
             blk.getGenerationStamp(), reason, Reason.CORRUPTION_REPORTED),
-        storageID == null ? null : node.getStorageInfo(storageID),
-        node);
+        storage, node);
   }
 
   /**
@@ -1179,25 +1343,24 @@ public class BlockManager implements BlockStatsMXBean {
       DatanodeStorageInfo storageInfo,
       DatanodeDescriptor node) throws IOException {
 
-    if (b.corrupted.isDeleted()) {
+    if (b.getCorrupted().isDeleted()) {
       blockLog.debug("BLOCK markBlockAsCorrupt: {} cannot be marked as" +
           " corrupt as it does not belong to any file", b);
-      addToInvalidates(b.corrupted, node);
+      addToInvalidates(b.getCorrupted(), node);
       return;
     } 
-    short expectedReplicas =
-        b.corrupted.getBlockCollection().getPreferredBlockReplication();
+    short expectedReplicas = b.getCorrupted().getReplication();
 
     // Add replica to the data-node if it is not already there
     if (storageInfo != null) {
-      storageInfo.addBlock(b.stored);
+      storageInfo.addBlock(b.getStored());
     }
 
     // Add this replica to corruptReplicas Map
-    corruptReplicas.addToCorruptReplicasMap(b.corrupted, node, b.reason,
-        b.reasonCode);
+    corruptReplicas.addToCorruptReplicasMap(b.getCorrupted(), node,
+        b.getReason(), b.getReasonCode());
 
-    NumberReplicas numberOfReplicas = countNodes(b.stored);
+    NumberReplicas numberOfReplicas = countNodes(b.getStored());
     boolean hasEnoughLiveReplicas = numberOfReplicas.liveReplicas() >=
         expectedReplicas;
     boolean minReplicationSatisfied =
@@ -1206,7 +1369,7 @@ public class BlockManager implements BlockStatsMXBean {
         (numberOfReplicas.liveReplicas() + numberOfReplicas.corruptReplicas()) >
         expectedReplicas;
     boolean corruptedDuringWrite = minReplicationSatisfied &&
-        (b.stored.getGenerationStamp() > b.corrupted.getGenerationStamp());
+        b.isCorruptedDuringWrite();
     // case 1: have enough number of live replicas
     // case 2: corrupted replicas + live replicas > Replication factor
     // case 3: Block is marked corrupt due to failure while writing. In this
@@ -1217,9 +1380,9 @@ public class BlockManager implements BlockStatsMXBean {
         || corruptedDuringWrite) {
       // the block is over-replicated so invalidate the replicas immediately
       invalidateBlock(b, node);
-    } else if (namesystem.isPopulatingReplQueues()) {
+    } else if (isPopulatingReplQueues()) {
       // add the block to neededReplication
-      updateNeededReplications(b.stored, -1, 0);
+      updateNeededReplications(b.getStored(), -1, 0);
     }
   }
 
@@ -1238,18 +1401,18 @@ public class BlockManager implements BlockStatsMXBean {
     }
 
     // Check how many copies we have of the block
-    NumberReplicas nr = countNodes(b.stored);
+    NumberReplicas nr = countNodes(b.getStored());
     if (nr.replicasOnStaleNodes() > 0) {
       blockLog.debug("BLOCK* invalidateBlocks: postponing " +
           "invalidation of {} on {} because {} replica(s) are located on " +
           "nodes with potentially out-of-date block reports", b, dn,
           nr.replicasOnStaleNodes());
-      postponeBlock(b.corrupted);
+      postponeBlock(b.getCorrupted());
       return false;
     } else if (nr.liveReplicas() >= 1) {
       // If we have at least one copy on a live node, then we can delete it.
-      addToInvalidates(b.corrupted, dn);
-      removeStoredBlock(b.stored, node);
+      addToInvalidates(b.getCorrupted(), dn);
+      removeStoredBlock(b.getStored(), node);
       blockLog.debug("BLOCK* invalidateBlocks: {} on {} listed for deletion.",
           b, dn);
       return true;
@@ -1267,9 +1430,7 @@ public class BlockManager implements BlockStatsMXBean {
 
 
   private void postponeBlock(Block blk) {
-    if (postponedMisreplicatedBlocks.add(blk)) {
-      postponedMisreplicatedBlocksCount.incrementAndGet();
-    }
+    postponedMisreplicatedBlocks.add(blk);
   }
   
   
@@ -1337,69 +1498,18 @@ public class BlockManager implements BlockStatsMXBean {
    */
   @VisibleForTesting
   int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
-    int requiredReplication, numEffectiveReplicas;
-    List<DatanodeDescriptor> containingNodes;
-    DatanodeDescriptor srcNode;
-    BlockCollection bc = null;
-    int additionalReplRequired;
-
     int scheduledWork = 0;
-    List<ReplicationWork> work = new LinkedList<ReplicationWork>();
+    final List<ReplicationWork> work = new LinkedList<>();
 
     namesystem.writeLock();
     try {
       synchronized (neededReplications) {
         for (int priority = 0; priority < blocksToReplicate.size(); priority++) {
           for (BlockInfo block : blocksToReplicate.get(priority)) {
-            // block should belong to a file
-            bc = blocksMap.getBlockCollection(block);
-            // abandoned block or block reopened for append
-            if(bc == null || (bc.isUnderConstruction() && block.equals(bc.getLastBlock()))) {
-              neededReplications.remove(block, priority); // remove from neededReplications
-              continue;
+            ReplicationWork rw = scheduleReplication(block, priority);
+            if (rw != null) {
+              work.add(rw);
             }
-
-            requiredReplication = bc.getPreferredBlockReplication();
-
-            // get a source data-node
-            containingNodes = new ArrayList<DatanodeDescriptor>();
-            List<DatanodeStorageInfo> liveReplicaNodes = new ArrayList<DatanodeStorageInfo>();
-            NumberReplicas numReplicas = new NumberReplicas();
-            srcNode = chooseSourceDatanode(
-                block, containingNodes, liveReplicaNodes, numReplicas,
-                priority);
-            if(srcNode == null) { // block can not be replicated from any node
-              LOG.debug("Block " + block + " cannot be repl from any node");
-              continue;
-            }
-
-            // liveReplicaNodes can include READ_ONLY_SHARED replicas which are 
-            // not included in the numReplicas.liveReplicas() count
-            assert liveReplicaNodes.size() >= numReplicas.liveReplicas();
-
-            // do not schedule more if enough replicas is already pending
-            numEffectiveReplicas = numReplicas.liveReplicas() +
-                                    pendingReplications.getNumReplicas(block);
-      
-            if (numEffectiveReplicas >= requiredReplication) {
-              if ( (pendingReplications.getNumReplicas(block) > 0) ||
-                   (blockHasEnoughRacks(block)) ) {
-                neededReplications.remove(block, priority); // remove from neededReplications
-                blockLog.debug("BLOCK* Removing {} from neededReplications as" +
-                        " it has enough replicas", block);
-                continue;
-              }
-            }
-
-            if (numReplicas.liveReplicas() < requiredReplication) {
-              additionalReplRequired = requiredReplication
-                  - numEffectiveReplicas;
-            } else {
-              additionalReplRequired = 1; // Needed on a new rack
-            }
-            work.add(new ReplicationWork(block, bc, srcNode,
-                containingNodes, liveReplicaNodes, additionalReplRequired,
-                priority));
           }
         }
       }
@@ -1407,85 +1517,31 @@ public class BlockManager implements BlockStatsMXBean {
       namesystem.writeUnlock();
     }
 
-    final Set<Node> excludedNodes = new HashSet<Node>();
+    final Set<Node> excludedNodes = new HashSet<>();
     for(ReplicationWork rw : work){
       // Exclude all of the containing nodes from being targets.
       // This list includes decommissioning or corrupt nodes.
       excludedNodes.clear();
-      for (DatanodeDescriptor dn : rw.containingNodes) {
+      for (DatanodeDescriptor dn : rw.getContainingNodes()) {
         excludedNodes.add(dn);
       }
 
       // choose replication targets: NOT HOLDING THE GLOBAL LOCK
-      // It is costly to extract the filename for which chooseTargets is called,
-      // so for now we pass in the block collection itself.
       rw.chooseTargets(blockplacement, storagePolicySuite, excludedNodes);
     }
 
     namesystem.writeLock();
     try {
       for(ReplicationWork rw : work){
-        final DatanodeStorageInfo[] targets = rw.targets;
+        final DatanodeStorageInfo[] targets = rw.getTargets();
         if(targets == null || targets.length == 0){
-          rw.targets = null;
+          rw.resetTargets();
           continue;
         }
 
         synchronized (neededReplications) {
-          BlockInfo block = rw.block;
-          int priority = rw.priority;
-          // Recheck since global lock was released
-          // block should belong to a file
-          bc = blocksMap.getBlockCollection(block);
-          // abandoned block or block reopened for append
-          if(bc == null || (bc.isUnderConstruction() && block.equals(bc.getLastBlock()))) {
-            neededReplications.remove(block, priority); // remove from neededReplications
-            rw.targets = null;
-            continue;
-          }
-          requiredReplication = bc.getPreferredBlockReplication();
-
-          // do not schedule more if enough replicas is already pending
-          NumberReplicas numReplicas = countNodes(block);
-          numEffectiveReplicas = numReplicas.liveReplicas() +
-            pendingReplications.getNumReplicas(block);
-
-          if (numEffectiveReplicas >= requiredReplication) {
-            if ( (pendingReplications.getNumReplicas(block) > 0) ||
-                 (blockHasEnoughRacks(block)) ) {
-              neededReplications.remove(block, priority); // remove from neededReplications
-              rw.targets = null;
-              blockLog.debug("BLOCK* Removing {} from neededReplications as" +
-                      " it has enough replicas", block);
-              continue;
-            }
-          }
-
-          if ( (numReplicas.liveReplicas() >= requiredReplication) &&
-               (!blockHasEnoughRacks(block)) ) {
-            if (rw.srcNode.getNetworkLocation().equals(
-                targets[0].getDatanodeDescriptor().getNetworkLocation())) {
-              //No use continuing, unless a new rack in this case
-              continue;
-            }
-          }
-
-          // Add block to the to be replicated list
-          rw.srcNode.addBlockToBeReplicated(block, targets);
-          scheduledWork++;
-          DatanodeStorageInfo.incrementBlocksScheduled(targets);
-
-          // Move the block-replication into a "pending" state.
-          // The reason we use 'pending' is so we can retry
-          // replications that fail after an appropriate amount of time.
-          pendingReplications.increment(block,
-              DatanodeStorageInfo.toDatanodeDescriptors(targets));
-          blockLog.debug("BLOCK* block {} is moved from neededReplications to "
-                  + "pendingReplications", block);
-
-          // remove from neededReplications
-          if(numEffectiveReplicas + targets.length >= requiredReplication) {
-            neededReplications.remove(block, priority); // remove from neededReplications
+          if (validateReplicationWork(rw)) {
+            scheduledWork++;
           }
         }
       }
@@ -1496,15 +1552,15 @@ public class BlockManager implements BlockStatsMXBean {
     if (blockLog.isInfoEnabled()) {
       // log which blocks have been scheduled for replication
       for(ReplicationWork rw : work){
-        DatanodeStorageInfo[] targets = rw.targets;
+        DatanodeStorageInfo[] targets = rw.getTargets();
         if (targets != null && targets.length != 0) {
           StringBuilder targetList = new StringBuilder("datanode(s)");
-          for (int k = 0; k < targets.length; k++) {
+          for (DatanodeStorageInfo target : targets) {
             targetList.append(' ');
-            targetList.append(targets[k].getDatanodeDescriptor());
+            targetList.append(target.getDatanodeDescriptor());
           }
-          blockLog.debug("BLOCK* ask {} to replicate {} to {}", rw.srcNode,
-              rw.block, targetList);
+          blockLog.debug("BLOCK* ask {} to replicate {} to {}", rw.getSrcNode(),
+              rw.getBlock(), targetList);
         }
       }
     }
@@ -1516,12 +1572,119 @@ public class BlockManager implements BlockStatsMXBean {
     return scheduledWork;
   }
 
+  boolean hasEnoughEffectiveReplicas(BlockInfo block,
+      NumberReplicas numReplicas, int pendingReplicaNum, int required) {
+    int numEffectiveReplicas = numReplicas.liveReplicas() + pendingReplicaNum;
+    return (numEffectiveReplicas >= required) &&
+        (pendingReplicaNum > 0 || isPlacementPolicySatisfied(block));
+  }
+
+  private ReplicationWork scheduleReplication(BlockInfo block, int priority) {
+    // skip abandoned block or block reopened for append
+    if (block.isDeleted() || !block.isCompleteOrCommitted()) {
+      // remove from neededReplications
+      neededReplications.remove(block, priority);
+      return null;
+    }
+
+    short requiredReplication = getExpectedReplicaNum(block);
+
+    // get a source data-node
+    List<DatanodeDescriptor> containingNodes = new ArrayList<>();
+    List<DatanodeStorageInfo> liveReplicaNodes = new ArrayList<>();
+    NumberReplicas numReplicas = new NumberReplicas();
+    DatanodeDescriptor srcNode = chooseSourceDatanode(block, containingNodes,
+        liveReplicaNodes, numReplicas, priority);
+    if (srcNode == null) { // block can not be replicated from any node
+      LOG.debug("Block " + block + " cannot be repl from any node");
+      return null;
+    }
+
+    // liveReplicaNodes can include READ_ONLY_SHARED replicas which are
+    // not included in the numReplicas.liveReplicas() count
+    assert liveReplicaNodes.size() >= numReplicas.liveReplicas();
+
+    int pendingNum = pendingReplications.getNumReplicas(block);
+    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum,
+        requiredReplication)) {
+      neededReplications.remove(block, priority);
+      blockLog.debug("BLOCK* Removing {} from neededReplications as" +
+          " it has enough replicas", block);
+      return null;
+    }
+
+    final int additionalReplRequired;
+    if (numReplicas.liveReplicas() < requiredReplication) {
+      additionalReplRequired = requiredReplication - numReplicas.liveReplicas()
+          - pendingNum;
+    } else {
+      additionalReplRequired = 1; // Needed on a new rack
+    }
+    final BlockCollection bc = getBlockCollection(block);
+    return new ReplicationWork(block, bc, srcNode, containingNodes,
+        liveReplicaNodes, additionalReplRequired, priority);
+  }
+
+  private boolean validateReplicationWork(ReplicationWork rw) {
+    BlockInfo block = rw.getBlock();
+    int priority = rw.getPriority();
+    // Recheck since global lock was released
+    // skip abandoned block or block reopened for append
+    if (block.isDeleted() || !block.isCompleteOrCommitted()) {
+      neededReplications.remove(block, priority);
+      rw.resetTargets();
+      return false;
+    }
+
+    // do not schedule more if enough replicas is already pending
+    final short requiredReplication = getExpectedReplicaNum(block);
+    NumberReplicas numReplicas = countNodes(block);
+    final int pendingNum = pendingReplications.getNumReplicas(block);
+    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum,
+        requiredReplication)) {
+      neededReplications.remove(block, priority);
+      rw.resetTargets();
+      blockLog.debug("BLOCK* Removing {} from neededReplications as" +
+          " it has enough replicas", block);
+      return false;
+    }
+
+    DatanodeStorageInfo[] targets = rw.getTargets();
+    if ( (numReplicas.liveReplicas() >= requiredReplication) &&
+        (!isPlacementPolicySatisfied(block)) ) {
+      if (rw.getSrcNode().getNetworkLocation().equals(
+          targets[0].getDatanodeDescriptor().getNetworkLocation())) {
+        //No use continuing, unless a new rack in this case
+        return false;
+      }
+    }
+
+    // Add block to the to be replicated list
+    rw.getSrcNode().addBlockToBeReplicated(block, targets);
+    DatanodeStorageInfo.incrementBlocksScheduled(targets);
+
+    // Move the block-replication into a "pending" state.
+    // The reason we use 'pending' is so we can retry
+    // replications that fail after an appropriate amount of time.
+    pendingReplications.increment(block,
+        DatanodeStorageInfo.toDatanodeDescriptors(targets));
+    blockLog.debug("BLOCK* block {} is moved from neededReplications to "
+        + "pendingReplications", block);
+
+    int numEffectiveReplicas = numReplicas.liveReplicas() + pendingNum;
+    // remove from neededReplications
+    if(numEffectiveReplicas + targets.length >= requiredReplication) {
+      neededReplications.remove(block, priority);
+    }
+    return true;
+  }
+
   /** Choose target for WebHDFS redirection. */
   public DatanodeStorageInfo[] chooseTarget4WebHDFS(String src,
       DatanodeDescriptor clientnode, Set<Node> excludes, long blocksize) {
     return blockplacement.chooseTarget(src, 1, clientnode,
         Collections.<DatanodeStorageInfo>emptyList(), false, excludes,
-        blocksize, storagePolicySuite.getDefaultPolicy());
+        blocksize, storagePolicySuite.getDefaultPolicy(), null);
   }
 
   /** Choose target for getting additional datanodes for an existing pipeline. */
@@ -1535,7 +1698,7 @@ public class BlockManager implements BlockStatsMXBean {
     
     final BlockStoragePolicy storagePolicy = storagePolicySuite.getPolicy(storagePolicyID);
     return blockplacement.chooseTarget(src, numAdditionalNodes, clientnode,
-        chosen, true, excludes, blocksize, storagePolicy);
+        chosen, true, excludes, blocksize, storagePolicy, null);
   }
 
   /**
@@ -1551,13 +1714,14 @@ public class BlockManager implements BlockStatsMXBean {
       final Set<Node> excludedNodes,
       final long blocksize,
       final List<String> favoredNodes,
-      final byte storagePolicyID) throws IOException {
-    List<DatanodeDescriptor> favoredDatanodeDescriptors = 
+      final byte storagePolicyID,
+      final EnumSet<AddBlockFlag> flags) throws IOException {
+    List<DatanodeDescriptor> favoredDatanodeDescriptors =
         getDatanodeDescriptors(favoredNodes);
     final BlockStoragePolicy storagePolicy = storagePolicySuite.getPolicy(storagePolicyID);
     final DatanodeStorageInfo[] targets = blockplacement.chooseTarget(src,
         numOfReplicas, client, excludedNodes, blocksize, 
-        favoredDatanodeDescriptors, storagePolicy);
+        favoredDatanodeDescriptors, storagePolicy, flags);
     if (targets.length < minReplication) {
       throw new IOException("File " + src + " could only be replicated to "
           + targets.length + " nodes instead of minReplication (="
@@ -1594,7 +1758,8 @@ public class BlockManager implements BlockStatsMXBean {
    *
    * We prefer nodes that are in DECOMMISSION_INPROGRESS state to other nodes
    * since the former do not have write traffic and hence are less busy.
-   * We do not use already decommissioned nodes as a source.
+   * We do not use already decommissioned nodes as a source, unless there no
+   * other choice.
    * Otherwise we choose a random node among those that did not reach their
    * replication limits.  However, if the replication is of the highest priority
    * and all nodes have reached their replication limits, we will choose a
@@ -1626,7 +1791,9 @@ public class BlockManager implements BlockStatsMXBean {
     containingNodes.clear();
     nodesContainingLiveReplicas.clear();
     DatanodeDescriptor srcNode = null;
+    DatanodeDescriptor decommissionedSrc = null;
     int live = 0;
+    int readonly = 0;
     int decommissioned = 0;
     int decommissioning = 0;
     int corrupt = 0;
@@ -1635,7 +1802,7 @@ public class BlockManager implements BlockStatsMXBean {
     Collection<DatanodeDescriptor> nodesCorrupt = corruptReplicas.getNodes(block);
     for(DatanodeStorageInfo storage : blocksMap.getStorages(block)) {
       final DatanodeDescriptor node = storage.getDatanodeDescriptor();
-      LightWeightLinkedSet<Block> excessBlocks =
+      LightWeightHashSet<Block> excessBlocks =
         excessReplicateMap.get(node.getDatanodeUuid());
       int countableReplica = storage.getState() == State.NORMAL ? 1 : 0; 
       if ((nodesCorrupt != null) && (nodesCorrupt.contains(node)))
@@ -1649,6 +1816,9 @@ public class BlockManager implements BlockStatsMXBean {
       } else {
         nodesContainingLiveReplicas.add(storage);
         live += countableReplica;
+      }
+      if (storage.getState() == State.READ_ONLY_SHARED) {
+        readonly++;
       }
       containingNodes.add(node);
       // Check if this replica is corrupt
@@ -1668,9 +1838,16 @@ public class BlockManager implements BlockStatsMXBean {
       // the block must not be scheduled for removal on srcNode
       if(excessBlocks != null && excessBlocks.contains(block))
         continue;
-      // never use already decommissioned nodes
-      if(node.isDecommissioned())
+      // Save the live decommissioned replica in case we need it. Such replicas
+      // are normally not used for replication, but if nothing else is
+      // available, one can be selected as a source.
+      if (node.isDecommissioned()) {
+        if (decommissionedSrc == null ||
+            ThreadLocalRandom.current().nextBoolean()) {
+          decommissionedSrc = node;
+        }
         continue;
+      }
 
       // We got this far, current node is a reasonable choice
       if (srcNode == null) {
@@ -1684,8 +1861,12 @@ public class BlockManager implements BlockStatsMXBean {
         srcNode = node;
     }
     if(numReplicas != null)
-      numReplicas.initialize(live, decommissioned, decommissioning, corrupt,
+      numReplicas.set(live, readonly, decommissioned, decommissioning, corrupt,
           excess, 0);
+    // Pick a live decommissioned replica, if nothing else is available.
+    if (live == 0 && srcNode == null && decommissionedSrc != null) {
+      return decommissionedSrc;
+    }
     return srcNode;
   }
 
@@ -1708,8 +1889,8 @@ public class BlockManager implements BlockStatsMXBean {
             continue;
           }
           NumberReplicas num = countNodes(timedOutItems[i]);
-          if (isNeededReplication(bi, getReplication(bi), num.liveReplicas())) {
-            neededReplications.add(bi, num.liveReplicas(),
+          if (isNeededReplication(bi, num.liveReplicas())) {
+            neededReplications.add(bi, num.liveReplicas(), num.readOnlyReplicas(),
                 num.decommissionedAndDecommissioning(), getReplication(bi));
           }
         }
@@ -1750,61 +1931,16 @@ public class BlockManager implements BlockStatsMXBean {
    * reported by the datanode in the block report. 
    */
   static class StatefulBlockInfo {
-    final BlockInfoContiguousUnderConstruction storedBlock;
+    final BlockInfo storedBlock;
     final Block reportedBlock;
     final ReplicaState reportedState;
     
-    StatefulBlockInfo(BlockInfoContiguousUnderConstruction storedBlock,
+    StatefulBlockInfo(BlockInfo storedBlock,
         Block reportedBlock, ReplicaState reportedState) {
+      Preconditions.checkArgument(!storedBlock.isComplete());
       this.storedBlock = storedBlock;
       this.reportedBlock = reportedBlock;
       this.reportedState = reportedState;
-    }
-  }
-  
-  /**
-   * BlockToMarkCorrupt is used to build the "toCorrupt" list, which is a
-   * list of blocks that should be considered corrupt due to a block report.
-   */
-  private static class BlockToMarkCorrupt {
-    /** The corrupted block in a datanode. */
-    final BlockInfo corrupted;
-    /** The corresponding block stored in the BlockManager. */
-    final BlockInfo stored;
-    /** The reason to mark corrupt. */
-    final String reason;
-    /** The reason code to be stored */
-    final Reason reasonCode;
-
-    BlockToMarkCorrupt(BlockInfo corrupted,
-        BlockInfo stored, String reason,
-        Reason reasonCode) {
-      Preconditions.checkNotNull(corrupted, "corrupted is null");
-      Preconditions.checkNotNull(stored, "stored is null");
-
-      this.corrupted = corrupted;
-      this.stored = stored;
-      this.reason = reason;
-      this.reasonCode = reasonCode;
-    }
-
-    BlockToMarkCorrupt(BlockInfo stored, String reason,
-        Reason reasonCode) {
-      this(stored, stored, reason, reasonCode);
-    }
-
-    BlockToMarkCorrupt(BlockInfo stored, long gs, String reason,
-        Reason reasonCode) {
-      this(new BlockInfoContiguous((BlockInfoContiguous)stored), stored,
-          reason, reasonCode);
-      //the corrupted block in datanode has a different generation stamp
-      corrupted.setGenerationStamp(gs);
-    }
-
-    @Override
-    public String toString() {
-      return corrupted + "("
-          + (corrupted == stored? "same as stored": "stored=" + stored) + ")";
     }
   }
 
@@ -1817,17 +1953,19 @@ public class BlockManager implements BlockStatsMXBean {
    */
   public boolean processReport(final DatanodeID nodeID,
       final DatanodeStorage storage,
-      final BlockListAsLongs newReport, BlockReportContext context,
-      boolean lastStorageInRpc) throws IOException {
+      final BlockListAsLongs newReport,
+      BlockReportContext context) throws IOException {
     namesystem.writeLock();
     final long startTime = Time.monotonicNow(); //after acquiring write lock
     final long endTime;
     DatanodeDescriptor node;
-    Collection<Block> invalidatedBlocks = null;
+    Collection<Block> invalidatedBlocks = Collections.emptyList();
+    String strBlockReportId =
+        context != null ? Long.toHexString(context.getReportId()) : "";
 
     try {
       node = datanodeManager.getDatanode(nodeID);
-      if (node == null || !node.isAlive) {
+      if (node == null || !node.isRegistered()) {
         throw new IOException(
             "ProcessReport from dead or unregistered node: " + nodeID);
       }
@@ -1842,9 +1980,11 @@ public class BlockManager implements BlockStatsMXBean {
       }
       if (namesystem.isInStartupSafeMode()
           && storageInfo.getBlockReportCount() > 0) {
-        blockLog.info("BLOCK* processReport: "
+        blockLog.info("BLOCK* processReport 0x{}: "
             + "discarded non-initial block report from {}"
-            + " because namenode still in startup phase", nodeID);
+            + " because namenode still in startup phase",
+            strBlockReportId, nodeID);
+        blockReportLeaseManager.removeLease(node);
         return !node.hasStaleStorages();
       }
       if (context != null) {
@@ -1857,51 +1997,25 @@ public class BlockManager implements BlockStatsMXBean {
       if (storageInfo.getBlockReportCount() == 0) {
         // The first block report can be processed a lot more efficiently than
         // ordinary block reports.  This shortens restart times.
-        LOG.info("Processing first storage report for " +
-            storageInfo.getStorageID() + " from datanode " +
+        blockLog.info("BLOCK* processReport 0x{}: Processing first "
+                + "storage report for {} from datanode {}",
+            strBlockReportId,
+            storageInfo.getStorageID(),
             nodeID.getDatanodeUuid());
         processFirstBlockReport(storageInfo, newReport);
       } else {
-        invalidatedBlocks = processReport(storageInfo, newReport);
+        invalidatedBlocks = processReport(storageInfo, newReport, context);
       }
       
       storageInfo.receivedBlockReport();
-      if (context != null) {
-        storageInfo.setLastBlockReportId(context.getReportId());
-        if (lastStorageInRpc) {
-          int rpcsSeen = node.updateBlockReportContext(context);
-          if (rpcsSeen >= context.getTotalRpcs()) {
-            long leaseId = blockReportLeaseManager.removeLease(node);
-            BlockManagerFaultInjector.getInstance().
-                removeBlockReportLease(node, leaseId);
-            List<DatanodeStorageInfo> zombies = node.removeZombieStorages();
-            if (zombies.isEmpty()) {
-              LOG.debug("processReport 0x{}: no zombie storages found.",
-                  Long.toHexString(context.getReportId()));
-            } else {
-              for (DatanodeStorageInfo zombie : zombies) {
-                removeZombieReplicas(context, zombie);
-              }
-            }
-            node.clearBlockReportContext();
-          } else {
-            LOG.debug("processReport 0x{}: {} more RPCs remaining in this " +
-                    "report.", Long.toHexString(context.getReportId()),
-                (context.getTotalRpcs() - rpcsSeen)
-            );
-          }
-        }
-      }
     } finally {
       endTime = Time.monotonicNow();
       namesystem.writeUnlock();
     }
 
-    if (invalidatedBlocks != null) {
-      for (Block b : invalidatedBlocks) {
-        blockLog.info("BLOCK* processReport: {} on node {} size {} does not " +
-            "belong to any file", b, node, b.getNumBytes());
-      }
+    for (Block b : invalidatedBlocks) {
+      blockLog.debug("BLOCK* processReport 0x{}: {} on node {} size {} does not"
+          + " belong to any file", strBlockReportId, b, node, b.getNumBytes());
     }
 
     // Log the block report processing stats from Namenode perspective
@@ -1909,37 +2023,34 @@ public class BlockManager implements BlockStatsMXBean {
     if (metrics != null) {
       metrics.addBlockReport((int) (endTime - startTime));
     }
-    blockLog.info("BLOCK* processReport: from storage {} node {}, " +
-        "blocks: {}, hasStaleStorage: {}, processing time: {} msecs", storage
-        .getStorageID(), nodeID, newReport.getNumberOfBlocks(),
-        node.hasStaleStorages(), (endTime - startTime));
+    blockLog.info("BLOCK* processReport 0x{}: from storage {} node {}, " +
+        "blocks: {}, hasStaleStorage: {}, processing time: {} msecs, " +
+        "invalidatedBlocks: {}", strBlockReportId, storage.getStorageID(),
+        nodeID, newReport.getNumberOfBlocks(),
+        node.hasStaleStorages(), (endTime - startTime),
+        invalidatedBlocks.size());
     return !node.hasStaleStorages();
   }
 
-  private void removeZombieReplicas(BlockReportContext context,
-      DatanodeStorageInfo zombie) {
-    LOG.warn("processReport 0x{}: removing zombie storage {}, which no " +
-             "longer exists on the DataNode.",
-              Long.toHexString(context.getReportId()), zombie.getStorageID());
-    assert(namesystem.hasWriteLock());
-    Iterator<BlockInfo> iter = zombie.getBlockIterator();
-    int prevBlocks = zombie.numBlocks();
-    while (iter.hasNext()) {
-      BlockInfo block = iter.next();
-      // We assume that a block can be on only one storage in a DataNode.
-      // That's why we pass in the DatanodeDescriptor rather than the
-      // DatanodeStorageInfo.
-      // TODO: remove this assumption in case we want to put a block on
-      // more than one storage on a datanode (and because it's a difficult
-      // assumption to really enforce)
-      removeStoredBlock(block, zombie.getDatanodeDescriptor());
-      invalidateBlocks.remove(zombie.getDatanodeDescriptor(), block);
+  public void removeBRLeaseIfNeeded(final DatanodeID nodeID,
+      final BlockReportContext context) throws IOException {
+    namesystem.writeLock();
+    DatanodeDescriptor node;
+    try {
+      node = datanodeManager.getDatanode(nodeID);
+      if (context != null) {
+        if (context.getTotalRpcs() == context.getCurRpc() + 1) {
+          long leaseId = this.getBlockReportLeaseManager().removeLease(node);
+          BlockManagerFaultInjector.getInstance().
+              removeBlockReportLease(node, leaseId);
+        }
+        LOG.debug("Processing RPC with index {} out of total {} RPCs in "
+                + "processReport 0x{}", context.getCurRpc(),
+            context.getTotalRpcs(), Long.toHexString(context.getReportId()));
+      }
+    } finally {
+      namesystem.writeUnlock();
     }
-    assert(zombie.numBlocks() == 0);
-    LOG.warn("processReport 0x{}: removed {} replicas from storage {}, " +
-            "which no longer exists on the DataNode.",
-            Long.toHexString(context.getReportId()), prevBlocks,
-            zombie.getStorageID());
   }
 
   /**
@@ -1949,39 +2060,14 @@ public class BlockManager implements BlockStatsMXBean {
     if (getPostponedMisreplicatedBlocksCount() == 0) {
       return;
     }
-    long startTimeRescanPostponedMisReplicatedBlocks = Time.monotonicNow();
-    long startPostponedMisReplicatedBlocksCount =
-        getPostponedMisreplicatedBlocksCount();
     namesystem.writeLock();
+    long startTime = Time.monotonicNow();
+    long startSize = postponedMisreplicatedBlocks.size();
     try {
-      // blocksPerRescan is the configured number of blocks per rescan.
-      // Randomly select blocksPerRescan consecutive blocks from the HashSet
-      // when the number of blocks remaining is larger than blocksPerRescan.
-      // The reason we don't always pick the first blocksPerRescan blocks is to
-      // handle the case if for some reason some datanodes remain in
-      // content stale state for a long time and only impact the first
-      // blocksPerRescan blocks.
-      int i = 0;
-      long startIndex = 0;
-      long blocksPerRescan =
-          datanodeManager.getBlocksPerPostponedMisreplicatedBlocksRescan();
-      long base = getPostponedMisreplicatedBlocksCount() - blocksPerRescan;
-      if (base > 0) {
-        startIndex = ThreadLocalRandom.current().nextLong() % (base+1);
-        if (startIndex < 0) {
-          startIndex += (base+1);
-        }
-      }
       Iterator<Block> it = postponedMisreplicatedBlocks.iterator();
-      for (int tmp = 0; tmp < startIndex; tmp++) {
-        it.next();
-      }
-
-      for (;it.hasNext(); i++) {
+      for (int i=0; i < blocksPerPostpondedRescan && it.hasNext(); i++) {
         Block b = it.next();
-        if (i >= blocksPerRescan) {
-          break;
-        }
+        it.remove();
 
         BlockInfo bi = blocksMap.getStoredBlock(b);
         if (bi == null) {
@@ -1990,8 +2076,6 @@ public class BlockManager implements BlockStatsMXBean {
                 "Postponed mis-replicated block " + b + " no longer found " +
                 "in block map.");
           }
-          it.remove();
-          postponedMisreplicatedBlocksCount.decrementAndGet();
           continue;
         }
         MisReplicationResult res = processMisReplicatedBlock(bi);
@@ -1999,26 +2083,26 @@ public class BlockManager implements BlockStatsMXBean {
           LOG.debug("BLOCK* rescanPostponedMisreplicatedBlocks: " +
               "Re-scanned block " + b + ", result is " + res);
         }
-        if (res != MisReplicationResult.POSTPONE) {
-          it.remove();
-          postponedMisreplicatedBlocksCount.decrementAndGet();
+        if (res == MisReplicationResult.POSTPONE) {
+          rescannedMisreplicatedBlocks.add(b);
         }
       }
     } finally {
+      postponedMisreplicatedBlocks.addAll(rescannedMisreplicatedBlocks);
+      rescannedMisreplicatedBlocks.clear();
+      long endSize = postponedMisreplicatedBlocks.size();
       namesystem.writeUnlock();
-      long endPostponedMisReplicatedBlocksCount =
-          getPostponedMisreplicatedBlocksCount();
       LOG.info("Rescan of postponedMisreplicatedBlocks completed in " +
-          (Time.monotonicNow() - startTimeRescanPostponedMisReplicatedBlocks) +
-          " msecs. " + endPostponedMisReplicatedBlocksCount +
-          " blocks are left. " + (startPostponedMisReplicatedBlocksCount -
-          endPostponedMisReplicatedBlocksCount) + " blocks are removed.");
+          (Time.monotonicNow() - startTime) + " msecs. " +
+          endSize + " blocks are left. " +
+          (startSize - endSize) + " blocks were removed.");
     }
   }
   
   private Collection<Block> processReport(
       final DatanodeStorageInfo storageInfo,
-      final BlockListAsLongs report) throws IOException {
+      final BlockListAsLongs report,
+      BlockReportContext context) throws IOException {
     // Normal case:
     // Modify the (block-->datanode) map, according to the difference
     // between the old and new block report.
@@ -2030,6 +2114,11 @@ public class BlockManager implements BlockStatsMXBean {
     Collection<StatefulBlockInfo> toUC = new LinkedList<StatefulBlockInfo>();
     reportDiff(storageInfo, report,
         toAdd, toRemove, toInvalidate, toCorrupt, toUC);
+
+    String strBlockReportId = "";
+    if (context != null) {
+      strBlockReportId = Long.toHexString(context.getReportId());
+    }
    
     DatanodeDescriptor node = storageInfo.getDatanodeDescriptor();
     // Process the blocks on each queue
@@ -2045,8 +2134,8 @@ public class BlockManager implements BlockStatsMXBean {
       numBlocksLogged++;
     }
     if (numBlocksLogged > maxNumBlocksToLog) {
-      blockLog.info("BLOCK* processReport: logged info for {} of {} " +
-          "reported.", maxNumBlocksToLog, numBlocksLogged);
+      blockLog.info("BLOCK* processReport 0x{}: logged info for {} of {} " +
+          "reported.", strBlockReportId, maxNumBlocksToLog, numBlocksLogged);
     }
     for (Block b : toInvalidate) {
       addToInvalidates(b, node);
@@ -2130,11 +2219,21 @@ public class BlockManager implements BlockStatsMXBean {
             QUEUE_REASON_FUTURE_GENSTAMP);
         continue;
       }
-      
-      BlockInfo storedBlock = blocksMap.getStoredBlock(iblk);
-      // If block does not belong to any file, we are done.
-      if (storedBlock == null) continue;
-      
+
+      BlockInfo storedBlock = getStoredBlock(iblk);
+
+      // If block does not belong to any file, we check if it violates
+      // an integrity assumption of Name node
+      if (storedBlock == null) {
+        if (namesystem.isInStartupSafeMode()
+            && !shouldPostponeBlocksFromFuture
+            && !inRollBack
+            && namesystem.isGenStampInFuture(iblk)) {
+          numberOfBytesInFutureBlocks.addAndGet(iblk.getBytesOnDisk());
+        }
+        continue;
+      }
+
       // If block is corrupt, mark it and continue to next block.
       BlockUCState ucState = storedBlock.getBlockUCState();
       BlockToMarkCorrupt c = checkReplicaCorrupt(
@@ -2154,15 +2253,14 @@ public class BlockManager implements BlockStatsMXBean {
       
       // If block is under construction, add this replica to its list
       if (isBlockUnderConstruction(storedBlock, ucState, reportedState)) {
-        ((BlockInfoContiguousUnderConstruction)storedBlock)
+        storedBlock.getUnderConstructionFeature()
             .addReplicaIfNotPresent(storageInfo, iblk, reportedState);
         // OpenFileBlocks only inside snapshots also will be added to safemode
         // threshold. So we need to update such blocks to safemode
         // refer HDFS-5283
-        BlockInfoContiguousUnderConstruction blockUC =
-            (BlockInfoContiguousUnderConstruction) storedBlock;
-        if (namesystem.isInSnapshot(blockUC)) {
-          int numOfReplicas = blockUC.getNumExpectedLocations();
+        if (namesystem.isInSnapshot(storedBlock.getBlockCollectionId())) {
+          int numOfReplicas = storedBlock.getUnderConstructionFeature()
+              .getNumExpectedLocations();
           namesystem.incrementSafeBlockCount(numOfReplicas);
         }
         //and fall through to next clause
@@ -2232,7 +2330,7 @@ public class BlockManager implements BlockStatsMXBean {
    * is fully replicated.</li>
    * <li>If the reported replica is for a block currently marked "under
    * construction" in the NN, then it should be added to the 
-   * BlockInfoUnderConstruction's list of replicas.</li>
+   * BlockUnderConstructionFeature's list of replicas.</li>
    * </ol>
    * 
    * @param storageInfo DatanodeStorageInfo that sent the report.
@@ -2287,11 +2385,6 @@ public class BlockManager implements BlockStatsMXBean {
 
     // Ignore replicas already scheduled to be removed from the DN
     if(invalidateBlocks.contains(dn, block)) {
-      /*
-       * TODO: following assertion is incorrect, see HDFS-2668 assert
-       * storedBlock.findDatanode(dn) < 0 : "Block " + block +
-       * " in recentInvalidatesSet should not appear in DN " + dn;
-       */
       return storedBlock;
     }
 
@@ -2314,8 +2407,7 @@ public class BlockManager implements BlockStatsMXBean {
     }
 
     if (isBlockUnderConstruction(storedBlock, ucState, reportedState)) {
-      toUC.add(new StatefulBlockInfo(
-          (BlockInfoContiguousUnderConstruction) storedBlock,
+      toUC.add(new StatefulBlockInfo(storedBlock,
           new Block(block), reportedState));
       return storedBlock;
     }
@@ -2506,8 +2598,8 @@ public class BlockManager implements BlockStatsMXBean {
 
   void addStoredBlockUnderConstruction(StatefulBlockInfo ucBlock,
       DatanodeStorageInfo storageInfo) throws IOException {
-    BlockInfoContiguousUnderConstruction block = ucBlock.storedBlock;
-    block.addReplicaIfNotPresent(
+    BlockInfo block = ucBlock.storedBlock;
+    block.getUnderConstructionFeature().addReplicaIfNotPresent(
         storageInfo, ucBlock.reportedBlock, ucBlock.reportedState);
 
     if (ucBlock.reportedState == ReplicaState.FINALIZED &&
@@ -2532,7 +2624,7 @@ public class BlockManager implements BlockStatsMXBean {
   throws IOException {
     assert (storedBlock != null && namesystem.hasWriteLock());
     if (!namesystem.isInStartupSafeMode() 
-        || namesystem.isPopulatingReplQueues()) {
+        || isPopulatingReplQueues()) {
       addStoredBlock(storedBlock, storageInfo, null, false);
       return;
     }
@@ -2544,7 +2636,7 @@ public class BlockManager implements BlockStatsMXBean {
     int numCurrentReplica = countLiveNodes(storedBlock);
     if (storedBlock.getBlockUCState() == BlockUCState.COMMITTED
         && numCurrentReplica >= minReplication) {
-      completeBlock(storedBlock.getBlockCollection(), storedBlock, false);
+      completeBlock(storedBlock, null, false);
     } else if (storedBlock.isComplete() && result == AddBlockResult.ADDED) {
       // check whether safe replication is reached for the block
       // only complete blocks are counted towards that.
@@ -2567,7 +2659,7 @@ public class BlockManager implements BlockStatsMXBean {
     assert block != null && namesystem.hasWriteLock();
     BlockInfo storedBlock;
     DatanodeDescriptor node = storageInfo.getDatanodeDescriptor();
-    if (block instanceof BlockInfoContiguousUnderConstruction) {
+    if (!block.isComplete()) {
       //refresh our copy in case the block got completed in another thread
       storedBlock = blocksMap.getStoredBlock(block);
     } else {
@@ -2582,17 +2674,16 @@ public class BlockManager implements BlockStatsMXBean {
       // it will happen in next block report otherwise.
       return block;
     }
-    BlockCollection bc = storedBlock.getBlockCollection();
-    assert bc != null : "Block must belong to a file";
 
     // add block to the datanode
     AddBlockResult result = storageInfo.addBlock(storedBlock);
 
     int curReplicaDelta;
     if (result == AddBlockResult.ADDED) {
-      curReplicaDelta = 1;
+      curReplicaDelta = (node.isDecommissioned()) ? 0 : 1;
       if (logEveryBlock) {
-        logAddStoredBlock(storedBlock, node);
+        blockLog.debug("BLOCK* addStoredBlock: {} is added to {} (size={})",
+            node, storedBlock, storedBlock.getNumBytes());
       }
     } else if (result == AddBlockResult.REPLACED) {
       curReplicaDelta = 0;
@@ -2605,7 +2696,7 @@ public class BlockManager implements BlockStatsMXBean {
       corruptReplicas.removeFromCorruptReplicasMap(block, node,
           Reason.GENSTAMP_MISMATCH);
       curReplicaDelta = 0;
-      blockLog.warn("BLOCK* addStoredBlock: Redundant addStoredBlock request"
+      blockLog.debug("BLOCK* addStoredBlock: Redundant addStoredBlock request"
               + " received for {} on node {} size {}", storedBlock, node,
           storedBlock.getNumBytes());
     }
@@ -2618,7 +2709,8 @@ public class BlockManager implements BlockStatsMXBean {
 
     if(storedBlock.getBlockUCState() == BlockUCState.COMMITTED &&
         numLiveReplicas >= minReplication) {
-      storedBlock = completeBlock(bc, storedBlock, false);
+      addExpectedReplicasToPending(storedBlock);
+      completeBlock(storedBlock, null, false);
     } else if (storedBlock.isComplete() && result == AddBlockResult.ADDED) {
       // check whether safe replication is reached for the block
       // only complete blocks are counted towards that
@@ -2628,20 +2720,21 @@ public class BlockManager implements BlockStatsMXBean {
       namesystem.incrementSafeBlockCount(numCurrentReplica);
     }
     
-    // if file is under construction, then done for now
-    if (bc.isUnderConstruction()) {
+    // if block is still under construction, then done for now
+    if (!storedBlock.isCompleteOrCommitted()) {
       return storedBlock;
     }
 
     // do not try to handle over/under-replicated blocks during first safe mode
-    if (!namesystem.isPopulatingReplQueues()) {
+    if (!isPopulatingReplQueues()) {
       return storedBlock;
     }
 
     // handle underReplication/overReplication
-    short fileReplication = bc.getPreferredBlockReplication();
-    if (!isNeededReplication(storedBlock, fileReplication, numCurrentReplica)) {
+    short fileReplication = getExpectedReplicaNum(storedBlock);
+    if (!isNeededReplication(storedBlock, numCurrentReplica)) {
       neededReplications.remove(storedBlock, numCurrentReplica,
+          num.readOnlyReplicas(),
           num.decommissionedAndDecommissioning(), fileReplication);
     } else {
       updateNeededReplications(storedBlock, curReplicaDelta, 0);
@@ -2663,21 +2756,6 @@ public class BlockManager implements BlockStatsMXBean {
     return storedBlock;
   }
 
-  private void logAddStoredBlock(BlockInfo storedBlock,
-      DatanodeDescriptor node) {
-    if (!blockLog.isDebugEnabled()) {
-      return;
-    }
-
-    StringBuilder sb = new StringBuilder(500);
-    sb.append("BLOCK* addStoredBlock: blockMap updated: ")
-      .append(node)
-      .append(" is added to ");
-    storedBlock.appendStringTo(sb);
-    sb.append(" size " )
-      .append(storedBlock.getNumBytes());
-    blockLog.debug(sb.toString());
-  }
   /**
    * Invalidate corrupt replicas.
    * <p>
@@ -2784,24 +2862,26 @@ public class BlockManager implements BlockStatsMXBean {
         while (processed < numBlocksPerIteration && blocksItr.hasNext()) {
           BlockInfo block = blocksItr.next();
           MisReplicationResult res = processMisReplicatedBlock(block);
-          if (LOG.isTraceEnabled()) {
-            LOG.trace("block " + block + ": " + res);
-          }
           switch (res) {
           case UNDER_REPLICATED:
+            LOG.trace("under replicated block {}: {}", block, res);
             nrUnderReplicated++;
             break;
           case OVER_REPLICATED:
+            LOG.trace("over replicated block {}: {}", block, res);
             nrOverReplicated++;
             break;
           case INVALID:
+            LOG.trace("invalid block {}: {}", block, res);
             nrInvalid++;
             break;
           case POSTPONE:
+            LOG.trace("postpone block {}: {}", block, res);
             nrPostponed++;
             postponeBlock(block);
             break;
           case UNDER_CONSTRUCTION:
+            LOG.trace("under construction block {}: {}", block, res);
             nrUnderConstruction++;
             break;
           case OK:
@@ -2869,14 +2949,13 @@ public class BlockManager implements BlockStatsMXBean {
       return MisReplicationResult.UNDER_CONSTRUCTION;
     }
     // calculate current replication
-    short expectedReplication =
-        block.getBlockCollection().getPreferredBlockReplication();
+    short expectedReplication = getExpectedReplicaNum(block);
     NumberReplicas num = countNodes(block);
     int numCurrentReplica = num.liveReplicas();
     // add to under-replicated queue if need to be
-    if (isNeededReplication(block, expectedReplication, numCurrentReplica)) {
-      if (neededReplications.add(block, numCurrentReplica, num
-          .decommissionedAndDecommissioning(), expectedReplication)) {
+    if (isNeededReplication(block, numCurrentReplica)) {
+      if (neededReplications.add(block, numCurrentReplica, num.readOnlyReplicas(),
+          num.decommissionedAndDecommissioning(), expectedReplication)) {
         return MisReplicationResult.UNDER_REPLICATED;
       }
     }
@@ -2900,27 +2979,18 @@ public class BlockManager implements BlockStatsMXBean {
   }
   
   /** Set replication for the blocks. */
-  public void setReplication(final short oldRepl, final short newRepl,
-      final String src, final BlockInfo... blocks) {
+  public void setReplication(
+      final short oldRepl, final short newRepl, final BlockInfo b) {
     if (newRepl == oldRepl) {
       return;
     }
 
     // update needReplication priority queues
-    for(BlockInfo b : blocks) {
-      updateNeededReplications(b, 0, newRepl-oldRepl);
-    }
-      
+    b.setReplication(newRepl);
+    updateNeededReplications(b, 0, newRepl - oldRepl);
+
     if (oldRepl > newRepl) {
-      // old replication > the new one; need to remove copies
-      LOG.info("Decreasing replication from " + oldRepl + " to " + newRepl
-          + " for " + src);
-      for(BlockInfo b : blocks) {
-        processOverReplicatedBlock(b, newRepl, null, null);
-      }
-    } else { // replication factor is increased
-      LOG.info("Increasing replication from " + oldRepl + " to " + newRepl
-          + " for " + src);
+      processOverReplicatedBlock(b, newRepl, null, null);
     }
   }
 
@@ -2929,7 +2999,7 @@ public class BlockManager implements BlockStatsMXBean {
    * If there are any extras, call chooseExcessReplicates() to
    * mark them in the excessReplicateMap.
    */
-  private void processOverReplicatedBlock(final Block block,
+  private void processOverReplicatedBlock(final BlockInfo block,
       final short replication, final DatanodeDescriptor addedNode,
       DatanodeDescriptor delNodeHint) {
     assert namesystem.hasWriteLock();
@@ -2939,19 +3009,20 @@ public class BlockManager implements BlockStatsMXBean {
     Collection<DatanodeStorageInfo> nonExcess = new ArrayList<DatanodeStorageInfo>();
     Collection<DatanodeDescriptor> corruptNodes = corruptReplicas
         .getNodes(block);
-    for(DatanodeStorageInfo storage : blocksMap.getStorages(block, State.NORMAL)) {
+    for (DatanodeStorageInfo storage : blocksMap.getStorages(block)) {
+      if (storage.getState() != State.NORMAL) {
+        continue;
+      }
       final DatanodeDescriptor cur = storage.getDatanodeDescriptor();
       if (storage.areBlockContentsStale()) {
-        LOG.info("BLOCK* processOverReplicatedBlock: " +
-            "Postponing processing of over-replicated " +
-            block + " since storage + " + storage
-            + "datanode " + cur + " does not yet have up-to-date " +
-            "block information.");
+        LOG.trace("BLOCK* processOverReplicatedBlock: Postponing {}"
+            + " since storage {} does not yet have up-to-date information.",
+            block, storage);
         postponeBlock(block);
         return;
       }
-      LightWeightLinkedSet<Block> excessBlocks = excessReplicateMap.get(cur
-          .getDatanodeUuid());
+      LightWeightHashSet<Block> excessBlocks = excessReplicateMap.get(
+          cur.getDatanodeUuid());
       if (excessBlocks == null || !excessBlocks.contains(block)) {
         if (!cur.isDecommissionInProgress() && !cur.isDecommissioned()) {
           // exclude corrupt replicas
@@ -2962,114 +3033,54 @@ public class BlockManager implements BlockStatsMXBean {
       }
     }
     chooseExcessReplicates(nonExcess, block, replication, 
-        addedNode, delNodeHint, blockplacement);
+        addedNode, delNodeHint);
   }
 
-
-  /**
-   * We want "replication" replicates for the block, but we now have too many.  
-   * In this method, copy enough nodes from 'srcNodes' into 'dstNodes' such that:
-   *
-   * srcNodes.size() - dstNodes.size() == replication
-   *
-   * We pick node that make sure that replicas are spread across racks and
-   * also try hard to pick one with least free space.
-   * The algorithm is first to pick a node with least free space from nodes
-   * that are on a rack holding more than one replicas of the block.
-   * So removing such a replica won't remove a rack. 
-   * If no such a node is available,
-   * then pick a node with least free space
-   */
-  private void chooseExcessReplicates(final Collection<DatanodeStorageInfo> nonExcess, 
-                              Block b, short replication,
-                              DatanodeDescriptor addedNode,
-                              DatanodeDescriptor delNodeHint,
-                              BlockPlacementPolicy replicator) {
+  private void chooseExcessReplicates(
+      final Collection<DatanodeStorageInfo> nonExcess,
+      BlockInfo storedBlock, short replication,
+      DatanodeDescriptor addedNode,
+      DatanodeDescriptor delNodeHint) {
     assert namesystem.hasWriteLock();
     // first form a rack to datanodes map and
-    BlockCollection bc = getBlockCollection(b);
-    final BlockStoragePolicy storagePolicy = storagePolicySuite.getPolicy(bc.getStoragePolicyID());
+    BlockCollection bc = getBlockCollection(storedBlock);
+    final BlockStoragePolicy storagePolicy = storagePolicySuite.getPolicy(
+        bc.getStoragePolicyID());
     final List<StorageType> excessTypes = storagePolicy.chooseExcess(
         replication, DatanodeStorageInfo.toStorageTypes(nonExcess));
-
-
-    final Map<String, List<DatanodeStorageInfo>> rackMap
-        = new HashMap<String, List<DatanodeStorageInfo>>();
-    final List<DatanodeStorageInfo> moreThanOne = new ArrayList<DatanodeStorageInfo>();
-    final List<DatanodeStorageInfo> exactlyOne = new ArrayList<DatanodeStorageInfo>();
-    
-    // split nodes into two sets
-    // moreThanOne contains nodes on rack with more than one replica
-    // exactlyOne contains the remaining nodes
-    replicator.splitNodesWithRack(nonExcess, rackMap, moreThanOne, exactlyOne);
-    
-    // pick one node to delete that favors the delete hint
-    // otherwise pick one with least space from priSet if it is not empty
-    // otherwise one node with least space from remains
-    boolean firstOne = true;
-    final DatanodeStorageInfo delNodeHintStorage
-        = DatanodeStorageInfo.getDatanodeStorageInfo(nonExcess, delNodeHint);
-    final DatanodeStorageInfo addedNodeStorage
-        = DatanodeStorageInfo.getDatanodeStorageInfo(nonExcess, addedNode);
-    while (nonExcess.size() - replication > 0) {
-      final DatanodeStorageInfo cur;
-      if (useDelHint(firstOne, delNodeHintStorage, addedNodeStorage,
-          moreThanOne, excessTypes)) {
-        cur = delNodeHintStorage;
-      } else { // regular excessive replica removal
-        cur = replicator.chooseReplicaToDelete(bc, b, replication,
-            moreThanOne, exactlyOne, excessTypes);
-      }
-      firstOne = false;
-
-      // adjust rackmap, moreThanOne, and exactlyOne
-      replicator.adjustSetsWithChosenReplica(rackMap, moreThanOne,
-          exactlyOne, cur);
-
-      nonExcess.remove(cur);
-      addToExcessReplicate(cur.getDatanodeDescriptor(), b);
-
-      //
-      // The 'excessblocks' tracks blocks until we get confirmation
-      // that the datanode has deleted them; the only way we remove them
-      // is when we get a "removeBlock" message.  
-      //
-      // The 'invalidate' list is used to inform the datanode the block 
-      // should be deleted.  Items are removed from the invalidate list
-      // upon giving instructions to the namenode.
-      //
-      addToInvalidates(b, cur.getDatanodeDescriptor());
-      blockLog.debug("BLOCK* chooseExcessReplicates: "
-                +"({}, {}) is added to invalidated blocks set", cur, b);
+    List<DatanodeStorageInfo> replicasToDelete = blockplacement
+        .chooseReplicasToDelete(nonExcess, replication, excessTypes,
+            addedNode, delNodeHint);
+    for (DatanodeStorageInfo choosenReplica : replicasToDelete) {
+      processChosenExcessReplica(nonExcess, choosenReplica, storedBlock);
     }
   }
 
-  /** Check if we can use delHint */
-  static boolean useDelHint(boolean isFirst, DatanodeStorageInfo delHint,
-      DatanodeStorageInfo added, List<DatanodeStorageInfo> moreThan1Racks,
-      List<StorageType> excessTypes) {
-    if (!isFirst) {
-      return false; // only consider delHint for the first case
-    } else if (delHint == null) {
-      return false; // no delHint
-    } else if (!excessTypes.contains(delHint.getStorageType())) {
-      return false; // delHint storage type is not an excess type
-    } else {
-      // check if removing delHint reduces the number of racks
-      if (moreThan1Racks.contains(delHint)) {
-        return true; // delHint and some other nodes are under the same rack 
-      } else if (added != null && !moreThan1Racks.contains(added)) {
-        return true; // the added node adds a new rack
-      }
-      return false; // removing delHint reduces the number of racks;
-    }
+  private void processChosenExcessReplica(
+      final Collection<DatanodeStorageInfo> nonExcess,
+      final DatanodeStorageInfo chosen, BlockInfo storedBlock) {
+    nonExcess.remove(chosen);
+    addToExcessReplicate(chosen.getDatanodeDescriptor(), storedBlock);
+    //
+    // The 'excessblocks' tracks blocks until we get confirmation
+    // that the datanode has deleted them; the only way we remove them
+    // is when we get a "removeBlock" message.
+    //
+    // The 'invalidate' list is used to inform the datanode the block
+    // should be deleted.  Items are removed from the invalidate list
+    // upon giving instructions to the datanodes.
+    //
+    addToInvalidates(storedBlock, chosen.getDatanodeDescriptor());
+    blockLog.debug("BLOCK* chooseExcessReplicates: "
+        + "({}, {}) is added to invalidated blocks set", chosen, storedBlock);
   }
 
   private void addToExcessReplicate(DatanodeInfo dn, Block block) {
     assert namesystem.hasWriteLock();
-    LightWeightLinkedSet<Block> excessBlocks = excessReplicateMap.get(dn.getDatanodeUuid());
+    LightWeightHashSet<Block> excessBlocks = excessReplicateMap.get(
+        dn.getDatanodeUuid());
     if (excessBlocks == null) {
-      excessBlocks = new LightWeightLinkedSet<Block>();
+      excessBlocks = new LightWeightHashSet<>();
       excessReplicateMap.put(dn.getDatanodeUuid(), excessBlocks);
     }
     if (excessBlocks.add(block)) {
@@ -3124,8 +3135,7 @@ public class BlockManager implements BlockStatsMXBean {
       // necessary. In that case, put block on a possibly-will-
       // be-replicated list.
       //
-      BlockCollection bc = blocksMap.getBlockCollection(block);
-      if (bc != null) {
+      if (!storedBlock.isDeleted()) {
         namesystem.decrementSafeBlockCount(storedBlock);
         updateNeededReplications(storedBlock, -1, 0);
       }
@@ -3134,8 +3144,8 @@ public class BlockManager implements BlockStatsMXBean {
       // We've removed a block from a node, so it's definitely no longer
       // in "excess" there.
       //
-      LightWeightLinkedSet<Block> excessBlocks = excessReplicateMap.get(node
-          .getDatanodeUuid());
+      LightWeightHashSet<Block> excessBlocks = excessReplicateMap.get(
+          node.getDatanodeUuid());
       if (excessBlocks != null) {
         if (excessBlocks.remove(block)) {
           excessBlocksCount.decrementAndGet();
@@ -3149,6 +3159,17 @@ public class BlockManager implements BlockStatsMXBean {
 
       // Remove the replica from corruptReplicas
       corruptReplicas.removeFromCorruptReplicasMap(block, node);
+    }
+  }
+
+  private void removeStaleReplicas(List<ReplicaUnderConstruction> staleReplicas,
+      BlockInfo block) {
+    for (ReplicaUnderConstruction r : staleReplicas) {
+      removeStoredBlock(block,
+          r.getExpectedStorageLocation().getDatanodeDescriptor());
+      NameNode.blockStateChangeLog
+          .debug("BLOCK* Removing stale replica {}" + " of {}", r,
+              Block.toString(r));
     }
   }
 
@@ -3202,8 +3223,9 @@ public class BlockManager implements BlockStatsMXBean {
     // Modify the blocks->datanode map and node's map.
     //
     BlockInfo storedBlock = getStoredBlock(block);
-    if (storedBlock != null) {
-      pendingReplications.decrement(getStoredBlock(block), node);
+    if (storedBlock != null &&
+        block.getGenerationStamp() == storedBlock.getGenerationStamp()) {
+      pendingReplications.decrement(storedBlock, node);
     }
     processAndHandleReportedBlock(storageInfo, block, ReplicaState.FINALIZED,
         delHintNode);
@@ -3259,17 +3281,27 @@ public class BlockManager implements BlockStatsMXBean {
   public void processIncrementalBlockReport(final DatanodeID nodeID,
       final StorageReceivedDeletedBlocks srdb) throws IOException {
     assert namesystem.hasWriteLock();
-    int received = 0;
-    int deleted = 0;
-    int receiving = 0;
     final DatanodeDescriptor node = datanodeManager.getDatanode(nodeID);
-    if (node == null || !node.isAlive) {
+    if (node == null || !node.isRegistered()) {
       blockLog.warn("BLOCK* processIncrementalBlockReport"
               + " is received from dead or unregistered node {}", nodeID);
       throw new IOException(
           "Got incremental block report from unregistered or dead node");
     }
 
+    boolean successful = false;
+    try {
+      processIncrementalBlockReport(node, srdb);
+      successful = true;
+    } finally {
+      if (!successful) {
+        node.setForceRegistration(true);
+      }
+    }
+  }
+
+  private void processIncrementalBlockReport(final DatanodeDescriptor node,
+      final StorageReceivedDeletedBlocks srdb) throws IOException {
     DatanodeStorageInfo storageInfo =
         node.getStorageInfo(srdb.getStorage().getStorageID());
     if (storageInfo == null) {
@@ -3280,6 +3312,10 @@ public class BlockManager implements BlockStatsMXBean {
       // uncovered by HDFS-6094.
       storageInfo = node.updateStorage(srdb.getStorage());
     }
+
+    int received = 0;
+    int deleted = 0;
+    int receiving = 0;
 
     for (ReceivedDeletedBlockInfo rdbi : srdb.getBlocks()) {
       switch (rdbi.getStatus()) {
@@ -3298,17 +3334,17 @@ public class BlockManager implements BlockStatsMXBean {
         break;
       default:
         String msg = 
-          "Unknown block status code reported by " + nodeID +
+          "Unknown block status code reported by " + node +
           ": " + rdbi;
         blockLog.warn(msg);
         assert false : msg; // if assertions are enabled, throw.
         break;
       }
       blockLog.debug("BLOCK* block {}: {} is received from {}",
-          rdbi.getStatus(), rdbi.getBlock(), nodeID);
+          rdbi.getStatus(), rdbi.getBlock(), node);
     }
     blockLog.debug("*BLOCK* NameNode.processIncrementalBlockReport: from "
-            + "{} receiving: {}, received: {}, deleted: {}", nodeID, receiving,
+            + "{} receiving: {}, received: {}, deleted: {}", node, receiving,
         received, deleted);
   }
 
@@ -3316,15 +3352,22 @@ public class BlockManager implements BlockStatsMXBean {
    * Return the number of nodes hosting a given block, grouped
    * by the state of those replicas.
    */
-  public NumberReplicas countNodes(BlockInfo b) {
+  public NumberReplicas countNodes(Block b) {
     int decommissioned = 0;
     int decommissioning = 0;
     int live = 0;
+    int readonly = 0;
     int corrupt = 0;
     int excess = 0;
     int stale = 0;
     Collection<DatanodeDescriptor> nodesCorrupt = corruptReplicas.getNodes(b);
-    for(DatanodeStorageInfo storage : blocksMap.getStorages(b, State.NORMAL)) {
+    for(DatanodeStorageInfo storage : blocksMap.getStorages(b)) {
+      if (storage.getState() == State.FAILED) {
+        continue;
+      } else if (storage.getState() == State.READ_ONLY_SHARED) {
+        readonly++;
+        continue;
+      }
       final DatanodeDescriptor node = storage.getDatanodeDescriptor();
       if ((nodesCorrupt != null) && (nodesCorrupt.contains(node))) {
         corrupt++;
@@ -3333,8 +3376,8 @@ public class BlockManager implements BlockStatsMXBean {
       } else if (node.isDecommissioned()) {
         decommissioned++;
       } else {
-        LightWeightLinkedSet<Block> blocksExcess = excessReplicateMap.get(node
-            .getDatanodeUuid());
+        LightWeightHashSet<Block> blocksExcess = excessReplicateMap.get(
+             node.getDatanodeUuid());
         if (blocksExcess != null && blocksExcess.contains(b)) {
           excess++;
         } else {
@@ -3345,7 +3388,8 @@ public class BlockManager implements BlockStatsMXBean {
         stale++;
       }
     }
-    return new NumberReplicas(live, decommissioned, decommissioning, corrupt, excess, stale);
+    return new NumberReplicas(live, readonly, decommissioned, decommissioning,
+        corrupt, excess, stale);
   }
 
   /** 
@@ -3365,7 +3409,10 @@ public class BlockManager implements BlockStatsMXBean {
     // else proceed with fast case
     int live = 0;
     Collection<DatanodeDescriptor> nodesCorrupt = corruptReplicas.getNodes(b);
-    for(DatanodeStorageInfo storage : blocksMap.getStorages(b, State.NORMAL)) {
+    for (DatanodeStorageInfo storage : blocksMap.getStorages(b)) {
+      if (storage.getState() != State.NORMAL) {
+        continue;
+      }
       final DatanodeDescriptor node = storage.getDatanodeDescriptor();
       if ((nodesCorrupt == null) || (!nodesCorrupt.contains(node)))
         live++;
@@ -3380,15 +3427,14 @@ public class BlockManager implements BlockStatsMXBean {
    */
   void processOverReplicatedBlocksOnReCommission(
       final DatanodeDescriptor srcNode) {
-    if (!namesystem.isPopulatingReplQueues()) {
+    if (!isPopulatingReplQueues()) {
       return;
     }
     final Iterator<BlockInfo> it = srcNode.getBlockIterator();
     int numOverReplicated = 0;
     while(it.hasNext()) {
       final BlockInfo block = it.next();
-      BlockCollection bc = blocksMap.getBlockCollection(block);
-      short expectedReplication = bc.getPreferredBlockReplication();
+      short expectedReplication = block.getReplication();
       NumberReplicas num = countNodes(block);
       int numCurrentReplica = num.liveReplicas();
       if (numCurrentReplica > expectedReplication) {
@@ -3411,7 +3457,7 @@ public class BlockManager implements BlockStatsMXBean {
       return false;
     }
 
-    if (node.isAlive) {
+    if (node.isAlive()) {
       return true;
     }
 
@@ -3461,13 +3507,18 @@ public class BlockManager implements BlockStatsMXBean {
     // Remove the block from pendingReplications and neededReplications
     pendingReplications.remove(block);
     neededReplications.remove(block, UnderReplicatedBlocks.LEVEL);
-    if (postponedMisreplicatedBlocks.remove(block)) {
-      postponedMisreplicatedBlocksCount.decrementAndGet();
-    }
+    postponedMisreplicatedBlocks.remove(block);
   }
 
   public BlockInfo getStoredBlock(Block block) {
     return blocksMap.getStoredBlock(block);
+  }
+
+  public void updateLastBlock(BlockInfo lastBlock, ExtendedBlock newBlock) {
+    lastBlock.setNumBytes(newBlock.getNumBytes());
+    List<ReplicaUnderConstruction> staleReplicas = lastBlock
+        .setGenerationStampAndVerifyReplicas(newBlock.getGenerationStamp());
+    removeStaleReplicas(staleReplicas, lastBlock);
   }
 
   /** updates a block in under replication queue */
@@ -3475,19 +3526,21 @@ public class BlockManager implements BlockStatsMXBean {
       final int curReplicasDelta, int expectedReplicasDelta) {
     namesystem.writeLock();
     try {
-      if (!namesystem.isPopulatingReplQueues()) {
+      if (!isPopulatingReplQueues() || !block.isComplete()) {
         return;
       }
       NumberReplicas repl = countNodes(block);
+      int pendingNum = pendingReplications.getNumReplicas(block);
       int curExpectedReplicas = getReplication(block);
-      if (isNeededReplication(block, curExpectedReplicas, repl.liveReplicas())) {
-        neededReplications.update(block, repl.liveReplicas(), repl
-            .decommissionedAndDecommissioning(), curExpectedReplicas,
-            curReplicasDelta, expectedReplicasDelta);
+      if (!hasEnoughEffectiveReplicas(block, repl, pendingNum,
+                    curExpectedReplicas)) {
+        neededReplications.update(block, repl.liveReplicas() + pendingNum,
+            repl.readOnlyReplicas(), repl.decommissionedAndDecommissioning(),
+            curExpectedReplicas, curReplicasDelta, expectedReplicasDelta);
       } else {
-        int oldReplicas = repl.liveReplicas()-curReplicasDelta;
+        int oldReplicas = repl.liveReplicas() + pendingNum - curReplicasDelta;
         int oldExpectedReplicas = curExpectedReplicas-expectedReplicasDelta;
-        neededReplications.remove(block, oldReplicas,
+        neededReplications.remove(block, oldReplicas, repl.readOnlyReplicas(),
             repl.decommissionedAndDecommissioning(), oldExpectedReplicas);
       }
     } finally {
@@ -3502,11 +3555,13 @@ public class BlockManager implements BlockStatsMXBean {
    * process it as an over replicated block.
    */
   public void checkReplication(BlockCollection bc) {
-    final short expected = bc.getPreferredBlockReplication();
     for (BlockInfo block : bc.getBlocks()) {
+      final short expected = block.getReplication();
       final NumberReplicas n = countNodes(block);
-      if (isNeededReplication(block, expected, n.liveReplicas())) { 
-        neededReplications.add(block, n.liveReplicas(),
+      final int pending = pendingReplications.getNumReplicas(block);
+      if (!hasEnoughEffectiveReplicas(block, n, pending, expected)) {
+        neededReplications.add(block, n.liveReplicas() + pending,
+            n.readOnlyReplicas(),
             n.decommissionedAndDecommissioning(), expected);
       } else if (n.liveReplicas() > expected) {
         processOverReplicatedBlock(block, expected, null, null);
@@ -3514,36 +3569,13 @@ public class BlockManager implements BlockStatsMXBean {
     }
   }
 
-  /**
-   * Check that the indicated blocks are present and
-   * replicated.
-   */
-  public boolean checkBlocksProperlyReplicated(
-      String src, BlockInfo[] blocks) {
-    for (BlockInfo b: blocks) {
-      if (!b.isComplete()) {
-        final BlockInfoContiguousUnderConstruction uc =
-            (BlockInfoContiguousUnderConstruction)b;
-        final int numNodes = b.numNodes();
-        LOG.info("BLOCK* " + b + " is not COMPLETE (ucState = "
-          + uc.getBlockUCState() + ", replication# = " + numNodes
-          + (numNodes < minReplication ? " < ": " >= ")
-          + " minimum = " + minReplication + ") in file " + src);
-        return false;
-      }
-    }
-    return true;
-  }
-
   /** 
    * @return 0 if the block is not found;
    *         otherwise, return the replication factor of the block.
    */
-  private int getReplication(Block block) {
-    final BlockCollection bc = blocksMap.getBlockCollection(block);
-    return bc == null? 0: bc.getPreferredBlockReplication();
+  private int getReplication(BlockInfo block) {
+    return getExpectedReplicaNum(block);
   }
-
 
   /**
    * Get blocks to invalidate for <i>nodeId</i>
@@ -3585,44 +3617,34 @@ public class BlockManager implements BlockStatsMXBean {
     return toInvalidate.size();
   }
 
-  boolean blockHasEnoughRacks(Block b) {
-    if (!this.shouldCheckForEnoughRacks) {
-      return true;
-    }
-    boolean enoughRacks = false;;
-    Collection<DatanodeDescriptor> corruptNodes = 
-                                  corruptReplicas.getNodes(b);
-    int numExpectedReplicas = getReplication(b);
-    String rackName = null;
-    for(DatanodeStorageInfo storage : blocksMap.getStorages(b)) {
+  boolean isPlacementPolicySatisfied(BlockInfo storedBlock) {
+    List<DatanodeDescriptor> liveNodes = new ArrayList<>();
+    Collection<DatanodeDescriptor> corruptNodes = corruptReplicas
+        .getNodes(storedBlock);
+    for (DatanodeStorageInfo storage : blocksMap.getStorages(storedBlock)) {
       final DatanodeDescriptor cur = storage.getDatanodeDescriptor();
-      if (!cur.isDecommissionInProgress() && !cur.isDecommissioned()) {
-        if ((corruptNodes == null ) || !corruptNodes.contains(cur)) {
-          if (numExpectedReplicas == 1 ||
-              (numExpectedReplicas > 1 &&
-                  !datanodeManager.hasClusterEverBeenMultiRack())) {
-            enoughRacks = true;
-            break;
-          }
-          String rackNameNew = cur.getNetworkLocation();
-          if (rackName == null) {
-            rackName = rackNameNew;
-          } else if (!rackName.equals(rackNameNew)) {
-            enoughRacks = true;
-            break;
-          }
-        }
+      if (!cur.isDecommissionInProgress() && !cur.isDecommissioned()
+          && ((corruptNodes == null) || !corruptNodes.contains(cur))) {
+        liveNodes.add(cur);
       }
     }
-    return enoughRacks;
+    DatanodeInfo[] locs = liveNodes.toArray(new DatanodeInfo[liveNodes.size()]);
+    return blockplacement.verifyBlockPlacement(locs,
+        storedBlock.getReplication()).isPlacementPolicySatisfied();
   }
 
   /**
    * A block needs replication if the number of replicas is less than expected
    * or if it does not have enough racks.
    */
-  boolean isNeededReplication(Block b, int expected, int current) {
-    return current < expected || !blockHasEnoughRacks(b);
+  boolean isNeededReplication(BlockInfo storedBlock, int current) {
+    int expected = storedBlock.getReplication();
+    return storedBlock.isComplete()
+        && (current < expected || !isPlacementPolicySatisfied(storedBlock));
+  }
+
+  public short getExpectedReplicaNum(BlockInfo block) {
+    return block.getReplication();
   }
   
   public long getMissingBlocksCount() {
@@ -3640,8 +3662,8 @@ public class BlockManager implements BlockStatsMXBean {
     return blocksMap.addBlockCollection(block, bc);
   }
 
-  public BlockCollection getBlockCollection(Block b) {
-    return blocksMap.getBlockCollection(b);
+  BlockCollection getBlockCollection(BlockInfo b) {
+    return namesystem.getBlockCollection(b.getBlockCollectionId());
   }
 
   /** @return an iterator of the datanodes. */
@@ -3653,7 +3675,7 @@ public class BlockManager implements BlockStatsMXBean {
     return corruptReplicas.numCorruptReplicas(block);
   }
 
-  public void removeBlockFromMap(Block block) {
+  public void removeBlockFromMap(BlockInfo block) {
     removeFromExcessReplicateMap(block);
     blocksMap.removeBlock(block);
     // If block is removed from blocksMap remove it from corruptReplicasMap
@@ -3663,10 +3685,11 @@ public class BlockManager implements BlockStatsMXBean {
   /**
    * If a block is removed from blocksMap, remove it from excessReplicateMap.
    */
-  private void removeFromExcessReplicateMap(Block block) {
+  private void removeFromExcessReplicateMap(BlockInfo block) {
     for (DatanodeStorageInfo info : blocksMap.getStorages(block)) {
       String uuid = info.getDatanodeDescriptor().getDatanodeUuid();
-      LightWeightLinkedSet<Block> excessReplicas = excessReplicateMap.get(uuid);
+      LightWeightHashSet<Block> excessReplicas =
+          excessReplicateMap.get(uuid);
       if (excessReplicas != null) {
         if (excessReplicas.remove(block)) {
           excessBlocksCount.decrementAndGet();
@@ -3719,7 +3742,7 @@ public class BlockManager implements BlockStatsMXBean {
       while (namesystem.isRunning()) {
         try {
           // Process replication work only when active NN is out of safe mode.
-          if (namesystem.isPopulatingReplQueues()) {
+          if (isPopulatingReplQueues()) {
             computeDatanodeWork();
             processPendingReplications();
             rescanPostponedMisreplicatedBlocks();
@@ -3793,7 +3816,6 @@ public class BlockManager implements BlockStatsMXBean {
     invalidateBlocks.clear();
     datanodeManager.clearPendingQueues();
     postponedMisreplicatedBlocks.clear();
-    postponedMisreplicatedBlocksCount.set(0);
   };
 
   public static LocatedBlock newLocatedBlock(
@@ -3806,51 +3828,6 @@ public class BlockManager implements BlockStatsMXBean {
         DatanodeStorageInfo.toStorageTypes(storages),
         startOffset, corrupt,
         null);
-  }
-
-  private static class ReplicationWork {
-
-    private final BlockInfo block;
-    private final BlockCollection bc;
-
-    private final DatanodeDescriptor srcNode;
-    private final List<DatanodeDescriptor> containingNodes;
-    private final List<DatanodeStorageInfo> liveReplicaStorages;
-    private final int additionalReplRequired;
-
-    private DatanodeStorageInfo targets[];
-    private final int priority;
-
-    public ReplicationWork(BlockInfo block,
-        BlockCollection bc,
-        DatanodeDescriptor srcNode,
-        List<DatanodeDescriptor> containingNodes,
-        List<DatanodeStorageInfo> liveReplicaStorages,
-        int additionalReplRequired,
-        int priority) {
-      this.block = block;
-      this.bc = bc;
-      this.srcNode = srcNode;
-      this.srcNode.incrementPendingReplicationWithoutTargets();
-      this.containingNodes = containingNodes;
-      this.liveReplicaStorages = liveReplicaStorages;
-      this.additionalReplRequired = additionalReplRequired;
-      this.priority = priority;
-      this.targets = null;
-    }
-    
-    private void chooseTargets(BlockPlacementPolicy blockplacement,
-        BlockStoragePolicySuite storagePolicySuite,
-        Set<Node> excludedNodes) {
-      try {
-        targets = blockplacement.chooseTarget(bc.getName(),
-            additionalReplRequired, srcNode, liveReplicaStorages, false,
-            excludedNodes, block.getNumBytes(),
-            storagePolicySuite.getPolicy(bc.getStoragePolicyID()));
-      } finally {
-        srcNode.decrementPendingReplicationWithoutTargets();
-      }
-    }
   }
 
   /**
@@ -3866,9 +3843,9 @@ public class BlockManager implements BlockStatsMXBean {
     OVER_REPLICATED,
     /** A decision can't currently be made about this block. */
     POSTPONE,
-    /** The block is under construction, so should be ignored */
+    /** The block is under construction, so should be ignored. */
     UNDER_CONSTRUCTION,
-    /** The block is properly replicated */
+    /** The block is properly replicated. */
     OK
   }
 
@@ -3891,5 +3868,191 @@ public class BlockManager implements BlockStatsMXBean {
   @Override // BlockStatsMXBean
   public Map<StorageType, StorageTypeStats> getStorageTypeStats() {
     return  datanodeManager.getDatanodeStatistics().getStorageTypeStats();
+  }
+
+  /**
+   * Initialize replication queues.
+   */
+  public void initializeReplQueues() {
+    LOG.info("initializing replication queues");
+    processMisReplicatedBlocks();
+    initializedReplQueues = true;
+  }
+
+  /**
+   * Check if replication queues are to be populated
+   * @return true when node is HAState.Active and not in the very first safemode
+   */
+  public boolean isPopulatingReplQueues() {
+    if (!shouldPopulateReplQueues()) {
+      return false;
+    }
+    return initializedReplQueues;
+  }
+
+  public void setInitializedReplQueues(boolean v) {
+    this.initializedReplQueues = v;
+  }
+
+  public boolean shouldPopulateReplQueues() {
+    HAContext haContext = namesystem.getHAContext();
+    if (haContext == null || haContext.getState() == null)
+      return false;
+    return haContext.getState().shouldPopulateReplQueues();
+  }
+
+  /**
+   * Returns the number of bytes that reside in blocks with Generation Stamps
+   * greater than generation stamp known to Namenode.
+   *
+   * @return Bytes in future
+   */
+  public long getBytesInFuture() {
+    return numberOfBytesInFutureBlocks.get();
+  }
+
+  /**
+   * Clears the bytes in future counter.
+   */
+  public void clearBytesInFuture() {
+    numberOfBytesInFutureBlocks.set(0);
+  }
+
+  /**
+   * Returns true if Namenode was started with a RollBack option.
+   *
+   * @param option - StartupOption
+   * @return boolean
+   */
+  private boolean isInRollBackMode(HdfsServerConstants.StartupOption option) {
+    if (option == HdfsServerConstants.StartupOption.ROLLBACK) {
+      return true;
+    }
+    if ((option == HdfsServerConstants.StartupOption.ROLLINGUPGRADE) &&
+        (option.getRollingUpgradeStartupOption() ==
+            HdfsServerConstants.RollingUpgradeStartupOption.ROLLBACK)) {
+      return true;
+    }
+    return false;
+  }
+
+  // async processing of an action, used for IBRs.
+  public void enqueueBlockOp(final Runnable action) throws IOException {
+    try {
+      blockReportThread.enqueue(action);
+    } catch (InterruptedException ie) {
+      throw new IOException(ie);
+    }
+  }
+
+  // sync batch processing for a full BR.
+  public <T> T runBlockOp(final Callable<T> action)
+      throws IOException {
+    final FutureTask<T> future = new FutureTask<T>(action);
+    enqueueBlockOp(future);
+    try {
+      return future.get();
+    } catch (ExecutionException ee) {
+      Throwable cause = ee.getCause();
+      if (cause == null) {
+        cause = ee;
+      }
+      if (!(cause instanceof IOException)) {
+        cause = new IOException(cause);
+      }
+      throw (IOException)cause;
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new IOException(ie);
+    }
+  }
+
+  @VisibleForTesting
+  public void flushBlockOps() throws IOException {
+    runBlockOp(new Callable<Void>(){
+      @Override
+      public Void call() {
+        return null;
+      }
+    });
+  }
+
+  public int getBlockOpQueueLength() {
+    return blockReportThread.queue.size();
+  }
+
+  private class BlockReportProcessingThread extends Thread {
+    private static final long MAX_LOCK_HOLD_MS = 4;
+    private long lastFull = 0;
+
+    private final BlockingQueue<Runnable> queue =
+        new ArrayBlockingQueue<Runnable>(1024);
+
+    BlockReportProcessingThread() {
+      super("Block report processor");
+      setDaemon(true);
+    }
+
+    @Override
+    public void run() {
+      try {
+        processQueue();
+      } catch (Throwable t) {
+        ExitUtil.terminate(1,
+            getName() + " encountered fatal exception: " + t);
+      }
+    }
+
+    private void processQueue() {
+      while (namesystem.isRunning()) {
+        NameNodeMetrics metrics = NameNode.getNameNodeMetrics();
+        try {
+          Runnable action = queue.take();
+          // batch as many operations in the write lock until the queue
+          // runs dry, or the max lock hold is reached.
+          int processed = 0;
+          namesystem.writeLock();
+          metrics.setBlockOpsQueued(queue.size() + 1);
+          try {
+            long start = Time.monotonicNow();
+            do {
+              processed++;
+              action.run();
+              if (Time.monotonicNow() - start > MAX_LOCK_HOLD_MS) {
+                break;
+              }
+              action = queue.poll();
+            } while (action != null);
+          } finally {
+            namesystem.writeUnlock();
+            metrics.addBlockOpsBatched(processed - 1);
+          }
+        } catch (InterruptedException e) {
+          // ignore unless thread was specifically interrupted.
+          if (Thread.interrupted()) {
+            break;
+          }
+        }
+      }
+      queue.clear();
+    }
+
+    void enqueue(Runnable action) throws InterruptedException {
+      if (!queue.offer(action)) {
+        if (!isAlive() && namesystem.isRunning()) {
+          ExitUtil.terminate(1, getName()+" is not running");
+        }
+        long now = Time.monotonicNow();
+        if (now - lastFull > 4000) {
+          lastFull = now;
+          LOG.info("Block report queue is full");
+        }
+        queue.put(action);
+      }
+    }
+  }
+
+  boolean isReplicaCorrupt(BlockInfo blk, DatanodeDescriptor d) {
+    return corruptReplicas.isReplicaCorrupt(blk, d);
   }
 }

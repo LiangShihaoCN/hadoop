@@ -32,7 +32,7 @@
   <skin>
     <groupId>org.apache.maven.skins</groupId>
     <artifactId>maven-stylus-skin</artifactId>
-    <version>1.2</version>
+    <version>${maven-stylus-skin.version}</version>
   </skin>
 
   <body>
@@ -52,7 +52,7 @@
       <item name="Cluster Setup" href="hadoop-project-dist/hadoop-common/ClusterSetup.html"/>
       <item name="Commands Reference" href="hadoop-project-dist/hadoop-common/CommandsManual.html"/>
       <item name="FileSystem Shell" href="hadoop-project-dist/hadoop-common/FileSystemShell.html"/>
-      <item name="Compatibility" href="hadoop-project-dist/hadoop-common/Compatibility.html"/>
+      <item name="Hadoop Compatibility" href="hadoop-project-dist/hadoop-common/Compatibility.html"/>
       <item name="Interface Classification" href="hadoop-project-dist/hadoop-common/InterfaceClassification.html"/>
       <item name="FileSystem Specification"
         href="hadoop-project-dist/hadoop-common/filesystem/index.html"/>
@@ -66,6 +66,7 @@
       <item name="Secure Mode" href="hadoop-project-dist/hadoop-common/SecureMode.html"/>
       <item name="Service Level Authorization" href="hadoop-project-dist/hadoop-common/ServiceLevelAuth.html"/>
       <item name="HTTP Authentication" href="hadoop-project-dist/hadoop-common/HttpAuthentication.html"/>
+      <item name="Credential Provider API" href="hadoop-project-dist/hadoop-common/CredentialProviderAPI.html"/>
       <item name="Hadoop KMS" href="hadoop-kms/index.html"/>
       <item name="Tracing" href="hadoop-project-dist/hadoop-common/Tracing.html"/>
     </menu>
@@ -120,14 +121,18 @@
       <item name="Fair Scheduler" href="hadoop-yarn/hadoop-yarn-site/FairScheduler.html"/>
       <item name="ResourceManager Restart" href="hadoop-yarn/hadoop-yarn-site/ResourceManagerRestart.html"/>
       <item name="ResourceManager HA" href="hadoop-yarn/hadoop-yarn-site/ResourceManagerHA.html"/>
+      <item name="Node Labels" href="hadoop-yarn/hadoop-yarn-site/NodeLabel.html"/>
       <item name="Web Application Proxy" href="hadoop-yarn/hadoop-yarn-site/WebApplicationProxy.html"/>
       <item name="Timeline Server" href="hadoop-yarn/hadoop-yarn-site/TimelineServer.html"/>
       <item name="Writing YARN Applications" href="hadoop-yarn/hadoop-yarn-site/WritingYarnApplications.html"/>
+      <item name="YARN Application Security" href="hadoop-yarn/hadoop-yarn-site/YarnApplicationSecurity.html"/>
       <item name="NodeManager" href="hadoop-yarn/hadoop-yarn-site/NodeManager.html"/>
+      <item name="Running Applications in Docker Containers" href="hadoop-yarn/hadoop-yarn-site/DockerContainers.html"/>
       <item name="DockerContainerExecutor" href="hadoop-yarn/hadoop-yarn-site/DockerContainerExecutor.html"/>
       <item name="Using CGroups" href="hadoop-yarn/hadoop-yarn-site/NodeManagerCgroups.html"/>
       <item name="Secure Containers" href="hadoop-yarn/hadoop-yarn-site/SecureContainer.html"/>
       <item name="Registry" href="hadoop-yarn/hadoop-yarn-site/registry/index.html"/>
+      <item name="Reservation System" href="hadoop-yarn/hadoop-yarn-site/ReservationSystem.html"/>
     </menu>
 
     <menu name="YARN REST APIs" inherit="top">
@@ -153,10 +158,12 @@
     <menu name="Tools" inherit="top">
       <item name="Hadoop Streaming" href="hadoop-streaming/HadoopStreaming.html"/>
       <item name="Hadoop Archives" href="hadoop-archives/HadoopArchives.html"/>
+      <item name="Hadoop Archive Logs" href="hadoop-archive-logs/HadoopArchiveLogs.html"/>
       <item name="DistCp" href="hadoop-distcp/DistCp.html"/>
       <item name="GridMix" href="hadoop-gridmix/GridMix.html"/>
       <item name="Rumen" href="hadoop-rumen/Rumen.html"/>
       <item name="Scheduler Load Simulator" href="hadoop-sls/SchedulerLoadSimulator.html"/>
+      <item name="Hadoop Benchmarking" href="hadoop-project-dist/hadoop-common/Benchmarking.html"/>
     </menu>
 
     <menu name="Reference" inherit="top">

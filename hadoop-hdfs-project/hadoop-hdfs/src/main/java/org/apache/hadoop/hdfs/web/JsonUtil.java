@@ -38,6 +38,12 @@ import java.util.*;
 public class JsonUtil {
   private static final Object[] EMPTY_OBJECT_ARRAY = {};
 
+  // Reuse ObjectMapper instance for improving performance.
+  // ObjectMapper is thread safe as long as we always configure instance
+  // before use. We don't have a re-entrant call pattern in WebHDFS,
+  // so we just need to worry about thread-safety.
+  private static final ObjectMapper MAPPER = new ObjectMapper();
+
   /** Convert a token object to a Json string. */
   public static String toJsonString(final Token<? extends TokenIdentifier> token
       ) throws IOException {
@@ -72,9 +78,8 @@ public class JsonUtil {
   public static String toJsonString(final String key, final Object value) {
     final Map<String, Object> m = new TreeMap<String, Object>();
     m.put(key, value);
-    ObjectMapper mapper = new ObjectMapper();
     try {
-      return mapper.writeValueAsString(m);
+      return MAPPER.writeValueAsString(m);
     } catch (IOException ignored) {
     }
     return null;
@@ -116,10 +121,9 @@ public class JsonUtil {
     m.put("fileId", status.getFileId());
     m.put("childrenNum", status.getChildrenNum());
     m.put("storagePolicy", status.getStoragePolicy());
-    ObjectMapper mapper = new ObjectMapper();
     try {
       return includeType ?
-          toJsonString(FileStatus.class, m) : mapper.writeValueAsString(m);
+          toJsonString(FileStatus.class, m) : MAPPER.writeValueAsString(m);
     } catch (IOException ignored) {
     }
     return null;
@@ -169,6 +173,9 @@ public class JsonUtil {
     m.put("xceiverCount", datanodeinfo.getXceiverCount());
     m.put("networkLocation", datanodeinfo.getNetworkLocation());
     m.put("adminState", datanodeinfo.getAdminState().name());
+    if (datanodeinfo.getUpgradeDomain() != null) {
+      m.put("upgradeDomain", datanodeinfo.getUpgradeDomain());
+    }
     return m;
   }
 
@@ -187,6 +194,21 @@ public class JsonUtil {
     }
   }
 
+  /** Convert a StorageType[] to a Json array. */
+  private static Object[] toJsonArray(final StorageType[] array) {
+    if (array == null) {
+      return null;
+    } else if (array.length == 0) {
+      return EMPTY_OBJECT_ARRAY;
+    } else {
+      final Object[] a = new Object[array.length];
+      for(int i = 0; i < array.length; i++) {
+        a[i] = array[i];
+      }
+      return a;
+    }
+  }
+
   /** Convert a LocatedBlock to a Json map. */
   private static Map<String, Object> toJsonMap(final LocatedBlock locatedblock
       ) throws IOException {
@@ -199,6 +221,7 @@ public class JsonUtil {
     m.put("isCorrupt", locatedblock.isCorrupt());
     m.put("startOffset", locatedblock.getStartOffset());
     m.put("block", toJsonMap(locatedblock.getBlock()));
+    m.put("storageTypes", toJsonArray(locatedblock.getStorageTypes()));
     m.put("locations", toJsonArray(locatedblock.getLocations()));
     m.put("cachedLocations", toJsonArray(locatedblock.getCachedLocations()));
     return m;
@@ -250,6 +273,21 @@ public class JsonUtil {
     m.put("quota", contentsummary.getQuota());
     m.put("spaceConsumed", contentsummary.getSpaceConsumed());
     m.put("spaceQuota", contentsummary.getSpaceQuota());
+    final Map<String, Map<String, Long>> typeQuota =
+        new TreeMap<String, Map<String, Long>>();
+    for (StorageType t : StorageType.getTypesSupportingQuota()) {
+      long tQuota = contentsummary.getTypeQuota(t);
+      if (tQuota != HdfsConstants.QUOTA_RESET) {
+        Map<String, Long> type = typeQuota.get(t.toString());
+        if (type == null) {
+          type = new TreeMap<String, Long>();
+          typeQuota.put(t.toString(), type);
+        }
+        type.put("quota", contentsummary.getTypeQuota(t));
+        type.put("consumed", contentsummary.getTypeConsumed(t));
+      }
+    }
+    m.put("typeQuota", typeQuota);
     return toJsonString(ContentSummary.class, m);
   }
 
@@ -279,7 +317,7 @@ public class JsonUtil {
 
     final List<String> stringEntries = new ArrayList<>();
     for (AclEntry entry : status.getEntries()) {
-      stringEntries.add(entry.toString());
+      stringEntries.add(entry.toStringStable());
     }
     m.put("entries", stringEntries);
 
@@ -297,9 +335,8 @@ public class JsonUtil {
         new TreeMap<String, Map<String, Object>>();
     finalMap.put(AclStatus.class.getSimpleName(), m);
 
-    ObjectMapper mapper = new ObjectMapper();
     try {
-      return mapper.writeValueAsString(finalMap);
+      return MAPPER.writeValueAsString(finalMap);
     } catch (IOException ignored) {
     }
     return null;
@@ -312,8 +349,8 @@ public class JsonUtil {
     }
  
     final Map<String, Object> m = new TreeMap<String, Object>();
-    m.put("name", XAttrHelper.getPrefixName(xAttr));
-    m.put("value", xAttr.getValue() != null ? 
+    m.put("name", XAttrHelper.getPrefixedName(xAttr));
+    m.put("value", xAttr.getValue() != null ?
         XAttrCodec.encodeValue(xAttr.getValue(), encoding) : null);
     return m;
   }
@@ -337,20 +374,69 @@ public class JsonUtil {
       final XAttrCodec encoding) throws IOException {
     final Map<String, Object> finalMap = new TreeMap<String, Object>();
     finalMap.put("XAttrs", toJsonArray(xAttrs, encoding));
-    ObjectMapper mapper = new ObjectMapper();
-    return mapper.writeValueAsString(finalMap);
+    return MAPPER.writeValueAsString(finalMap);
   }
   
   public static String toJsonString(final List<XAttr> xAttrs)
       throws IOException {
     final List<String> names = Lists.newArrayListWithCapacity(xAttrs.size());
     for (XAttr xAttr : xAttrs) {
-      names.add(XAttrHelper.getPrefixName(xAttr));
+      names.add(XAttrHelper.getPrefixedName(xAttr));
     }
-    ObjectMapper mapper = new ObjectMapper();
-    String ret = mapper.writeValueAsString(names);
+    String ret = MAPPER.writeValueAsString(names);
     final Map<String, Object> finalMap = new TreeMap<String, Object>();
     finalMap.put("XAttrNames", ret);
-    return mapper.writeValueAsString(finalMap);
+    return MAPPER.writeValueAsString(finalMap);
+  }
+
+  public static String toJsonString(Object obj) throws IOException {
+    return MAPPER.writeValueAsString(obj);
+  }
+
+  public static String toJsonString(BlockStoragePolicy[] storagePolicies) {
+    final Map<String, Object> blockStoragePolicies = new TreeMap<>();
+    Object[] a = null;
+    if (storagePolicies != null && storagePolicies.length > 0) {
+      a = new Object[storagePolicies.length];
+      for (int i = 0; i < storagePolicies.length; i++) {
+        a[i] = toJsonMap(storagePolicies[i]);
+      }
+    }
+    blockStoragePolicies.put("BlockStoragePolicy", a);
+    return toJsonString("BlockStoragePolicies", blockStoragePolicies);
+  }
+
+  private static Object toJsonMap(BlockStoragePolicy blockStoragePolicy) {
+    final Map<String, Object> m = new TreeMap<String, Object>();
+    m.put("id", blockStoragePolicy.getId());
+    m.put("name", blockStoragePolicy.getName());
+    m.put("storageTypes", blockStoragePolicy.getStorageTypes());
+    m.put("creationFallbacks", blockStoragePolicy.getCreationFallbacks());
+    m.put("replicationFallbacks", blockStoragePolicy.getReplicationFallbacks());
+    m.put("copyOnCreateFile", blockStoragePolicy.isCopyOnCreateFile());
+    return m;
+  }
+
+  public static String toJsonString(BlockStoragePolicy storagePolicy) {
+    return toJsonString(BlockStoragePolicy.class, toJsonMap(storagePolicy));
+  }
+
+  public static String toJsonString(FsServerDefaults serverDefaults) {
+    return toJsonString(FsServerDefaults.class, toJsonMap(serverDefaults));
+  }
+
+  private static Object toJsonMap(FsServerDefaults serverDefaults) {
+    final Map<String, Object> m = new HashMap<String, Object>();
+    m.put("blockSize", serverDefaults.getBlockSize());
+    m.put("bytesPerChecksum", serverDefaults.getBytesPerChecksum());
+    m.put("writePacketSize", serverDefaults.getWritePacketSize());
+    m.put("replication", serverDefaults.getReplication());
+    m.put("fileBufferSize", serverDefaults.getFileBufferSize());
+    m.put("encryptDataTransfer", serverDefaults.getEncryptDataTransfer());
+    m.put("trashInterval", serverDefaults.getTrashInterval());
+    m.put("checksumType", serverDefaults.getChecksumType().id);
+    m.put("keyProviderUri", serverDefaults.getKeyProviderUri());
+    m.put("defaultStoragePolicyId", serverDefaults.getDefaultStoragePolicyId());
+    return m;
   }
 }

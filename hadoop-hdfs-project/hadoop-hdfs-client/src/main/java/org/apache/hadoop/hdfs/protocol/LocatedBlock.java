@@ -20,6 +20,7 @@ package org.apache.hadoop.hdfs.protocol;
 import java.util.Arrays;
 import java.util.List;
 
+import com.google.common.base.Preconditions;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.fs.StorageType;
@@ -65,13 +66,13 @@ public class LocatedBlock {
   }
 
   public LocatedBlock(ExtendedBlock b, DatanodeInfo[] locs,
-                      String[] storageIDs, StorageType[] storageTypes) {
+      String[] storageIDs, StorageType[] storageTypes) {
     this(b, locs, storageIDs, storageTypes, -1, false, EMPTY_LOCS);
   }
 
   public LocatedBlock(ExtendedBlock b, DatanodeInfo[] locs, String[] storageIDs,
-                      StorageType[] storageTypes, long startOffset,
-                      boolean corrupt, DatanodeInfo[] cachedLocs) {
+      StorageType[] storageTypes, long startOffset,
+      boolean corrupt, DatanodeInfo[] cachedLocs) {
     this.b = b;
     this.offset = startOffset;
     this.corrupt = corrupt;
@@ -184,6 +185,9 @@ public class LocatedBlock {
     }
     // Not present in loc, add it and go
     cachedList.add(loc);
+    Preconditions.checkArgument(cachedLocs != EMPTY_LOCS,
+        "Cached locations should only be added when having a backing"
+            + " disk replica!", loc, locs.length, Arrays.toString(locs));
     cachedLocs = cachedList.toArray(cachedLocs);
   }
 

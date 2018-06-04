@@ -69,6 +69,7 @@ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.NodeId;
+import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.event.AsyncDispatcher;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.factories.RecordFactory;
@@ -526,6 +527,11 @@ public class TestRuntimeEstimators {
     public void setQueueName(String queueName) {
       // do nothing
     }
+
+    @Override
+    public void setJobPriority(Priority priority) {
+      // do nothing
+    }
   }
 
   /*
@@ -888,6 +894,16 @@ public class TestRuntimeEstimators {
     @Override
     public TaskAttemptFinishingMonitor getTaskAttemptFinishingMonitor() {
       return null;
+    }
+
+    @Override
+    public String getHistoryUrl() {
+      return null;
+    }
+
+    @Override
+    public void setHistoryUrl(String historyUrl) {
+      return;
     }
   }
 }

@@ -52,7 +52,7 @@ import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.AMRM
 import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.ApplicationAttemptStateDataProto;
 import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.ApplicationStateDataProto;
 import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.EpochProto;
-import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.ReservationAllocationStateProto;
+import org.apache.hadoop.yarn.proto.YarnProtos.ReservationAllocationStateProto;
 import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
 import org.apache.hadoop.yarn.server.records.Version;
 import org.apache.hadoop.yarn.server.records.impl.pb.VersionPBImpl;
@@ -718,7 +718,7 @@ public class FileSystemRMStateStore extends RMStateStore {
     new FSAction<Void>() {
       @Override
       public Void run() throws Exception {
-        fs.close();
+        IOUtils.closeStream(fs);
         return null;
       }
     }.runWithRetries();
@@ -863,18 +863,6 @@ public class FileSystemRMStateStore extends RMStateStore {
         "plan " + planName + " at path " + reservationPath);
     byte[] reservationData = reservationAllocation.toByteArray();
     writeFileWithRetries(reservationPath, reservationData, true);
-  }
-
-  @Override
-  protected void updateReservationState(
-      ReservationAllocationStateProto reservationAllocation, String planName,
-      String reservationIdName) throws Exception {
-    Path planCreatePath = getNodePath(reservationRoot, planName);
-    Path reservationPath = getNodePath(planCreatePath, reservationIdName);
-    LOG.info("Updating state for reservation " + reservationIdName + " from " +
-        "plan " + planName + " at path " + reservationPath);
-    byte[] reservationData = reservationAllocation.toByteArray();
-    updateFile(reservationPath, reservationData, true);
   }
 
   @Override

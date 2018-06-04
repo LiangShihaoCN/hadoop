@@ -70,7 +70,8 @@ public class FSLeafQueue extends FSQueue {
   private Resource amResourceUsage;
 
   private final ActiveUsersManager activeUsersManager;
-  
+  public static final List<FSQueue> EMPTY_LIST = Collections.emptyList();
+
   public FSLeafQueue(String name, FairScheduler scheduler,
       FSParentQueue parent) {
     super(name, scheduler, parent);
@@ -330,7 +331,7 @@ public class FSLeafQueue extends FSQueue {
       readLock.unlock();
     }
     for (FSAppAttempt sched : pendingForResourceApps) {
-      if (SchedulerAppUtils.isBlacklisted(sched, node, LOG)) {
+      if (SchedulerAppUtils.isPlaceBlacklisted(sched, node, LOG)) {
         continue;
       }
       assigned = sched.assignContainer(node);
@@ -350,7 +351,7 @@ public class FSLeafQueue extends FSQueue {
     RMContainer toBePreempted = null;
 
     // If this queue is not over its fair share, reject
-    if (!preemptContainerPreCheck()) {
+    if (!canBePreempted()) {
       return toBePreempted;
     }
 
@@ -383,7 +384,7 @@ public class FSLeafQueue extends FSQueue {
 
   @Override
   public List<FSQueue> getChildQueues() {
-    return new ArrayList<FSQueue>(1);
+    return EMPTY_LIST;
   }
   
   @Override
@@ -530,16 +531,6 @@ public class FSLeafQueue extends FSQueue {
   public void setWeights(float weight) {
     scheduler.getAllocationConfiguration().setQueueWeight(getName(),
         new ResourceWeights(weight));
-  }
-
-  /**
-   * Helper method to check if the queue should preempt containers
-   *
-   * @return true if check passes (can preempt) or false otherwise
-   */
-  private boolean preemptContainerPreCheck() {
-    return parent.getPolicy().checkIfUsageOverFairShare(getResourceUsage(),
-        getFairShare());
   }
 
   /**

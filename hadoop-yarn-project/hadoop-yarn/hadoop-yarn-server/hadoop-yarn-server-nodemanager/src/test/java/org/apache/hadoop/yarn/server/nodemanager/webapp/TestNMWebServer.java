@@ -212,13 +212,14 @@ public class TestNMWebServer {
           recordFactory.newRecordInstance(ContainerLaunchContext.class);
       long currentTime = System.currentTimeMillis();
       Token containerToken =
-          BuilderUtils.newContainerToken(containerId, "127.0.0.1", 1234, user,
-            BuilderUtils.newResource(1024, 1), currentTime + 10000L, 123,
-            "password".getBytes(), currentTime);
+          BuilderUtils.newContainerToken(containerId, 0, "127.0.0.1", 1234,
+              user, BuilderUtils.newResource(1024, 1), currentTime + 10000L,
+              123, "password".getBytes(), currentTime);
+      Context context = mock(Context.class);
       Container container =
-          new ContainerImpl(conf, dispatcher, stateStore, launchContext,
+          new ContainerImpl(conf, dispatcher, launchContext,
             null, metrics,
-            BuilderUtils.newContainerTokenIdentifier(containerToken)) {
+            BuilderUtils.newContainerTokenIdentifier(containerToken), context) {
 
             @Override
             public ContainerState getContainerState() {
@@ -248,7 +249,7 @@ public class TestNMWebServer {
     containerLogDir.mkdirs();
     for (String fileType : new String[] { "stdout", "stderr", "syslog" }) {
       Writer writer = new FileWriter(new File(containerLogDir, fileType));
-      writer.write(ConverterUtils.toString(containerId) + "\n Hello "
+      writer.write(containerId.toString() + "\n Hello "
           + fileType + "!");
       writer.close();
     }

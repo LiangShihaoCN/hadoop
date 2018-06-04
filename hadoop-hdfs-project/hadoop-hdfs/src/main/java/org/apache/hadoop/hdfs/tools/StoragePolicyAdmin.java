@@ -144,9 +144,11 @@ public class StoragePolicyAdmin extends Configured implements Tool {
         return 1;
       }
 
-      final DistributedFileSystem dfs = AdminHelper.getDFS(conf);
+      Path p = new Path(path);
+      final DistributedFileSystem dfs = AdminHelper.getDFS(p.toUri(), conf);
       try {
-        HdfsFileStatus status = dfs.getClient().getFileInfo(path);
+        HdfsFileStatus status = dfs.getClient().getFileInfo(
+            Path.getPathWithoutSchemeAndAuthority(p).toString());
         if (status == null) {
           System.err.println("File/Directory does not exist: " + path);
           return 2;
@@ -157,9 +159,9 @@ public class StoragePolicyAdmin extends Configured implements Tool {
           return 0;
         }
         Collection<BlockStoragePolicy> policies = dfs.getAllStoragePolicies();
-        for (BlockStoragePolicy p : policies) {
-          if (p.getId() == storagePolicyId) {
-            System.out.println("The storage policy of " + path + ":\n" + p);
+        for (BlockStoragePolicy policy : policies) {
+          if (policy.getId() == storagePolicyId) {
+            System.out.println("The storage policy of " + path + ":\n" + policy);
             return 0;
           }
         }
@@ -211,11 +213,57 @@ public class StoragePolicyAdmin extends Configured implements Tool {
             getLongUsage());
         return 1;
       }
-
-      final DistributedFileSystem dfs = AdminHelper.getDFS(conf);
+      Path p = new Path(path);
+      final DistributedFileSystem dfs = AdminHelper.getDFS(p.toUri(), conf);
       try {
-        dfs.setStoragePolicy(new Path(path), policyName);
+        dfs.setStoragePolicy(p, policyName);
         System.out.println("Set storage policy " + policyName + " on " + path);
+      } catch (Exception e) {
+        System.err.println(AdminHelper.prettifyException(e));
+        return 2;
+      }
+      return 0;
+    }
+  }
+
+  /* Command to unset the storage policy set for a file/directory */
+  private static class UnsetStoragePolicyCommand
+      implements AdminHelper.Command {
+
+    @Override
+    public String getName() {
+      return "-unsetStoragePolicy";
+    }
+
+    @Override
+    public String getShortUsage() {
+      return "[" + getName() + " -path <path>]\n";
+    }
+
+    @Override
+    public String getLongUsage() {
+      TableListing listing = AdminHelper.getOptionDescriptionListing();
+      listing.addRow("<path>", "The path of the file/directory "
+          + "from which the storage policy will be unset.");
+      return getShortUsage() + "\n"
+          + "Unset the storage policy set for a file/directory.\n\n"
+          + listing.toString();
+    }
+
+    @Override
+    public int run(Configuration conf, List<String> args) throws IOException {
+      final String path = StringUtils.popOptionWithArgument("-path", args);
+      if (path == null) {
+        System.err.println("Please specify the path from which "
+            + "the storage policy will be unsetd.\nUsage: " + getLongUsage());
+        return 1;
+      }
+
+      Path p = new Path(path);
+      final DistributedFileSystem dfs = AdminHelper.getDFS(p.toUri(), conf);
+      try {
+        dfs.unsetStoragePolicy(p);
+        System.out.println("Unset storage policy from " + path);
       } catch (Exception e) {
         System.err.println(AdminHelper.prettifyException(e));
         return 2;
@@ -227,6 +275,7 @@ public class StoragePolicyAdmin extends Configured implements Tool {
   private static final AdminHelper.Command[] COMMANDS = {
       new ListStoragePoliciesCommand(),
       new SetStoragePolicyCommand(),
-      new GetStoragePolicyCommand()
+      new GetStoragePolicyCommand(),
+      new UnsetStoragePolicyCommand()
   };
 }

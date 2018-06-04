@@ -36,6 +36,7 @@ import org.apache.hadoop.hdfs.DFSUtilClient;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
+import org.apache.hadoop.hdfs.server.blockmanagement.BlockUnderConstructionFeature;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.server.namenode.INodeReference.DstReference;
@@ -419,16 +420,18 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
 
   /** Compute {@link ContentSummary}. Blocking call */
   public final ContentSummary computeContentSummary(BlockStoragePolicySuite bsps) {
-    return computeAndConvertContentSummary(
+    return computeAndConvertContentSummary(Snapshot.CURRENT_STATE_ID,
         new ContentSummaryComputationContext(bsps));
   }
 
   /**
    * Compute {@link ContentSummary}. 
    */
-  public final ContentSummary computeAndConvertContentSummary(
+  public final ContentSummary computeAndConvertContentSummary(int snapshotId,
       ContentSummaryComputationContext summary) {
-    ContentCounts counts = computeContentSummary(summary).getCounts();
+    computeContentSummary(snapshotId, summary);
+    final ContentCounts counts = summary.getCounts();
+    final ContentCounts snapshotCounts = summary.getSnapshotCounts();
     final QuotaCounts q = getQuotaCounts();
     return new ContentSummary.Builder().
         length(counts.getLength()).
@@ -439,17 +442,26 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
         spaceQuota(q.getStorageSpace()).
         typeConsumed(counts.getTypeSpaces()).
         typeQuota(q.getTypeSpaces().asArray()).
+        snapshotLength(snapshotCounts.getLength()).
+        snapshotFileCount(snapshotCounts.getFileCount()).
+        snapshotDirectoryCount(snapshotCounts.getDirectoryCount()).
+        snapshotSpaceConsumed(snapshotCounts.getStoragespace()).
         build();
   }
 
   /**
    * Count subtree content summary with a {@link ContentCounts}.
    *
+   * @param snapshotId Specify the time range for the calculation. If this
+   *                   parameter equals to {@link Snapshot#CURRENT_STATE_ID},
+   *                   the result covers both the current states and all the
+   *                   snapshots. Otherwise the result only covers all the
+   *                   files/directories contained in the specific snapshot.
    * @param summary the context object holding counts for the subtree.
    * @return The same objects as summary.
    */
   public abstract ContentSummaryComputationContext computeContentSummary(
-      ContentSummaryComputationContext summary);
+      int snapshotId, ContentSummaryComputationContext summary);
 
 
   /**
@@ -563,9 +575,39 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
 
   public String getFullPathName() {
     // Get the full path name of this inode.
-    return FSDirectory.getFullPathName(this);
+    if (isRoot()) {
+      return Path.SEPARATOR;
+    }
+    // compute size of needed bytes for the path
+    int idx = 0;
+    for (INode inode = this; inode != null; inode = inode.getParent()) {
+      // add component + delimiter (if not tail component)
+      idx += inode.getLocalNameBytes().length + (inode != this ? 1 : 0);
+    }
+    byte[] path = new byte[idx];
+    for (INode inode = this; inode != null; inode = inode.getParent()) {
+      if (inode != this) {
+        path[--idx] = Path.SEPARATOR_CHAR;
+      }
+      byte[] name = inode.getLocalNameBytes();
+      idx -= name.length;
+      System.arraycopy(name, 0, path, idx, name.length);
+    }
+    return DFSUtil.bytes2String(path);
   }
-  
+
+  public byte[][] getPathComponents() {
+    int n = 0;
+    for (INode inode = this; inode != null; inode = inode.getParent()) {
+      n++;
+    }
+    byte[][] components = new byte[n][];
+    for (INode inode = this; inode != null; inode = inode.getParent()) {
+      components[--n] = inode.getLocalNameBytes();
+    }
+    return components;
+  }
+
   @Override
   public String toString() {
     return getLocalName();
@@ -721,18 +763,8 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
    */
   @VisibleForTesting
   public static byte[][] getPathComponents(String path) {
-    return getPathComponents(getPathNames(path));
-  }
-
-  /** Convert strings to byte arrays for path components. */
-  static byte[][] getPathComponents(String[] strings) {
-    if (strings.length == 0) {
-      return new byte[][]{null};
-    }
-    byte[][] bytes = new byte[strings.length][];
-    for (int i = 0; i < strings.length; i++)
-      bytes[i] = DFSUtil.string2Bytes(strings[i]);
-    return bytes;
+    checkAbsolutePath(path);
+    return DFSUtil.getPathComponents(path);
   }
 
   /**
@@ -741,10 +773,24 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
    * @return array of path components.
    */
   public static String[] getPathNames(String path) {
-    if (path == null || !path.startsWith(Path.SEPARATOR)) {
-      throw new AssertionError("Absolute path required");
-    }
+    checkAbsolutePath(path);
     return StringUtils.split(path, Path.SEPARATOR_CHAR);
+  }
+
+  /**
+   * Verifies if the path informed is a valid absolute path.
+   * @param path the absolute path to validate.
+   * @return true if the path is valid.
+   */
+  static boolean isValidAbsolutePath(final String path){
+    return path != null && path.startsWith(Path.SEPARATOR);
+  }
+
+  private static void checkAbsolutePath(final String path) {
+    if (!isValidAbsolutePath(path)) {
+      throw new AssertionError("Absolute path required, but got '"
+          + path + "'");
+    }
   }
 
   @Override
@@ -901,15 +947,14 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
 
     /**
      * @param bsps
-     *          block storage policy suite to calculate intended storage type
-     *          usage
+ *          block storage policy suite to calculate intended storage type
+ *          usage
      * @param collectedBlocks
-     *          blocks collected from the descents for further block
-     *          deletion/update will be added to the given map.
+*          blocks collected from the descents for further block
+*          deletion/update will be added to the given map.
      * @param removedINodes
- *          INodes collected from the descents for further cleaning up of
+*          INodes collected from the descents for further cleaning up of
      * @param removedUCFiles
-     *      files that the NN need to remove the leases
      */
     public ReclaimContext(
         BlockStoragePolicySuite bsps, BlocksMapUpdateInfo collectedBlocks,
@@ -948,12 +993,43 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
    */
   public static class BlocksMapUpdateInfo {
     /**
+     * The blocks whose replication factor need to be updated.
+     */
+    public static class UpdatedReplicationInfo {
+      /**
+       * the expected replication after the update.
+       */
+      private final short targetReplication;
+      /**
+       * The block whose replication needs to be updated.
+       */
+      private final BlockInfo block;
+
+      public UpdatedReplicationInfo(short targetReplication, BlockInfo block) {
+        this.targetReplication = targetReplication;
+        this.block = block;
+      }
+
+      public BlockInfo block() {
+        return block;
+      }
+
+      public short targetReplication() {
+        return targetReplication;
+      }
+    }
+    /**
      * The list of blocks that need to be removed from blocksMap
      */
     private final List<BlockInfo> toDeleteList;
+    /**
+     * The list of blocks whose replication factor needs to be adjusted
+     */
+    private final List<UpdatedReplicationInfo> toUpdateReplicationInfo;
 
     public BlocksMapUpdateInfo() {
       toDeleteList = new ChunkedArrayList<>();
+      toUpdateReplicationInfo = new ChunkedArrayList<>();
     }
     
     /**
@@ -962,7 +1038,11 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
     public List<BlockInfo> getToDeleteList() {
       return toDeleteList;
     }
-    
+
+    public List<UpdatedReplicationInfo> toUpdateReplicationInfo() {
+      return toUpdateReplicationInfo;
+    }
+
     /**
      * Add a to-be-deleted block into the
      * {@link BlocksMapUpdateInfo#toDeleteList}
@@ -970,14 +1050,25 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
      */
     public void addDeleteBlock(BlockInfo toDelete) {
       assert toDelete != null : "toDelete is null";
+      toDelete.delete();
       toDeleteList.add(toDelete);
+      // If the file is being truncated
+      // the copy-on-truncate block should also be collected for deletion
+      BlockUnderConstructionFeature uc = toDelete.getUnderConstructionFeature();
+      if(uc == null) {
+        return;
+      }
+      BlockInfo truncateBlock = uc.getTruncateBlock();
+      if(truncateBlock == null || truncateBlock.equals(toDelete)) {
+        return;
+      }
+      addDeleteBlock(truncateBlock);
     }
 
-    public void removeDeleteBlock(BlockInfo block) {
-      assert block != null : "block is null";
-      toDeleteList.remove(block);
+    public void addUpdateReplicationFactor(BlockInfo block, short targetRepl) {
+      toUpdateReplicationInfo.add(
+          new UpdatedReplicationInfo(targetRepl, block));
     }
-
     /**
      * Clear {@link BlocksMapUpdateInfo#toDeleteList}
      */

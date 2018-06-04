@@ -120,6 +120,7 @@ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.NodeState;
+import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.state.InvalidStateTransitionException;
@@ -129,6 +130,7 @@ import org.apache.hadoop.yarn.state.StateMachine;
 import org.apache.hadoop.yarn.state.StateMachineFactory;
 import org.apache.hadoop.yarn.util.Clock;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /** Implementation of Job interface. Maintains the state machines of Job.
@@ -416,7 +418,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
           .addTransition(JobStateInternal.COMMITTING,
               JobStateInternal.COMMITTING,
               EnumSet.of(JobEventType.JOB_UPDATED_NODES,
-                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE))
+                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
+                  JobEventType.JOB_TASK_ATTEMPT_COMPLETED,
+                  JobEventType.JOB_MAP_TASK_RESCHEDULED))
 
           // Transitions from SUCCEEDED state
           .addTransition(JobStateInternal.SUCCEEDED, JobStateInternal.SUCCEEDED,
@@ -639,6 +643,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
   private float reduceProgress;
   private float cleanupProgress;
   private boolean isUber = false;
+  private boolean finishJobWhenReducersDone;
+  private boolean completingJob = false;
 
   private Credentials jobCredentials;
   private Token<JobTokenIdentifier> jobToken;
@@ -651,6 +657,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
   private ScheduledFuture failWaitTriggerScheduledFuture;
 
   private JobState lastNonFinalState = JobState.NEW;
+
+  private volatile Priority jobPriority = Priority.newInstance(0);
 
   public JobImpl(JobId jobId, ApplicationAttemptId applicationAttemptId,
       Configuration conf, EventHandler eventHandler,
@@ -710,6 +718,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
     this.maxFetchFailuresNotifications = conf.getInt(
         MRJobConfig.MAX_FETCH_FAILURES_NOTIFICATIONS,
         MRJobConfig.DEFAULT_MAX_FETCH_FAILURES_NOTIFICATIONS);
+    this.finishJobWhenReducersDone = conf.getBoolean(
+        MRJobConfig.FINISH_JOB_WHEN_REDUCERS_DONE,
+        MRJobConfig.DEFAULT_FINISH_JOB_WHEN_REDUCERS_DONE);
   }
 
   protected StateMachine<JobStateInternal, JobEventType, JobEvent> getStateMachine() {
@@ -877,7 +888,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
           reporterUserName,
           state, appSubmitTime, startTime, finishTime, setupProgress,
           this.mapProgress, this.reduceProgress,
-          cleanupProgress, jobFile, amInfos, isUber, diagsb.toString());
+          cleanupProgress, jobFile, amInfos, isUber, diagsb.toString(),
+          jobPriority);
       return report;
     } finally {
       readLock.unlock();
@@ -1328,20 +1340,32 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
   
   private void actOnUnusableNode(NodeId nodeId, NodeState nodeState) {
     // rerun previously successful map tasks
-    List<TaskAttemptId> taskAttemptIdList = nodesToSucceededTaskAttempts.get(nodeId);
-    if(taskAttemptIdList != null) {
-      String mesg = "TaskAttempt killed because it ran on unusable node "
-          + nodeId;
-      for(TaskAttemptId id : taskAttemptIdList) {
-        if(TaskType.MAP == id.getTaskId().getTaskType()) {
-          // reschedule only map tasks because their outputs maybe unusable
-          LOG.info(mesg + ". AttemptId:" + id);
-          eventHandler.handle(new TaskAttemptKillEvent(id, mesg));
+    // do this only if the job is still in the running state and there are
+    // running reducers
+    if (getInternalState() == JobStateInternal.RUNNING &&
+        !allReducersComplete()) {
+      List<TaskAttemptId> taskAttemptIdList =
+          nodesToSucceededTaskAttempts.get(nodeId);
+      if (taskAttemptIdList != null) {
+        String mesg = "TaskAttempt killed because it ran on unusable node "
+            + nodeId;
+        for (TaskAttemptId id : taskAttemptIdList) {
+          if (TaskType.MAP == id.getTaskId().getTaskType()) {
+            // reschedule only map tasks because their outputs maybe unusable
+            LOG.info(mesg + ". AttemptId:" + id);
+            // Kill the attempt and indicate that next map attempt should be
+            // rescheduled (i.e. considered as a fast fail map).
+            eventHandler.handle(new TaskAttemptKillEvent(id, mesg, true));
+          }
         }
       }
     }
     // currently running task attempts on unusable nodes are handled in
     // RMContainerAllocator
+  }
+
+  private boolean allReducersComplete() {
+    return numReduceTasks == 0 || numReduceTasks == getCompletedReduces();
   }
 
   /*
@@ -1999,7 +2023,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
                 TimeUnit.MILLISECONDS);
         return JobStateInternal.FAIL_WAIT;
       }
-      
+
+      checkReadyForCompletionWhenAllReducersDone(job);
+
       return job.checkReadyForCommit();
     }
 
@@ -2029,6 +2055,32 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
         job.killedReduceTaskCount++;
       }
       job.metrics.killedTask(task);
+    }
+
+   /** Improvement: if all reducers have finished, we check if we have
+       restarted mappers that are still running. This can happen in a
+       situation when a node becomes UNHEALTHY and mappers are rescheduled.
+       See MAPREDUCE-6870 for details */
+    private void checkReadyForCompletionWhenAllReducersDone(JobImpl job) {
+      if (job.finishJobWhenReducersDone) {
+        int totalReduces = job.getTotalReduces();
+        int completedReduces = job.getCompletedReduces();
+
+        if (totalReduces > 0 && totalReduces == completedReduces
+            && !job.completingJob) {
+
+          for (TaskId mapTaskId : job.mapTasks) {
+            MapTaskImpl task = (MapTaskImpl) job.tasks.get(mapTaskId);
+            if (!task.isFinished()) {
+              LOG.info("Killing map task " + task.getID());
+              job.eventHandler.handle(
+                  new TaskEvent(task.getID(), TaskEventType.T_KILL));
+            }
+          }
+
+          job.completingJob = true;
+        }
+      }
     }
   }
 
@@ -2082,13 +2134,18 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
     }
   }
 
+  @VisibleForTesting
+  void decrementSucceededMapperCount() {
+    completedTaskCount--;
+    succeededMapTaskCount--;
+  }
+
   private static class MapTaskRescheduledTransition implements
       SingleArcTransition<JobImpl, JobEvent> {
     @Override
     public void transition(JobImpl job, JobEvent event) {
       //succeeded map task is restarted back
-      job.completedTaskCount--;
-      job.succeededMapTaskCount--;
+      job.decrementSucceededMapperCount();
     }
   }
 
@@ -2148,7 +2205,7 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
       }
     }
   }
-  
+
   private static class InternalTerminationTransition implements
       SingleArcTransition<JobImpl, JobEvent> {
     JobStateInternal terminationState = null;
@@ -2200,5 +2257,10 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
 
   public int getMaxFetchFailuresNotifications() {
     return maxFetchFailuresNotifications;
+  }
+
+  @Override
+  public void setJobPriority(Priority priority) {
+    this.jobPriority = priority;
   }
 }

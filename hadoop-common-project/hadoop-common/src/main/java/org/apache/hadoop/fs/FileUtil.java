@@ -381,6 +381,7 @@ public class FileUtil {
   
   }
 
+  @Deprecated
   /** Copy all files in a directory to one output file (merge). */
   public static boolean copyMerge(FileSystem srcFS, Path srcDir, 
                                   FileSystem dstFS, Path dstFile, 
@@ -738,15 +739,15 @@ public class FileUtil {
 
     int count;
     byte data[] = new byte[2048];
-    BufferedOutputStream outputStream = new BufferedOutputStream(
-        new FileOutputStream(outputFile));
+    try (BufferedOutputStream outputStream = new BufferedOutputStream(
+        new FileOutputStream(outputFile));) {
 
-    while ((count = tis.read(data)) != -1) {
-      outputStream.write(data, 0, count);
+      while ((count = tis.read(data)) != -1) {
+        outputStream.write(data, 0, count);
+      }
+
+      outputStream.flush();
     }
-
-    outputStream.flush();
-    outputStream.close();
   }
   
   /**
@@ -779,35 +780,6 @@ public class FileUtil {
         Path.getPathWithoutSchemeAndAuthority(new Path(target)).toString());
     File linkFile = new File(
         Path.getPathWithoutSchemeAndAuthority(new Path(linkname)).toString());
-
-    // If not on Java7+, copy a file instead of creating a symlink since
-    // Java6 has close to no support for symlinks on Windows. Specifically
-    // File#length and File#renameTo do not work as expected.
-    // (see HADOOP-9061 for additional details)
-    // We still create symlinks for directories, since the scenario in this
-    // case is different. The directory content could change in which
-    // case the symlink loses its purpose (for example task attempt log folder
-    // is symlinked under userlogs and userlogs are generated afterwards).
-    if (Shell.WINDOWS && !Shell.isJava7OrAbove() && targetFile.isFile()) {
-      try {
-        LOG.warn("FileUtil#symlink: On Windows+Java6, copying file instead " +
-            "of creating a symlink. Copying " + target + " -> " + linkname);
-
-        if (!linkFile.getParentFile().exists()) {
-          LOG.warn("Parent directory " + linkFile.getParent() +
-              " does not exist.");
-          return 1;
-        } else {
-          org.apache.commons.io.FileUtils.copyFile(targetFile, linkFile);
-        }
-      } catch (IOException ex) {
-        LOG.warn("FileUtil#symlink failed to copy the file with error: "
-            + ex.getMessage());
-        // Exit with non-zero exit code
-        return 1;
-      }
-      return 0;
-    }
 
     String[] cmd = Shell.getSymlinkCommand(
         targetFile.toString(),

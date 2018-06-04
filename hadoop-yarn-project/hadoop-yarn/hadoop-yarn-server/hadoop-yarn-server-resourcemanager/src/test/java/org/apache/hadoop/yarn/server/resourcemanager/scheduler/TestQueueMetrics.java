@@ -37,6 +37,7 @@ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo.FifoScheduler;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
@@ -72,8 +73,10 @@ public class TestQueueMetrics {
     metrics.submitAppAttempt(user);
     checkApps(queueSource, 1, 1, 0, 0, 0, 0, true);
 
-    metrics.setAvailableResourcesToQueue(Resources.createResource(100*GB, 100));
-    metrics.incrPendingResources(user, 5, Resources.createResource(3*GB, 3));
+    metrics.setAvailableResourcesToQueue(RMNodeLabelsManager.NO_LABEL,
+        Resources.createResource(100*GB, 100));
+    metrics.incrPendingResources(RMNodeLabelsManager.NO_LABEL,
+        user, 5, Resources.createResource(3*GB, 3));
     // Available resources is set externally, as it depends on dynamic
     // configurable cluster/queue resources
     checkResources(queueSource, 0, 0, 0, 0, 0, 100*GB, 100, 15*GB, 15, 5, 0, 0, 0);
@@ -81,11 +84,23 @@ public class TestQueueMetrics {
     metrics.runAppAttempt(app.getApplicationId(), user);
     checkApps(queueSource, 1, 0, 1, 0, 0, 0, true);
 
-    metrics.allocateResources(user, 3, Resources.createResource(2*GB, 2), true);
+    metrics.allocateResources(RMNodeLabelsManager.NO_LABEL,
+        user, 3, Resources.createResource(2*GB, 2), true);
     checkResources(queueSource, 6*GB, 6, 3, 3, 0, 100*GB, 100, 9*GB, 9, 2, 0, 0, 0);
 
-    metrics.releaseResources(user, 1, Resources.createResource(2*GB, 2));
+    metrics.releaseResources(RMNodeLabelsManager.NO_LABEL,
+        user, 1, Resources.createResource(2*GB, 2));
     checkResources(queueSource, 4*GB, 4, 2, 3, 1, 100*GB, 100, 9*GB, 9, 2, 0, 0, 0);
+
+    metrics.incrPendingResources(RMNodeLabelsManager.NO_LABEL,
+        user, 0, Resources.createResource(2 * GB, 2));
+    checkResources(queueSource, 4 * GB, 4, 2, 3, 1, 100 * GB, 100, 9 * GB, 9, 2,
+        0, 0, 0);
+
+    metrics.decrPendingResources(RMNodeLabelsManager.NO_LABEL,
+        user, 0, Resources.createResource(2 * GB, 2));
+    checkResources(queueSource, 4 * GB, 4, 2, 3, 1, 100 * GB, 100, 9 * GB, 9, 2,
+        0, 0, 0);
 
     metrics.finishAppAttempt(
         app.getApplicationId(), app.isPending(), app.getUser());
@@ -169,9 +184,12 @@ public class TestQueueMetrics {
     checkApps(queueSource, 1, 1, 0, 0, 0, 0, true);
     checkApps(userSource, 1, 1, 0, 0, 0, 0, true);
 
-    metrics.setAvailableResourcesToQueue(Resources.createResource(100*GB, 100));
-    metrics.setAvailableResourcesToUser(user, Resources.createResource(10*GB, 10));
-    metrics.incrPendingResources(user, 5, Resources.createResource(3*GB, 3));
+    metrics.setAvailableResourcesToQueue(RMNodeLabelsManager.NO_LABEL,
+        Resources.createResource(100*GB, 100));
+    metrics.setAvailableResourcesToUser(RMNodeLabelsManager.NO_LABEL,
+        user, Resources.createResource(10*GB, 10));
+    metrics.incrPendingResources(RMNodeLabelsManager.NO_LABEL,
+        user, 5, Resources.createResource(3*GB, 3));
     // Available resources is set externally, as it depends on dynamic
     // configurable cluster/queue resources
     checkResources(queueSource, 0, 0, 0, 0, 0,  100*GB, 100, 15*GB, 15, 5, 0, 0, 0);
@@ -181,11 +199,13 @@ public class TestQueueMetrics {
     checkApps(queueSource, 1, 0, 1, 0, 0, 0, true);
     checkApps(userSource, 1, 0, 1, 0, 0, 0, true);
 
-    metrics.allocateResources(user, 3, Resources.createResource(2*GB, 2), true);
+    metrics.allocateResources(RMNodeLabelsManager.NO_LABEL,
+        user, 3, Resources.createResource(2*GB, 2), true);
     checkResources(queueSource, 6*GB, 6, 3, 3, 0, 100*GB, 100, 9*GB, 9, 2, 0, 0, 0);
     checkResources(userSource, 6*GB, 6, 3, 3, 0, 10*GB, 10, 9*GB, 9, 2, 0, 0, 0);
 
-    metrics.releaseResources(user, 1, Resources.createResource(2*GB, 2));
+    metrics.releaseResources(RMNodeLabelsManager.NO_LABEL,
+        user, 1, Resources.createResource(2*GB, 2));
     checkResources(queueSource, 4*GB, 4, 2, 3, 1, 100*GB, 100, 9*GB, 9, 2, 0, 0, 0);
     checkResources(userSource, 4*GB, 4, 2, 3, 1, 10*GB, 10, 9*GB, 9, 2, 0, 0, 0);
 
@@ -197,6 +217,53 @@ public class TestQueueMetrics {
     checkApps(queueSource, 1, 0, 0, 1, 0, 0, true);
     checkApps(userSource, 1, 0, 0, 1, 0, 0, true);
   }
+
+
+  @Test public void testNodeTypeMetrics() {
+    String parentQueueName = "root";
+    String leafQueueName = "root.leaf";
+    String user = "alice";
+
+    QueueMetrics parentMetrics =
+      QueueMetrics.forQueue(ms, parentQueueName, null, true, conf);
+    Queue parentQueue = make(stub(Queue.class).returning(parentMetrics).
+        from.getMetrics());
+    QueueMetrics metrics =
+      QueueMetrics.forQueue(ms, leafQueueName, parentQueue, true, conf);
+    MetricsSource parentQueueSource = queueSource(ms, parentQueueName);
+    MetricsSource queueSource = queueSource(ms, leafQueueName);
+    //AppSchedulingInfo app = mockApp(user);
+
+    metrics.submitApp(user);
+    MetricsSource userSource = userSource(ms, leafQueueName, user);
+    MetricsSource parentUserSource = userSource(ms, parentQueueName, user);
+
+    metrics.incrNodeTypeAggregations(user, NodeType.NODE_LOCAL);
+    checkAggregatedNodeTypes(queueSource,1L,0L,0L);
+    checkAggregatedNodeTypes(parentQueueSource,1L,0L,0L);
+    checkAggregatedNodeTypes(userSource,1L,0L,0L);
+    checkAggregatedNodeTypes(parentUserSource,1L,0L,0L);
+
+    metrics.incrNodeTypeAggregations(user, NodeType.RACK_LOCAL);
+    checkAggregatedNodeTypes(queueSource,1L,1L,0L);
+    checkAggregatedNodeTypes(parentQueueSource,1L,1L,0L);
+    checkAggregatedNodeTypes(userSource,1L,1L,0L);
+    checkAggregatedNodeTypes(parentUserSource,1L,1L,0L);
+
+    metrics.incrNodeTypeAggregations(user, NodeType.OFF_SWITCH);
+    checkAggregatedNodeTypes(queueSource,1L,1L,1L);
+    checkAggregatedNodeTypes(parentQueueSource,1L,1L,1L);
+    checkAggregatedNodeTypes(userSource,1L,1L,1L);
+    checkAggregatedNodeTypes(parentUserSource,1L,1L,1L);
+
+    metrics.incrNodeTypeAggregations(user, NodeType.OFF_SWITCH);
+    checkAggregatedNodeTypes(queueSource,1L,1L,2L);
+    checkAggregatedNodeTypes(parentQueueSource,1L,1L,2L);
+    checkAggregatedNodeTypes(userSource,1L,1L,2L);
+    checkAggregatedNodeTypes(parentUserSource,1L,1L,2L);
+
+  }
+
 
   @Test public void testTwoLevelWithUserMetrics() {
     String parentQueueName = "root";
@@ -228,11 +295,16 @@ public class TestQueueMetrics {
     checkApps(userSource, 1, 1, 0, 0, 0, 0, true);
     checkApps(parentUserSource, 1, 1, 0, 0, 0, 0, true);
 
-    parentMetrics.setAvailableResourcesToQueue(Resources.createResource(100*GB, 100));
-    metrics.setAvailableResourcesToQueue(Resources.createResource(100*GB, 100));
-    parentMetrics.setAvailableResourcesToUser(user, Resources.createResource(10*GB, 10));
-    metrics.setAvailableResourcesToUser(user, Resources.createResource(10*GB, 10));
-    metrics.incrPendingResources(user, 5, Resources.createResource(3*GB, 3));
+    parentMetrics.setAvailableResourcesToQueue(RMNodeLabelsManager.NO_LABEL,
+        Resources.createResource(100*GB, 100));
+    metrics.setAvailableResourcesToQueue(RMNodeLabelsManager.NO_LABEL,
+        Resources.createResource(100*GB, 100));
+    parentMetrics.setAvailableResourcesToUser(RMNodeLabelsManager.NO_LABEL,
+        user, Resources.createResource(10*GB, 10));
+    metrics.setAvailableResourcesToUser(RMNodeLabelsManager.NO_LABEL,
+        user, Resources.createResource(10*GB, 10));
+    metrics.incrPendingResources(RMNodeLabelsManager.NO_LABEL,
+        user, 5, Resources.createResource(3*GB, 3));
     checkResources(queueSource, 0, 0, 0, 0, 0, 100*GB, 100, 15*GB, 15, 5, 0, 0, 0);
     checkResources(parentQueueSource, 0, 0, 0, 0, 0, 100*GB, 100, 15*GB, 15, 5, 0, 0, 0);
     checkResources(userSource, 0, 0, 0, 0, 0, 10*GB, 10, 15*GB, 15, 5, 0, 0, 0);
@@ -242,8 +314,10 @@ public class TestQueueMetrics {
     checkApps(queueSource, 1, 0, 1, 0, 0, 0, true);
     checkApps(userSource, 1, 0, 1, 0, 0, 0, true);
 
-    metrics.allocateResources(user, 3, Resources.createResource(2*GB, 2), true);
-    metrics.reserveResource(user, Resources.createResource(3*GB, 3));
+    metrics.allocateResources(RMNodeLabelsManager.NO_LABEL,
+        user, 3, Resources.createResource(2*GB, 2), true);
+    metrics.reserveResource(RMNodeLabelsManager.NO_LABEL,
+        user, Resources.createResource(3*GB, 3));
     // Available resources is set externally, as it depends on dynamic
     // configurable cluster/queue resources
     checkResources(queueSource, 6*GB, 6, 3, 3, 0, 100*GB, 100, 9*GB, 9, 2, 3*GB, 3, 1);
@@ -251,8 +325,10 @@ public class TestQueueMetrics {
     checkResources(userSource, 6*GB, 6, 3, 3, 0, 10*GB, 10, 9*GB, 9, 2, 3*GB, 3, 1);
     checkResources(parentUserSource, 6*GB, 6, 3, 3, 0, 10*GB, 10, 9*GB, 9, 2, 3*GB, 3, 1);
 
-    metrics.releaseResources(user, 1, Resources.createResource(2*GB, 2));
-    metrics.unreserveResource(user, Resources.createResource(3*GB, 3));
+    metrics.releaseResources(RMNodeLabelsManager.NO_LABEL,
+        user, 1, Resources.createResource(2*GB, 2));
+    metrics.unreserveResource(RMNodeLabelsManager.NO_LABEL,
+          user, Resources.createResource(3*GB, 3));
     checkResources(queueSource, 4*GB, 4, 2, 3, 1, 100*GB, 100, 9*GB, 9, 2, 0, 0, 0);
     checkResources(parentQueueSource, 4*GB, 4, 2, 3, 1, 100*GB, 100, 9*GB, 9, 2, 0, 0, 0);
     checkResources(userSource, 4*GB, 4, 2, 3, 1, 10*GB, 10, 9*GB, 9, 2, 0, 0, 0);
@@ -346,10 +422,10 @@ public class TestQueueMetrics {
     assertCounter("AppsKilled", killed, rb);
   }
 
-  public static void checkResources(MetricsSource source, int allocatedMB,
+  public static void checkResources(MetricsSource source, long allocatedMB,
       int allocatedCores, int allocCtnrs, long aggreAllocCtnrs,
-      long aggreReleasedCtnrs, int availableMB, int availableCores, int pendingMB,
-      int pendingCores, int pendingCtnrs, int reservedMB, int reservedCores,
+      long aggreReleasedCtnrs, long availableMB, int availableCores, long pendingMB,
+      int pendingCores, int pendingCtnrs, long reservedMB, int reservedCores,
       int reservedCtnrs) {
     MetricsRecordBuilder rb = getMetrics(source);
     assertGauge("AllocatedMB", allocatedMB, rb);
@@ -365,6 +441,14 @@ public class TestQueueMetrics {
     assertGauge("ReservedMB", reservedMB, rb);
     assertGauge("ReservedVCores", reservedCores, rb);
     assertGauge("ReservedContainers", reservedCtnrs, rb);
+  }
+
+  public static void checkAggregatedNodeTypes(MetricsSource source,
+      long nodeLocal, long rackLocal, long offSwitch) {
+    MetricsRecordBuilder rb = getMetrics(source);
+    assertCounter("AggregateNodeLocalContainersAllocated", nodeLocal, rb);
+    assertCounter("AggregateRackLocalContainersAllocated", rackLocal, rb);
+    assertCounter("AggregateOffSwitchContainersAllocated", offSwitch, rb);
   }
 
   private static AppSchedulingInfo mockApp(String user) {

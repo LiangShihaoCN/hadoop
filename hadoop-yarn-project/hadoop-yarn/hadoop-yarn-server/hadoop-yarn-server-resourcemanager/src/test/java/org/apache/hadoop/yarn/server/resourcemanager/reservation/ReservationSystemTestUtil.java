@@ -19,9 +19,7 @@ package org.apache.hadoop.yarn.server.resourcemanager.reservation;
 
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anySetOf;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 import java.io.FileWriter;
 import java.io.IOException;
@@ -32,6 +30,7 @@ import java.util.Random;
 import java.util.TreeMap;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.yarn.api.protocolrecords.ReservationSubmissionRequest;
 import org.apache.hadoop.yarn.api.records.ReservationDefinition;
 import org.apache.hadoop.yarn.api.records.ReservationId;
 import org.apache.hadoop.yarn.api.records.ReservationRequest;
@@ -45,6 +44,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.MockNodes;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
+import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemoryRMStateStore;
 import org.apache.hadoop.yarn.server.resourcemanager.reservation.planning.AlignedPlannerWithGreedy;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
@@ -73,12 +73,14 @@ public class ReservationSystemTestUtil {
   public static ReservationSchedulerConfiguration createConf(
       String reservationQ, long timeWindow, float instConstraint,
       float avgConstraint) {
-    ReservationSchedulerConfiguration conf =
-        mock(ReservationSchedulerConfiguration.class);
+
+    ReservationSchedulerConfiguration realConf = new CapacitySchedulerConfiguration();
+    ReservationSchedulerConfiguration conf = spy(realConf);
     when(conf.getReservationWindow(reservationQ)).thenReturn(timeWindow);
     when(conf.getInstantaneousMaxCapacity(reservationQ))
         .thenReturn(instConstraint);
     when(conf.getAverageCapacity(reservationQ)).thenReturn(avgConstraint);
+
     return conf;
   }
 
@@ -88,7 +90,7 @@ public class ReservationSystemTestUtil {
     Assert.assertNotNull(plan);
     Assert.assertTrue(plan instanceof InMemoryPlan);
     Assert.assertEquals(planQName, plan.getQueueName());
-    Assert.assertEquals(8192, plan.getTotalCapacity().getMemory());
+    Assert.assertEquals(8192, plan.getTotalCapacity().getMemorySize());
     Assert.assertTrue(
         plan.getReservationAgent() instanceof AlignedPlannerWithGreedy);
     Assert
@@ -175,10 +177,15 @@ public class ReservationSystemTestUtil {
 
   public static ReservationDefinition createSimpleReservationDefinition(
       long arrival, long deadline, long duration) {
+    return createSimpleReservationDefinition(arrival, deadline, duration, 1);
+  }
+
+  public static ReservationDefinition createSimpleReservationDefinition(
+      long arrival, long deadline, long duration, int parallelism) {
     // create a request with a single atomic ask
     ReservationRequest r =
-        ReservationRequest.newInstance(Resource.newInstance(1024, 1), 1, 1,
-            duration);
+        ReservationRequest.newInstance(Resource.newInstance(1024, 1),
+            parallelism, parallelism, duration);
     ReservationDefinition rDef = new ReservationDefinitionPBImpl();
     ReservationRequests reqs = new ReservationRequestsPBImpl();
     reqs.setReservationResources(Collections.singletonList(r));
@@ -189,7 +196,31 @@ public class ReservationSystemTestUtil {
     return rDef;
   }
 
-  @SuppressWarnings("unchecked")
+  public static ReservationSubmissionRequest createSimpleReservationRequest(
+      ReservationId reservationId, int numContainers, long arrival,
+      long deadline, long duration) {
+    // create a request with a single atomic ask
+    ReservationRequest r =
+        ReservationRequest.newInstance(Resource.newInstance(1024, 1),
+            numContainers, 1, duration);
+    ReservationRequests reqs =
+        ReservationRequests.newInstance(Collections.singletonList(r),
+            ReservationRequestInterpreter.R_ALL);
+    ReservationDefinition rDef =
+        ReservationDefinition.newInstance(arrival, deadline, reqs,
+            "testClientRMService#reservation");
+    ReservationSubmissionRequest request =
+        ReservationSubmissionRequest.newInstance(rDef,
+            reservationQ, reservationId);
+    return request;
+  }
+
+  public static RMContext createMockRMContext() {
+    RMContext context = mock(RMContext.class);
+    when(context.getStateStore()).thenReturn(new MemoryRMStateStore());
+    return context;
+  }
+
   public CapacityScheduler mockCapacityScheduler(int numContainers)
       throws IOException {
     // stolen from TestCapacityScheduler
@@ -277,6 +308,18 @@ public class ReservationSystemTestUtil {
     conf.setQueues(A, new String[] { "a1", "a2" });
     conf.setCapacity(A1, 30);
     conf.setCapacity(A2, 70);
+  }
+
+  public static void setupDynamicQueueConfiguration(
+      CapacitySchedulerConfiguration conf) {
+    // Define top-level queues
+    conf.setQueues(CapacitySchedulerConfiguration.ROOT,
+        new String[] { reservationQ });
+    final String dedicated = CapacitySchedulerConfiguration.ROOT
+        + CapacitySchedulerConfiguration.DOT + reservationQ;
+    conf.setCapacity(dedicated, 100);
+    // Set as reservation queue
+    conf.setReservable(dedicated, true);
   }
 
   public static String getFullReservationQueueName() {

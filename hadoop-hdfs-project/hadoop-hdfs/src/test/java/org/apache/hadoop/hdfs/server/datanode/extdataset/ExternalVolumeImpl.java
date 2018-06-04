@@ -75,7 +75,7 @@ public class ExternalVolumeImpl implements FsVolumeSpi {
   }
 
   @Override
-  public void reserveSpaceForRbw(long bytesToReserve) {
+  public void reserveSpaceForReplica(long bytesToReserve) {
   }
 
   @Override
@@ -88,6 +88,12 @@ public class ExternalVolumeImpl implements FsVolumeSpi {
 
   @Override
   public BlockIterator newBlockIterator(String bpid, String name) {
+    return null;
+  }
+
+  @Override
+  public byte[] loadLastPartialChunkChecksum(
+      File blockFile, File metaFile) throws IOException {
     return null;
   }
 

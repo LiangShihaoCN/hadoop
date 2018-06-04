@@ -22,7 +22,6 @@ import java.util.Collection;
 import java.util.Map;
 
 import com.google.common.collect.Maps;
-import com.google.common.base.Objects;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -188,16 +187,21 @@ public class MetricsRegistry {
    * @param valueName of the metric (e.g., "Time" or "Latency")
    * @param interval rollover interval of estimator in seconds
    * @return a new quantile estimator object
+   * @throws MetricsException if interval is not a positive integer
    */
   public synchronized MutableQuantiles newQuantiles(String name, String desc,
       String sampleName, String valueName, int interval) {
     checkMetricName(name);
-    MutableQuantiles ret = 
+    if (interval <= 0) {
+      throw new MetricsException("Interval should be positive.  Value passed" +
+          " is: " + interval);
+    }
+    MutableQuantiles ret =
         new MutableQuantiles(name, desc, sampleName, valueName, interval);
     metricsMap.put(name, ret);
     return ret;
   }
-  
+
   /**
    * Create a mutable metric with stats
    * @param name  of the metric
@@ -274,6 +278,14 @@ public class MetricsRegistry {
     MutableRate ret = new MutableRate(name, desc, extended);
     metricsMap.put(name, ret);
     return ret;
+  }
+
+  public synchronized MutableRatesWithAggregation newRatesWithAggregation(
+      String name) {
+    checkMetricName(name);
+    MutableRatesWithAggregation rates = new MutableRatesWithAggregation();
+    metricsMap.put(name, rates);
+    return rates;
   }
 
   synchronized void add(String name, MutableMetric metric) {
@@ -403,8 +415,14 @@ public class MetricsRegistry {
   }
 
   @Override public String toString() {
-    return Objects.toStringHelper(this)
-        .add("info", metricsInfo).add("tags", tags()).add("metrics", metrics())
-        .toString();
+    StringBuilder sb = new StringBuilder(32);
+    sb.append(this.getClass().getSimpleName());
+    sb.append("{info=");
+    sb.append(metricsInfo);
+    sb.append(", tags=");
+    sb.append(tags());
+    sb.append(", metrics=");
+    sb.append(metrics());
+    return sb.append('}').toString();
   }
 }

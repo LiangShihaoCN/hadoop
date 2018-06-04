@@ -228,6 +228,24 @@ public class TestHttpFSServer extends HFSTestCase {
   @TestDir
   @TestJetty
   @TestHdfs
+  public void testMkdirs() throws Exception {
+    createHttpFSServer(false);
+
+    String user = HadoopUsersConfTestHelper.getHadoopUsers()[0];
+    URL url = new URL(TestJettyHelper.getJettyURL(), MessageFormat.format(
+        "/webhdfs/v1/tmp/sub-tmp?user.name={0}&op=MKDIRS", user));
+    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+    conn.setRequestMethod("PUT");
+    conn.connect();
+    Assert.assertEquals(conn.getResponseCode(), HttpURLConnection.HTTP_OK);
+
+    getStatus("/tmp/sub-tmp", "LISTSTATUS");
+  }
+
+  @Test
+  @TestDir
+  @TestJetty
+  @TestHdfs
   public void testGlobFilter() throws Exception {
     createHttpFSServer(false);
 
@@ -501,12 +519,13 @@ public class TestHttpFSServer extends HFSTestCase {
   @TestHdfs
   public void testFileAcls() throws Exception {
     final String aclUser1 = "user:foo:rw-";
+    final String remAclUser1 = "user:foo:";
     final String aclUser2 = "user:bar:r--";
     final String aclGroup1 = "group::r--";
     final String aclSpec = "aclspec=user::rwx," + aclUser1 + ","
             + aclGroup1 + ",other::---";
     final String modAclSpec = "aclspec=" + aclUser2;
-    final String remAclSpec = "aclspec=" + aclUser1;
+    final String remAclSpec = "aclspec=" + remAclUser1;
     final String dir = "/aclFileTest";
     final String path = dir + "/test";
     String statusJson;

@@ -41,6 +41,22 @@ public class TestYarnConfiguration {
     // specifically add slashes and Jetty doesn't handle double slashes.
     Assert.assertNotSame("RM Web Url is not correct", "http://0.0.0.0:8088",
         rmWebUrl);
+
+    // test it in HA scenario
+    conf.setBoolean(YarnConfiguration.RM_HA_ENABLED, true);
+    conf.set(YarnConfiguration.RM_HA_IDS, "rm1, rm2");
+    conf.set("yarn.resourcemanager.webapp.address.rm1", "10.10.10.10:18088");
+    conf.set("yarn.resourcemanager.webapp.address.rm2", "20.20.20.20:28088");
+    String rmWebUrlinHA = WebAppUtils.getRMWebAppURLWithScheme(conf);
+    Assert.assertEquals("http://10.10.10.10:18088", rmWebUrlinHA);
+
+    YarnConfiguration conf2 = new YarnConfiguration();
+    conf2.setBoolean(YarnConfiguration.RM_HA_ENABLED, true);
+    conf2.set(YarnConfiguration.RM_HA_IDS, "rm1, rm2");
+    conf2.set("yarn.resourcemanager.hostname.rm1", "30.30.30.30");
+    conf2.set("yarn.resourcemanager.hostname.rm2", "40.40.40.40");
+    String rmWebUrlinHA2 = WebAppUtils.getRMWebAppURLWithScheme(conf2);
+    Assert.assertEquals("http://30.30.30.30:8088", rmWebUrlinHA2);
   }
 
   @Test
@@ -54,7 +70,7 @@ public class TestYarnConfiguration {
     String rmWebUrl = WebAppUtils.getRMWebAppURLWithScheme(conf);
     String[] parts = rmWebUrl.split(":");
     Assert.assertEquals("RM Web URL Port is incrrect", 24543,
-        Integer.valueOf(parts[parts.length - 1]).intValue());
+        Integer.parseInt(parts[parts.length - 1]));
     Assert.assertNotSame(
         "RM Web Url not resolved correctly. Should not be rmtesting",
         "http://rmtesting:24543", rmWebUrl);
@@ -178,7 +194,7 @@ public class TestYarnConfiguration {
     conf.set(YarnConfiguration.RM_RESOURCE_TRACKER_ADDRESS, "yo.yo.yo");
     serverAddress = new InetSocketAddress(
         YarnConfiguration.DEFAULT_RM_RESOURCE_TRACKER_ADDRESS.split(":")[0],
-        Integer.valueOf(YarnConfiguration.DEFAULT_RM_RESOURCE_TRACKER_ADDRESS.split(":")[1]));
+        Integer.parseInt(YarnConfiguration.DEFAULT_RM_RESOURCE_TRACKER_ADDRESS.split(":")[1]));
 
     resourceTrackerConnectAddress = conf.updateConnectAddr(
         YarnConfiguration.RM_BIND_HOST,
@@ -194,7 +210,7 @@ public class TestYarnConfiguration {
     conf.set(YarnConfiguration.RM_BIND_HOST, "0.0.0.0");
     serverAddress = new InetSocketAddress(
         YarnConfiguration.DEFAULT_RM_RESOURCE_TRACKER_ADDRESS.split(":")[0],
-        Integer.valueOf(YarnConfiguration.DEFAULT_RM_RESOURCE_TRACKER_ADDRESS.split(":")[1]));
+        Integer.parseInt(YarnConfiguration.DEFAULT_RM_RESOURCE_TRACKER_ADDRESS.split(":")[1]));
 
     resourceTrackerConnectAddress = conf.updateConnectAddr(
         YarnConfiguration.RM_BIND_HOST,
@@ -213,7 +229,7 @@ public class TestYarnConfiguration {
 
     serverAddress = new InetSocketAddress(
         YarnConfiguration.DEFAULT_NM_LOCALIZER_ADDRESS.split(":")[0],
-        Integer.valueOf(YarnConfiguration.DEFAULT_NM_LOCALIZER_ADDRESS.split(":")[1]));
+        Integer.parseInt(YarnConfiguration.DEFAULT_NM_LOCALIZER_ADDRESS.split(":")[1]));
 
     InetSocketAddress localizerAddress = conf.updateConnectAddr(
         YarnConfiguration.NM_BIND_HOST,

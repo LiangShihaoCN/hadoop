@@ -24,7 +24,6 @@ import static org.apache.hadoop.fs.CreateFlag.OVERWRITE;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -43,7 +42,6 @@ import org.apache.hadoop.fs.FileContext;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.LocalDirAllocator;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.StringUtils;
@@ -52,6 +50,7 @@ import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
+import org.apache.hadoop.yarn.api.records.SignalContainerCommand;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.Dispatcher;
 import org.apache.hadoop.yarn.ipc.RPCUtil;
@@ -155,7 +154,7 @@ public class ContainerLaunch implements Callable<Integer> {
     final ContainerLaunchContext launchContext = container.getLaunchContext();
     Map<Path,List<String>> localResources = null;
     ContainerId containerID = container.getContainerId();
-    String containerIdStr = ConverterUtils.toString(containerID);
+    String containerIdStr = containerID.toString();
     final List<String> command = launchContext.getCommands();
     int ret = -1;
 
@@ -218,8 +217,6 @@ public class ContainerLaunch implements Callable<Integer> {
       Path nmPrivateClasspathJarDir = 
           dirsHandler.getLocalPathForWrite(
               getContainerPrivateDir(appIdStr, containerIdStr));
-      DataOutputStream containerScriptOutStream = null;
-      DataOutputStream tokensOutStream = null;
 
       // Select the working directory for the container
       Path containerWorkDir =
@@ -248,43 +245,41 @@ public class ContainerLaunch implements Callable<Integer> {
             + dirsHandler.getDisksHealthReport(false));
       }
 
-      try {
-        // /////////// Write out the container-script in the nmPrivate space.
-        List<Path> appDirs = new ArrayList<Path>(localDirs.size());
-        for (String localDir : localDirs) {
-          Path usersdir = new Path(localDir, ContainerLocalizer.USERCACHE);
-          Path userdir = new Path(usersdir, user);
-          Path appsdir = new Path(userdir, ContainerLocalizer.APPCACHE);
-          appDirs.add(new Path(appsdir, appIdStr));
-        }
-        containerScriptOutStream =
-          lfs.create(nmPrivateContainerScriptPath,
-              EnumSet.of(CREATE, OVERWRITE));
+      List<Path> appDirs = new ArrayList<Path>(localDirs.size());
+      for (String localDir : localDirs) {
+        Path usersdir = new Path(localDir, ContainerLocalizer.USERCACHE);
+        Path userdir = new Path(usersdir, user);
+        Path appsdir = new Path(userdir, ContainerLocalizer.APPCACHE);
+        appDirs.add(new Path(appsdir, appIdStr));
+      }
+      // Set the token location too.
+      environment.put(
+          ApplicationConstants.CONTAINER_TOKEN_FILE_ENV_NAME,
+          new Path(containerWorkDir,
+              FINAL_CONTAINER_TOKENS_FILE).toUri().getPath());
 
-        // Set the token location too.
-        environment.put(
-            ApplicationConstants.CONTAINER_TOKEN_FILE_ENV_NAME, 
-            new Path(containerWorkDir, 
-                FINAL_CONTAINER_TOKENS_FILE).toUri().getPath());
+      // /////////// Write out the container-script in the nmPrivate space.
+      try (DataOutputStream containerScriptOutStream =
+               lfs.create(nmPrivateContainerScriptPath,
+                   EnumSet.of(CREATE, OVERWRITE))) {
         // Sanitize the container's environment
         sanitizeEnv(environment, containerWorkDir, appDirs, containerLogDirs,
           localResources, nmPrivateClasspathJarDir);
 
         // Write out the environment
         exec.writeLaunchEnv(containerScriptOutStream, environment,
-          localResources, launchContext.getCommands());
+          localResources, launchContext.getCommands(),
+            new Path(containerLogDirs.get(0)));
+      }
+      // /////////// End of writing out container-script
 
-        // /////////// End of writing out container-script
-
-        // /////////// Write out the container-tokens in the nmPrivate space.
-        tokensOutStream =
-            lfs.create(nmPrivateTokensPath, EnumSet.of(CREATE, OVERWRITE));
+      // /////////// Write out the container-tokens in the nmPrivate space.
+      try (DataOutputStream tokensOutStream =
+               lfs.create(nmPrivateTokensPath, EnumSet.of(CREATE, OVERWRITE))) {
         Credentials creds = container.getCredentials();
         creds.writeTokenStorageToStream(tokensOutStream);
-        // /////////// End of writing out container-tokens
-      } finally {
-        IOUtils.cleanup(LOG, containerScriptOutStream, tokensOutStream);
       }
+      // /////////// End of writing out container-tokens
 
       // LaunchContainer is a blocking call. We are here almost means the
       // container is launched, so send out the event.
@@ -376,7 +371,7 @@ public class ContainerLaunch implements Callable<Integer> {
   @SuppressWarnings("unchecked") // dispatcher not typed
   public void cleanupContainer() throws IOException {
     ContainerId containerId = container.getContainerId();
-    String containerIdStr = ConverterUtils.toString(containerId);
+    String containerIdStr = containerId.toString();
     LOG.info("Cleaning up container " + containerIdStr);
 
     try {
@@ -462,6 +457,100 @@ public class ContainerLaunch implements Callable<Integer> {
   }
 
   /**
+   * Send a signal to the container.
+   *
+   *
+   * @throws IOException
+   */
+  @SuppressWarnings("unchecked") // dispatcher not typed
+  public void signalContainer(SignalContainerCommand command)
+      throws IOException {
+    ContainerId containerId =
+        container.getContainerTokenIdentifier().getContainerID();
+    String containerIdStr = containerId.toString();
+    String user = container.getUser();
+    Signal signal = translateCommandToSignal(command);
+    if (signal.equals(Signal.NULL)) {
+      LOG.info("ignore signal command " + command);
+      return;
+    }
+
+    LOG.info("Sending signal " + command + " to container " + containerIdStr);
+
+    boolean alreadyLaunched = !shouldLaunchContainer.compareAndSet(false, true);
+    if (!alreadyLaunched) {
+      LOG.info("Container " + containerIdStr + " not launched."
+          + " Not sending the signal");
+      return;
+    }
+
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Getting pid for container " + containerIdStr
+          + " to send signal to from pid file "
+          + (pidFilePath != null ? pidFilePath.toString() : "null"));
+    }
+
+    try {
+      // get process id from pid file if available
+      // else if shell is still active, get it from the shell
+      String processId = null;
+      if (pidFilePath != null) {
+        processId = getContainerPid(pidFilePath);
+      }
+
+      if (processId != null) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Sending signal to pid " + processId
+              + " as user " + user
+              + " for container " + containerIdStr);
+        }
+
+        boolean result = exec.signalContainer(
+            new ContainerSignalContext.Builder()
+                .setContainer(container)
+                .setUser(user)
+                .setPid(processId)
+                .setSignal(signal)
+                .build());
+
+        String diagnostics = "Sent signal " + command
+            + " (" + signal + ") to pid " + processId
+            + " as user " + user
+            + " for container " + containerIdStr
+            + ", result=" + (result ? "success" : "failed");
+        LOG.info(diagnostics);
+
+        dispatcher.getEventHandler().handle(
+            new ContainerDiagnosticsUpdateEvent(containerId, diagnostics));
+      }
+    } catch (Exception e) {
+      String message =
+          "Exception when sending signal to container " + containerIdStr
+              + ": " + StringUtils.stringifyException(e);
+      LOG.warn(message);
+    }
+  }
+
+  @VisibleForTesting
+  public static Signal translateCommandToSignal(
+      SignalContainerCommand command) {
+    Signal signal = Signal.NULL;
+    switch (command) {
+      case OUTPUT_THREAD_DUMP:
+        // TODO for windows support.
+        signal = Shell.WINDOWS ? Signal.NULL: Signal.QUIT;
+        break;
+      case GRACEFUL_SHUTDOWN:
+        signal = Signal.TERM;
+        break;
+      case FORCEFUL_SHUTDOWN:
+        signal = Signal.KILL;
+        break;
+    }
+    return signal;
+  }
+
+  /**
    * Loop through for a time-bounded interval waiting to
    * read the process id from a file generated by a running process.
    * @param pidFilePath File from which to read the process id
@@ -470,7 +559,7 @@ public class ContainerLaunch implements Callable<Integer> {
    */
   private String getContainerPid(Path pidFilePath) throws Exception {
     String containerIdStr = 
-        ConverterUtils.toString(container.getContainerId());
+        container.getContainerId().toString();
     String processId = null;
     LOG.debug("Accessing pid for container " + containerIdStr
         + " from pid file " + pidFilePath);
@@ -530,8 +619,6 @@ public class ContainerLaunch implements Callable<Integer> {
 
     public abstract void command(List<String> command) throws IOException;
 
-    public abstract void whitelistedEnv(String key, String value) throws IOException;
-
     public abstract void env(String key, String value) throws IOException;
 
     public final void symlink(Path src, Path dst) throws IOException {
@@ -546,6 +633,28 @@ public class ContainerLaunch implements Callable<Integer> {
       }
       link(src, dst);
     }
+
+    /**
+     * Method to copy files that are useful for debugging container failures.
+     * This method will be called by ContainerExecutor when setting up the
+     * container launch script. The method should take care to make sure files
+     * are read-able by the yarn user if the files are to undergo
+     * log-aggregation.
+     * @param src path to the source file
+     * @param dst path to the destination file - should be absolute
+     * @throws IOException
+     */
+    public abstract void copyDebugInformation(Path src, Path dst)
+        throws IOException;
+
+    /**
+     * Method to dump debug information to the a target file. This method will
+     * be called by ContainerExecutor when setting up the container launch
+     * script.
+     * @param output the file to which debug information is to be written
+     * @throws IOException
+     */
+    public abstract void listDebugInformation(Path output) throws IOException;
 
     @Override
     public String toString() {
@@ -590,11 +699,6 @@ public class ContainerLaunch implements Callable<Integer> {
     }
 
     @Override
-    public void whitelistedEnv(String key, String value) {
-      line("export ", key, "=${", key, ":-", "\"", value, "\"}");
-    }
-
-    @Override
     public void env(String key, String value) {
       line("export ", key, "=\"", value, "\"");
     }
@@ -609,6 +713,36 @@ public class ContainerLaunch implements Callable<Integer> {
     protected void mkdir(Path path) {
       line("mkdir -p ", path.toString());
       errorCheck();
+    }
+
+    @Override
+    public void copyDebugInformation(Path src, Path dest) throws IOException {
+      line("# Creating copy of launch script");
+      line("cp \"", src.toUri().getPath(), "\" \"", dest.toUri().getPath(),
+          "\"");
+      // set permissions to 640 because we need to be able to run
+      // log aggregation in secure mode as well
+      if(dest.isAbsolute()) {
+        line("chmod 640 \"", dest.toUri().getPath(), "\"");
+      }
+    }
+
+    @Override
+    public void listDebugInformation(Path output) throws  IOException {
+      line("# Determining directory contents");
+      line("echo \"ls -l:\" 1>\"", output.toString(), "\"");
+      line("ls -l 1>>\"", output.toString(), "\"");
+
+      // don't run error check because if there are loops
+      // find will exit with an error causing container launch to fail
+      // find will follow symlinks outside the work dir if such sylimks exist
+      // (like public/app local resources)
+      line("echo \"find -L . -maxdepth 5 -ls:\" 1>>\"", output.toString(),
+          "\"");
+      line("find -L . -maxdepth 5 -ls 1>>\"", output.toString(), "\"");
+      line("echo \"broken symlinks(find -L . -maxdepth 5 -type l -ls):\" 1>>\"",
+          output.toString(), "\"");
+      line("find -L . -maxdepth 5 -type l -ls 1>>\"", output.toString(), "\"");
     }
   }
 
@@ -636,12 +770,6 @@ public class ContainerLaunch implements Callable<Integer> {
     }
 
     @Override
-    public void whitelistedEnv(String key, String value) throws IOException {
-      lineWithLenCheck("@set ", key, "=", value);
-      errorCheck();
-    }
-
-    @Override
     public void env(String key, String value) throws IOException {
       lineWithLenCheck("@set ", key, "=", value);
       errorCheck();
@@ -652,16 +780,9 @@ public class ContainerLaunch implements Callable<Integer> {
       File srcFile = new File(src.toUri().getPath());
       String srcFileStr = srcFile.getPath();
       String dstFileStr = new File(dst.toString()).getPath();
-      // If not on Java7+ on Windows, then copy file instead of symlinking.
-      // See also FileUtil#symLink for full explanation.
-      if (!Shell.isJava7OrAbove() && srcFile.isFile()) {
-        lineWithLenCheck(String.format("@copy \"%s\" \"%s\"", srcFileStr, dstFileStr));
-        errorCheck();
-      } else {
-        lineWithLenCheck(String.format("@%s symlink \"%s\" \"%s\"", Shell.WINUTILS,
-          dstFileStr, srcFileStr));
-        errorCheck();
-      }
+      lineWithLenCheck(String.format("@%s symlink \"%s\" \"%s\"",
+          Shell.getWinUtilsPath(), dstFileStr, srcFileStr));
+      errorCheck();
     }
 
     @Override
@@ -669,6 +790,25 @@ public class ContainerLaunch implements Callable<Integer> {
       lineWithLenCheck(String.format("@if not exist \"%s\" mkdir \"%s\"",
           path.toString(), path.toString()));
       errorCheck();
+    }
+
+    @Override
+    public void copyDebugInformation(Path src, Path dest)
+        throws IOException {
+      // no need to worry about permissions - in secure mode
+      // WindowsSecureContainerExecutor will set permissions
+      // to allow NM to read the file
+      line("rem Creating copy of launch script");
+      lineWithLenCheck(String.format("copy \"%s\" \"%s\"", src.toString(),
+          dest.toString()));
+    }
+
+    @Override
+    public void listDebugInformation(Path output) throws IOException {
+      line("rem Determining directory contents");
+      lineWithLenCheck(
+          String.format("@echo \"dir:\" > \"%s\"", output.toString()));
+      lineWithLenCheck(String.format("dir >> \"%s\"", output.toString()));
     }
   }
 
@@ -725,24 +865,10 @@ public class ContainerLaunch implements Callable<Integer> {
     
     environment.put(Environment.PWD.name(), pwd.toString());
     
-    putEnvIfNotNull(environment, 
-        Environment.HADOOP_CONF_DIR.name(), 
-        System.getenv(Environment.HADOOP_CONF_DIR.name())
-        );
+    putEnvIfAbsent(environment, Environment.HADOOP_CONF_DIR.name());
 
     if (!Shell.WINDOWS) {
       environment.put("JVM_PID", "$$");
-    }
-
-    /**
-     * Modifiable environment variables
-     */
-    
-    // allow containers to override these variables
-    String[] whitelist = conf.get(YarnConfiguration.NM_ENV_WHITELIST, YarnConfiguration.DEFAULT_NM_ENV_WHITELIST).split(",");
-    
-    for(String whitelistEnvVariable : whitelist) {
-      putEnvIfAbsent(environment, whitelistEnvVariable.trim());
     }
 
     // variables here will be forced in, even if the container has specified them.
@@ -768,7 +894,7 @@ public class ContainerLaunch implements Callable<Integer> {
         //variable can be set to indicate that distcache entries should come
         //first
 
-        boolean preferLocalizedJars = Boolean.valueOf(
+        boolean preferLocalizedJars = Boolean.parseBoolean(
           environment.get(Environment.CLASSPATH_PREPEND_DISTCACHE.name())
           );
 

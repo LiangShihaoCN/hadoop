@@ -73,7 +73,8 @@ public enum DistCpOptionSwitch {
    */
   DELETE_MISSING(DistCpConstants.CONF_LABEL_DELETE_MISSING,
       new Option("delete", false, "Delete from target, " +
-          "files missing in source")),
+          "files missing in source. Delete is applicable only"
+          + " with update or overwrite options")),
 
   /**
    * Configuration file to use with hftps:// for securely copying
@@ -82,7 +83,7 @@ public enum DistCpOptionSwitch {
    */
   SSL_CONF(DistCpConstants.CONF_LABEL_SSL_CONF,
       new Option("mapredSslConf", true, "Configuration for ssl config file" +
-          ", to use with hftps://")),
+          ", to use with hftps://. Must be in the classpath.")),
   /**
    * Number of threads for building source file listing (before map-reduce
    * phase, max one listStatus per thread at a time).

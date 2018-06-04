@@ -222,7 +222,7 @@ class Checkpointer extends Daemon {
             "image with txid " + sig.mostRecentCheckpointTxId);
         MD5Hash downloadedHash = TransferFsImage.downloadImageToStorage(
             backupNode.nnHttpAddress, sig.mostRecentCheckpointTxId, bnStorage,
-            true);
+            true, false);
         bnImage.saveDigestAndRenameCheckpointImage(NameNodeFile.IMAGE,
             sig.mostRecentCheckpointTxId, downloadedHash);
         lastApplied = sig.mostRecentCheckpointTxId;
@@ -263,7 +263,7 @@ class Checkpointer extends Daemon {
         bnStorage.writeAll();
       }
     } finally {
-      backupNode.namesystem.writeUnlock();
+      backupNode.namesystem.writeUnlock("doCheckpoint");
     }
 
     if(cpCmd.needToReturnImage()) {

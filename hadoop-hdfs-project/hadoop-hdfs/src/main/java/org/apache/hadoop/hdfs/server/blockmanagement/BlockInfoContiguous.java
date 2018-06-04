@@ -37,8 +37,7 @@ public class BlockInfoContiguous extends BlockInfo {
 
   /**
    * Copy construction.
-   * This is used to convert BlockReplicationInfoUnderConstruction
-   * @param from BlockReplicationInfo to copy from.
+   * @param from BlockInfoContiguous to copy from.
    */
   protected BlockInfoContiguous(BlockInfoContiguous from) {
     super(from);
@@ -104,20 +103,5 @@ public class BlockInfoContiguous extends BlockInfo {
       }
     }
     return 0;
-  }
-
-  @Override
-  void replaceBlock(BlockInfo newBlock) {
-    assert newBlock instanceof BlockInfoContiguous;
-    for (int i = this.numNodes() - 1; i >= 0; i--) {
-      final DatanodeStorageInfo storage = this.getStorageInfo(i);
-      final boolean removed = storage.removeBlock(this);
-      assert removed : "currentBlock not found.";
-
-      final DatanodeStorageInfo.AddBlockResult result = storage.addBlock(
-          newBlock);
-      assert result == DatanodeStorageInfo.AddBlockResult.ADDED :
-          "newBlock already exists.";
-    }
   }
 }

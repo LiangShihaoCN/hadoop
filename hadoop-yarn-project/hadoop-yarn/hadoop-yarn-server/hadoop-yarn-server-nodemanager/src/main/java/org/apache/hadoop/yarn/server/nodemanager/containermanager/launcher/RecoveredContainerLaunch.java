@@ -19,6 +19,7 @@
 package org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher;
 
 import java.io.File;
+import java.io.InterruptedIOException;
 import java.io.IOException;
 
 import org.apache.commons.logging.Log;
@@ -67,9 +68,9 @@ public class RecoveredContainerLaunch extends ContainerLaunch {
   public Integer call() {
     int retCode = ExitCode.LOST.getExitCode();
     ContainerId containerId = container.getContainerId();
-    String appIdStr = ConverterUtils.toString(
-        containerId.getApplicationAttemptId().getApplicationId());
-    String containerIdStr = ConverterUtils.toString(containerId);
+    String appIdStr =
+        containerId.getApplicationAttemptId().getApplicationId().toString();
+    String containerIdStr = containerId.toString();
 
     dispatcher.getEventHandler().handle(new ContainerEvent(containerId,
         ContainerEventType.CONTAINER_LAUNCHED));
@@ -83,17 +84,18 @@ public class RecoveredContainerLaunch extends ContainerLaunch {
         exec.activateContainer(containerId, pidFilePath);
         retCode = exec.reacquireContainer(
             new ContainerReacquisitionContext.Builder()
-            .setUser(container.getUser())
-            .setContainerId(containerId)
-            .build());
+                .setContainer(container)
+                .setUser(container.getUser())
+                .setContainerId(containerId)
+                .build());
       } else {
         LOG.warn("Unable to locate pid file for container " + containerIdStr);
       }
-    } catch (IOException e) {
-        LOG.error("Unable to recover container " + containerIdStr, e);
-    } catch (InterruptedException e) {
+    } catch (InterruptedException | InterruptedIOException e) {
       LOG.warn("Interrupted while waiting for exit code from " + containerId);
       notInterrupted = false;
+    } catch (IOException e) {
+      LOG.error("Unable to recover container " + containerIdStr, e);
     } finally {
       if (notInterrupted) {
         this.completed.set(true);

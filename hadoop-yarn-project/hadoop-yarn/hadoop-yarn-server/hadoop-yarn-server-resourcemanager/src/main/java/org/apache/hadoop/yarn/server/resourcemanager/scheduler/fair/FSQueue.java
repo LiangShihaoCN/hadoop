@@ -41,6 +41,8 @@ import org.apache.hadoop.yarn.server.resourcemanager.resource.ResourceWeights;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Queue;
 import org.apache.hadoop.yarn.util.resource.Resources;
 
+import com.google.common.base.Preconditions;
+
 @Private
 @Unstable
 public abstract class FSQueue implements Queue, Schedulable {
@@ -130,18 +132,18 @@ public abstract class FSQueue implements Queue, Schedulable {
     QueueInfo queueInfo = recordFactory.newRecordInstance(QueueInfo.class);
     queueInfo.setQueueName(getQueueName());
 
-    if (scheduler.getClusterResource().getMemory() == 0) {
+    if (scheduler.getClusterResource().getMemorySize() == 0) {
       queueInfo.setCapacity(0.0f);
     } else {
-      queueInfo.setCapacity((float) getFairShare().getMemory() /
-          scheduler.getClusterResource().getMemory());
+      queueInfo.setCapacity((float) getFairShare().getMemorySize() /
+          scheduler.getClusterResource().getMemorySize());
     }
 
-    if (getFairShare().getMemory() == 0) {
+    if (getFairShare().getMemorySize() == 0) {
       queueInfo.setCurrentCapacity(0.0f);
     } else {
-      queueInfo.setCurrentCapacity((float) getResourceUsage().getMemory() /
-          getFairShare().getMemory());
+      queueInfo.setCurrentCapacity((float) getResourceUsage().getMemorySize() /
+          getFairShare().getMemorySize());
     }
 
     ArrayList<QueueInfo> childQueueInfos = new ArrayList<QueueInfo>();
@@ -233,6 +235,28 @@ public abstract class FSQueue implements Queue, Schedulable {
 
   public void setFairSharePreemptionThreshold(float fairSharePreemptionThreshold) {
     this.fairSharePreemptionThreshold = fairSharePreemptionThreshold;
+  }
+
+  /**
+   * Recursively check if the queue can be preempted based on whether the
+   * resource usage is greater than fair share.
+   *
+   * @return true if the queue can be preempted
+   */
+  public boolean canBePreempted() {
+    if (parent == null || parent.policy.checkIfUsageOverFairShare(
+        getResourceUsage(), getFairShare())) {
+      return true;
+    } else {
+      // recursively find one queue which can be preempted
+      for (FSQueue queue: getChildQueues()) {
+        if (queue.canBePreempted()) {
+          return true;
+        }
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -329,6 +353,14 @@ public abstract class FSQueue implements Queue, Schedulable {
   
   @Override
   public void decPendingResource(String nodeLabel, Resource resourceToDec) {
+  }
+
+  @Override
+  public void incReservedResource(String nodeLabel, Resource resourceToInc) {
+  }
+
+  @Override
+  public void decReservedResource(String nodeLabel, Resource resourceToDec) {
   }
 
   @Override

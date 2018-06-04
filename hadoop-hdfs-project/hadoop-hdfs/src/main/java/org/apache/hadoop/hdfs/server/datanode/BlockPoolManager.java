@@ -23,7 +23,6 @@ import java.security.PrivilegedExceptionAction;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import org.apache.commons.logging.Log;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
@@ -35,6 +34,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import org.slf4j.Logger;
 
 /**
  * Manages the BPOfferService objects for the data node.
@@ -43,7 +43,7 @@ import com.google.common.collect.Sets;
  */
 @InterfaceAudience.Private
 class BlockPoolManager {
-  private static final Log LOG = DataNode.LOG;
+  private static final Logger LOG = DataNode.LOG;
   
   private final Map<String, BPOfferService> bpByNameserviceId =
     Maps.newHashMap();
@@ -151,14 +151,18 @@ class BlockPoolManager {
 
     Map<String, Map<String, InetSocketAddress>> newAddressMap = DFSUtil
             .getNNServiceRpcAddressesForCluster(conf);
+    Map<String, Map<String, InetSocketAddress>> newLifelineAddressMap = DFSUtil
+            .getNNLifelineRpcAddressesForCluster(conf);
 
     synchronized (refreshNamenodesLock) {
-      doRefreshNamenodes(newAddressMap);
+      doRefreshNamenodes(newAddressMap, newLifelineAddressMap);
     }
   }
   
   private void doRefreshNamenodes(
-      Map<String, Map<String, InetSocketAddress>> addrMap) throws IOException {
+      Map<String, Map<String, InetSocketAddress>> addrMap,
+      Map<String, Map<String, InetSocketAddress>> lifelineAddrMap)
+      throws IOException {
     assert Thread.holdsLock(refreshNamenodesLock);
 
     Set<String> toRefresh = Sets.newLinkedHashSet();
@@ -195,9 +199,19 @@ class BlockPoolManager {
             Joiner.on(",").useForNull("<default>").join(toAdd));
       
         for (String nsToAdd : toAdd) {
+          Map<String, InetSocketAddress> nnIdToAddr = addrMap.get(nsToAdd);
+          Map<String, InetSocketAddress> nnIdToLifelineAddr =
+              lifelineAddrMap.get(nsToAdd);
           ArrayList<InetSocketAddress> addrs =
-            Lists.newArrayList(addrMap.get(nsToAdd).values());
-          BPOfferService bpos = createBPOS(addrs);
+              Lists.newArrayListWithCapacity(nnIdToAddr.size());
+          ArrayList<InetSocketAddress> lifelineAddrs =
+              Lists.newArrayListWithCapacity(nnIdToAddr.size());
+          for (String nnId : nnIdToAddr.keySet()) {
+            addrs.add(nnIdToAddr.get(nnId));
+            lifelineAddrs.add(nnIdToLifelineAddr != null ?
+                nnIdToLifelineAddr.get(nnId) : null);
+          }
+          BPOfferService bpos = createBPOS(nsToAdd, addrs, lifelineAddrs);
           bpByNameserviceId.put(nsToAdd, bpos);
           offerServices.add(bpos);
         }
@@ -226,10 +240,33 @@ class BlockPoolManager {
           Joiner.on(",").useForNull("<default>").join(toRefresh));
       
       for (String nsToRefresh : toRefresh) {
-        BPOfferService bpos = bpByNameserviceId.get(nsToRefresh);
-        ArrayList<InetSocketAddress> addrs =
-          Lists.newArrayList(addrMap.get(nsToRefresh).values());
-        bpos.refreshNNList(addrs);
+        final BPOfferService bpos = bpByNameserviceId.get(nsToRefresh);
+        Map<String, InetSocketAddress> nnIdToAddr = addrMap.get(nsToRefresh);
+        Map<String, InetSocketAddress> nnIdToLifelineAddr =
+            lifelineAddrMap.get(nsToRefresh);
+        final ArrayList<InetSocketAddress> addrs =
+            Lists.newArrayListWithCapacity(nnIdToAddr.size());
+        final ArrayList<InetSocketAddress> lifelineAddrs =
+            Lists.newArrayListWithCapacity(nnIdToAddr.size());
+        for (String nnId : nnIdToAddr.keySet()) {
+          addrs.add(nnIdToAddr.get(nnId));
+          lifelineAddrs.add(nnIdToLifelineAddr != null ?
+              nnIdToLifelineAddr.get(nnId) : null);
+        }
+        try {
+          UserGroupInformation.getLoginUser()
+              .doAs(new PrivilegedExceptionAction<Object>() {
+                @Override
+                public Object run() throws Exception {
+                  bpos.refreshNNList(addrs, lifelineAddrs);
+                  return null;
+                }
+              });
+        } catch (InterruptedException ex) {
+          IOException ioe = new IOException();
+          ioe.initCause(ex.getCause());
+          throw ioe;
+        }
       }
     }
   }
@@ -237,7 +274,10 @@ class BlockPoolManager {
   /**
    * Extracted out for test purposes.
    */
-  protected BPOfferService createBPOS(List<InetSocketAddress> nnAddrs) {
-    return new BPOfferService(nnAddrs, dn);
+  protected BPOfferService createBPOS(
+      final String nameserviceId,
+      List<InetSocketAddress> nnAddrs,
+      List<InetSocketAddress> lifelineNnAddrs) {
+    return new BPOfferService(nameserviceId, nnAddrs, lifelineNnAddrs, dn);
   }
 }

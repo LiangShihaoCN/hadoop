@@ -35,6 +35,7 @@ import org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB;
 import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
+import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
 import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
 import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo.BlockStatus;
 import org.apache.hadoop.hdfs.server.protocol.StorageBlockReport;
@@ -61,7 +62,7 @@ public final class TestTriggerBlockReport {
     cluster.waitActive();
     FileSystem fs = cluster.getFileSystem();
     DatanodeProtocolClientSideTranslatorPB spy =
-        DataNodeTestUtils.spyOnBposToNN(
+        InternalDataNodeTestUtils.spyOnBposToNN(
             cluster.getDataNodes().get(0), cluster.getNameNode());
     DFSTestUtil.createFile(fs, new Path("/abc"), 16, (short) 1, 1L);
 
@@ -93,12 +94,14 @@ public final class TestTriggerBlockReport {
     DataNode datanode = cluster.getDataNodes().get(0);
     BPServiceActor actor =
         datanode.getAllBpOs().get(0).getBPServiceActors().get(0);
-    String storageUuid;
+    final FsDatasetSpi<?> dataset = datanode.getFSDataset();
+    final DatanodeStorage storage;
     try (FsDatasetSpi.FsVolumeReferences volumes =
-        datanode.getFSDataset().getFsVolumeReferences()) {
-      storageUuid = volumes.get(0).getStorageID();
+        dataset.getFsVolumeReferences()) {
+      storage = dataset.getStorage(volumes.get(0).getStorageID());
     }
-    actor.notifyNamenodeDeletedBlock(rdbi, storageUuid);
+
+    actor.getIbrManager().addRDBI(rdbi, storage);
 
     // Manually trigger a block report.
     datanode.triggerBlockReport(

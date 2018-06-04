@@ -34,6 +34,7 @@ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.Container;
+import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
 import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationSubmissionContextPBImpl;
 import org.apache.hadoop.yarn.api.records.impl.pb.ContainerPBImpl;
@@ -54,6 +55,8 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptS
 import org.apache.hadoop.yarn.server.resourcemanager.security.ClientToAMTokenSecretManagerInRM;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.ZooDefs.Perms;
+import org.apache.zookeeper.data.ACL;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -65,6 +68,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
+import java.util.List;
+
 import javax.crypto.SecretKey;
 
 public class TestZKRMStateStore extends RMStateStoreTestBase {
@@ -101,6 +106,7 @@ public class TestZKRMStateStore extends RMStateStoreTestBase {
 
       public TestZKRMStateStoreInternal(Configuration conf, String workingZnode)
           throws Exception {
+        setResourceManager(new ResourceManager());
         init(conf);
         start();
         assertTrue(znodeWorkingPath.equals(workingZnode));
@@ -248,6 +254,70 @@ public class TestZKRMStateStore extends RMStateStoreTestBase {
     return conf;
   }
 
+  private static boolean verifyZKACL(String id, String scheme, int perm,
+      List<ACL> acls) {
+    for (ACL acl : acls) {
+      if (acl.getId().getScheme().equals(scheme) &&
+          acl.getId().getId().startsWith(id) &&
+          acl.getPerms() == perm) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Test if RM can successfully start in HA disabled mode if it was previously
+   * running in HA enabled mode. And then start it in HA mode after running it
+   * with HA disabled. NoAuth Exception should not be sent by zookeeper and RM
+   * should start successfully.
+   */
+  @Test
+  public void testZKRootPathAcls() throws Exception {
+    StateChangeRequestInfo req = new StateChangeRequestInfo(
+        HAServiceProtocol.RequestSource.REQUEST_BY_USER);
+    String rootPath =
+        YarnConfiguration.DEFAULT_ZK_RM_STATE_STORE_PARENT_PATH + "/" +
+            ZKRMStateStore.ROOT_ZNODE_NAME;
+
+    // Start RM with HA enabled
+    Configuration conf = createHARMConf("rm1,rm2", "rm1", 1234);
+    conf.setBoolean(YarnConfiguration.AUTO_FAILOVER_ENABLED, false);
+    ResourceManager rm = new MockRM(conf);
+    rm.start();
+    rm.getRMContext().getRMAdminService().transitionToActive(req);
+    List<ACL> acls =
+        ((ZKRMStateStore)rm.getRMContext().getStateStore()).getACL(rootPath);
+    assertEquals(acls.size(), 2);
+    // CREATE and DELETE permissions for root node based on RM ID
+    verifyZKACL("digest", "localhost", Perms.CREATE | Perms.DELETE, acls);
+    verifyZKACL(
+        "world", "anyone", Perms.ALL ^ (Perms.CREATE | Perms.DELETE), acls);
+    rm.close();
+
+    // Now start RM with HA disabled. NoAuth Exception should not be thrown.
+    conf.setBoolean(YarnConfiguration.RM_HA_ENABLED, false);
+    rm = new MockRM(conf);
+    rm.start();
+    rm.getRMContext().getRMAdminService().transitionToActive(req);
+    acls = ((ZKRMStateStore)rm.getRMContext().getStateStore()).getACL(rootPath);
+    assertEquals(acls.size(), 1);
+    verifyZKACL("world", "anyone", Perms.ALL, acls);
+    rm.close();
+
+    // Start RM with HA enabled.
+    conf.setBoolean(YarnConfiguration.RM_HA_ENABLED, true);
+    rm = new MockRM(conf);
+    rm.start();
+    rm.getRMContext().getRMAdminService().transitionToActive(req);
+    acls = ((ZKRMStateStore)rm.getRMContext().getStateStore()).getACL(rootPath);
+    assertEquals(acls.size(), 2);
+    verifyZKACL("digest", "localhost", Perms.CREATE | Perms.DELETE, acls);
+    verifyZKACL(
+        "world", "anyone", Perms.ALL ^ (Perms.CREATE | Perms.DELETE), acls);
+    rm.close();
+  }
+
   @SuppressWarnings("unchecked")
   @Test
   public void testFencing() throws Exception {
@@ -318,14 +388,14 @@ public class TestZKRMStateStore extends RMStateStoreTestBase {
     // Add a new attempt
     ClientToAMTokenSecretManagerInRM clientToAMTokenMgr =
             new ClientToAMTokenSecretManagerInRM();
-    ApplicationAttemptId attemptId = ConverterUtils
-            .toApplicationAttemptId("appattempt_1234567894321_0001_000001");
+    ApplicationAttemptId attemptId = ApplicationAttemptId.fromString(
+        "appattempt_1234567894321_0001_000001");
     SecretKey clientTokenMasterKey =
                 clientToAMTokenMgr.createMasterKey(attemptId);
     RMAppAttemptMetrics mockRmAppAttemptMetrics = 
          mock(RMAppAttemptMetrics.class);
     Container container = new ContainerPBImpl();
-    container.setId(ConverterUtils.toContainerId("container_1234567891234_0001_01_000001"));
+    container.setId(ContainerId.fromString("container_1234567891234_0001_01_000001"));
     RMAppAttempt mockAttempt = mock(RMAppAttempt.class);
     when(mockAttempt.getAppAttemptId()).thenReturn(attemptId);
     when(mockAttempt.getMasterContainer()).thenReturn(container);
@@ -346,7 +416,7 @@ public class TestZKRMStateStore extends RMStateStoreTestBase {
             store.getCredentialsFromAppAttempt(mockAttempt),
             startTime, RMAppAttemptState.FINISHED, "testUrl", 
             "test", FinalApplicationStatus.SUCCEEDED, 100, 
-            finishTime, 0, 0);
+            finishTime, 0, 0, 0, 0);
     store.updateApplicationAttemptState(newAttemptState);
     assertEquals("RMStateStore should have been in fenced state",
             true, store.isFencedState());
@@ -410,8 +480,8 @@ public class TestZKRMStateStore extends RMStateStoreTestBase {
     TestDispatcher dispatcher = new TestDispatcher();
     store.setRMDispatcher(dispatcher);
 
-    ApplicationAttemptId attemptIdRemoved = ConverterUtils
-        .toApplicationAttemptId("appattempt_1352994193343_0002_000001");
+    ApplicationAttemptId attemptIdRemoved = ApplicationAttemptId.fromString(
+        "appattempt_1352994193343_0002_000001");
     ApplicationId appIdRemoved = attemptIdRemoved.getApplicationId();
     storeApp(store, appIdRemoved, submitTime, startTime);
     storeAttempt(store, attemptIdRemoved,
@@ -420,6 +490,7 @@ public class TestZKRMStateStore extends RMStateStoreTestBase {
     ApplicationSubmissionContext context =
         new ApplicationSubmissionContextPBImpl();
     context.setApplicationId(appIdRemoved);
+
     ApplicationStateData appStateRemoved =
         ApplicationStateData.newInstance(
             submitTime, startTime, context, "user1");

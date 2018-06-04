@@ -38,7 +38,7 @@ import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
-import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+import org.apache.hadoop.hdfs.server.datanode.InternalDataNodeTestUtils;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
 import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
@@ -69,7 +69,7 @@ public class TestOverReplicatedBlocks {
       
       // corrupt the block on datanode 0
       ExtendedBlock block = DFSTestUtil.getFirstBlock(fs, fileName);
-      assertTrue(cluster.corruptReplica(0, block));
+      cluster.corruptReplica(0, block);
       DataNodeProperties dnProps = cluster.stopDataNode(0);
       // remove block scanner log to trigger block scanning
       File scanCursor = new File(new File(MiniDFSCluster.getFinalizedDir(
@@ -91,7 +91,7 @@ public class TestOverReplicatedBlocks {
       
       String blockPoolId = cluster.getNamesystem().getBlockPoolId();
       final DatanodeID corruptDataNode = 
-        DataNodeTestUtils.getDNRegistrationForBP(
+        InternalDataNodeTestUtils.getDNRegistrationForBP(
             cluster.getDataNodes().get(2), blockPoolId);
          
       final FSNamesystem namesystem = cluster.getNamesystem();
@@ -159,8 +159,8 @@ public class TestOverReplicatedBlocks {
       conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY, 300);
       cluster.startDataNodes(conf, 1, true, null, null, null);
       DataNode lastDN = cluster.getDataNodes().get(3);
-      DatanodeRegistration dnReg = DataNodeTestUtils.getDNRegistrationForBP(
-          lastDN, namesystem.getBlockPoolId());
+      DatanodeRegistration dnReg = InternalDataNodeTestUtils.
+          getDNRegistrationForBP(lastDN, namesystem.getBlockPoolId());
       String lastDNid = dnReg.getDatanodeUuid();
 
       final Path fileName = new Path("/foo2");

@@ -24,16 +24,15 @@ import java.io.OutputStream;
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -41,7 +40,6 @@ import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
-import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
@@ -65,6 +63,8 @@ public abstract class ContainerExecutor implements Configurable {
   final public static FsPermission TASK_LAUNCH_SCRIPT_PERMISSION =
     FsPermission.createImmutable((short) 0700);
 
+  public static final String DIRECTORY_CONTENTS = "directory.info";
+
   private Configuration conf;
 
   private ConcurrentMap<ContainerId, Path> pidFiles =
@@ -73,10 +73,15 @@ public abstract class ContainerExecutor implements Configurable {
   private ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
   private final ReadLock readLock = lock.readLock();
   private final WriteLock writeLock = lock.writeLock();
+  private String[] whitelistVars;
 
   @Override
   public void setConf(Configuration conf) {
     this.conf = conf;
+    if (conf != null) {
+      whitelistVars = conf.get(YarnConfiguration.NM_ENV_WHITELIST,
+          YarnConfiguration.DEFAULT_NM_ENV_WHITELIST).split(",");
+    }
   }
 
   @Override
@@ -241,27 +246,29 @@ public abstract class ContainerExecutor implements Configurable {
    * @param resources The resources which have been localized for this container
    * Symlinks will be created to these localized resources
    * @param command The command that will be run.
+   * @param logDir The log dir to copy debugging information to
    * @throws IOException if any errors happened writing to the OutputStream,
    * while creating symlinks
    */
   public void writeLaunchEnv(OutputStream out, Map<String, String> environment,
-    Map<Path, List<String>> resources, List<String> command) throws IOException{
+      Map<Path, List<String>> resources, List<String> command, Path logDir)
+      throws IOException {
+    this.writeLaunchEnv(out, environment, resources, command, logDir,
+        ContainerLaunch.CONTAINER_SCRIPT);
+  }
+
+  @VisibleForTesting
+  public void writeLaunchEnv(OutputStream out,
+      Map<String, String> environment, Map<Path, List<String>> resources,
+      List<String> command, Path logDir, String outFilename)
+      throws IOException {
+    updateEnvForWhitelistVars(environment);
+
     ContainerLaunch.ShellScriptBuilder sb =
       ContainerLaunch.ShellScriptBuilder.create();
-    Set<String> whitelist = new HashSet<String>();
-    whitelist.add(YarnConfiguration.NM_DOCKER_CONTAINER_EXECUTOR_IMAGE_NAME);
-    whitelist.add(ApplicationConstants.Environment.HADOOP_YARN_HOME.name());
-    whitelist.add(ApplicationConstants.Environment.HADOOP_COMMON_HOME.name());
-    whitelist.add(ApplicationConstants.Environment.HADOOP_HDFS_HOME.name());
-    whitelist.add(ApplicationConstants.Environment.HADOOP_CONF_DIR.name());
-    whitelist.add(ApplicationConstants.Environment.JAVA_HOME.name());
     if (environment != null) {
       for (Map.Entry<String,String> env : environment.entrySet()) {
-        if (!whitelist.contains(env.getKey())) {
-          sb.env(env.getKey().toString(), env.getValue().toString());
-        } else {
-          sb.whitelistedEnv(env.getKey().toString(), env.getValue().toString());
-        }
+        sb.env(env.getKey().toString(), env.getValue().toString());
       }
     }
     if (resources != null) {
@@ -270,6 +277,14 @@ public abstract class ContainerExecutor implements Configurable {
           sb.symlink(entry.getKey(), new Path(linkName));
         }
       }
+    }
+
+    // dump debugging information if configured
+    if (getConf() != null && getConf().getBoolean(
+        YarnConfiguration.NM_LOG_CONTAINER_DEBUG_INFO,
+        YarnConfiguration.DEFAULT_NM_LOG_CONTAINER_DEBUG_INFO)) {
+      sb.copyDebugInformation(new Path(outFilename), new Path(logDir, outFilename));
+      sb.listDebugInformation(new Path(logDir, DIRECTORY_CONTENTS));
     }
 
     sb.command(command);
@@ -382,7 +397,7 @@ public abstract class ContainerExecutor implements Configurable {
             .getBoolean(
                 YarnConfiguration.NM_WINDOWS_CONTAINER_MEMORY_LIMIT_ENABLED,
                 YarnConfiguration.DEFAULT_NM_WINDOWS_CONTAINER_MEMORY_LIMIT_ENABLED)) {
-          memory = resource.getMemory();
+          memory = (int) resource.getMemorySize();
         }
 
         if (conf.getBoolean(
@@ -401,7 +416,7 @@ public abstract class ContainerExecutor implements Configurable {
           cpuRate = Math.min(10000, (int) (containerCpuPercentage * 100));
         }
       }
-      return new String[] { Shell.WINUTILS, "task", "create", "-m",
+      return new String[] { Shell.getWinUtilsPath(), "task", "create", "-m",
           String.valueOf(memory), "-c", String.valueOf(cpuRate), groupId,
           "cmd /c " + command };
     } else {
@@ -428,6 +443,28 @@ public abstract class ContainerExecutor implements Configurable {
     } finally {
       readLock.unlock();
     }
+  }
+
+  /**
+   * Propagate variables from the nodemanager's environment into the
+   * container's environment if unspecified by the container.
+   * @param env the environment to update
+   * @see org.apache.hadoop.yarn.conf.YarnConfiguration#NM_ENV_WHITELIST
+   */
+  protected void updateEnvForWhitelistVars(Map<String, String> env) {
+    for(String var : whitelistVars) {
+      if (!env.containsKey(var)) {
+        String val = getNMEnvVar(var);
+        if (val != null) {
+          env.put(var, val);
+        }
+      }
+    }
+  }
+
+  @VisibleForTesting
+  protected String getNMEnvVar(String varname) {
+    return System.getenv(varname);
   }
 
   /**

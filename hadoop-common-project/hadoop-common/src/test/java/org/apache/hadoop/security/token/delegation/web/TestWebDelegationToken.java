@@ -31,6 +31,8 @@ import org.apache.hadoop.security.authentication.server.PseudoAuthenticationHand
 import org.apache.hadoop.security.authentication.util.KerberosUtil;
 import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSecretManager;
 import org.codehaus.jackson.map.ObjectMapper;
+import org.apache.hadoop.test.GenericTestUtils;
+import org.apache.log4j.Level;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -176,13 +178,8 @@ public class TestWebDelegationToken {
 
   protected Server createJettyServer() {
     try {
-      InetAddress localhost = InetAddress.getLocalHost();
-      ServerSocket ss = new ServerSocket(0, 50, localhost);
-      int port = ss.getLocalPort();
-      ss.close();
       jetty = new Server(0);
       jetty.getConnectors()[0].setHost("localhost");
-      jetty.getConnectors()[0].setPort(port);
       return jetty;
     } catch (Exception ex) {
       throw new RuntimeException("Could not setup Jetty: " + ex.getMessage(),
@@ -192,7 +189,7 @@ public class TestWebDelegationToken {
 
   protected String getJettyURL() {
     Connector c = jetty.getConnectors()[0];
-    return "http://" + c.getHost() + ":" + c.getPort();
+    return "http://" + c.getHost() + ":" + c.getLocalPort();
   }
 
   @Before
@@ -203,6 +200,8 @@ public class TestWebDelegationToken {
     UserGroupInformation.setConfiguration(conf);
 
     jetty = createJettyServer();
+    GenericTestUtils.setLogLevel(KerberosAuthenticationHandler.LOG,
+        Level.TRACE);
   }
 
   @After

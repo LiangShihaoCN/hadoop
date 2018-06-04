@@ -20,6 +20,7 @@ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
 
 import static org.junit.Assert.assertEquals;
 import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
@@ -51,6 +52,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEven
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.NodeType;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceLimits;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.preemption.PreemptionManager;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerApp;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerNode;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
@@ -94,13 +96,12 @@ public class TestChildQueueOrder {
         Resources.createResource(16*GB, 32));
     when(csContext.getClusterResource()).
     thenReturn(Resources.createResource(100 * 16 * GB, 100 * 32));
-    when(csContext.getApplicationComparator()).
-    thenReturn(CapacityScheduler.applicationComparator);
     when(csContext.getNonPartitionedQueueComparator()).
     thenReturn(CapacityScheduler.nonPartitionedQueueComparator);
     when(csContext.getResourceCalculator()).
     thenReturn(resourceComparator);
     when(csContext.getRMContext()).thenReturn(rmContext);
+    when(csContext.getPreemptionManager()).thenReturn(new PreemptionManager());
   }
 
   private FiCaSchedulerApp getMockApplication(int appId, String user) {
@@ -134,11 +135,11 @@ public class TestChildQueueOrder {
         final Resource allocatedResource = Resources.createResource(allocation);
         if (queue instanceof ParentQueue) {
           ((ParentQueue)queue).allocateResource(clusterResource, 
-              allocatedResource, RMNodeLabelsManager.NO_LABEL);
+              allocatedResource, RMNodeLabelsManager.NO_LABEL, false);
         } else {
           FiCaSchedulerApp app1 = getMockApplication(0, "");
           ((LeafQueue)queue).allocateResource(clusterResource, app1, 
-              allocatedResource, null, null);
+              allocatedResource, null, null, false);
         }
 
         // Next call - nothing
@@ -159,21 +160,22 @@ public class TestChildQueueOrder {
     }).
     when(queue).assignContainers(eq(clusterResource), eq(node), 
         any(ResourceLimits.class), any(SchedulingMode.class));
-    doNothing().when(node).releaseContainer(any(Container.class));
+    doNothing().when(node).releaseContainer(any(ContainerId.class),
+        anyBoolean());
   }
 
 
   private float computeQueueAbsoluteUsedCapacity(CSQueue queue, 
       int expectedMemory, Resource clusterResource) {
     return (
-        ((float)expectedMemory / (float)clusterResource.getMemory())
+        ((float)expectedMemory / (float)clusterResource.getMemorySize())
       );
   }
 
   private float computeQueueUsedCapacity(CSQueue queue,
       int expectedMemory, Resource clusterResource) {
     return (expectedMemory / 
-        (clusterResource.getMemory() * queue.getAbsoluteCapacity()));
+        (clusterResource.getMemorySize() * queue.getAbsoluteCapacity()));
   }
 
   final static float DELTA = 0.0001f;
@@ -230,7 +232,8 @@ public class TestChildQueueOrder {
 
     FiCaSchedulerNode node_0 = 
       TestUtils.getMockNode("host_0", DEFAULT_RACK, 0, memoryPerNode*GB);
-    doNothing().when(node_0).releaseContainer(any(Container.class));
+    doNothing().when(node_0).releaseContainer(any(ContainerId.class),
+        anyBoolean());
     
     final Resource clusterResource = 
       Resources.createResource(numNodes * (memoryPerNode*GB), 

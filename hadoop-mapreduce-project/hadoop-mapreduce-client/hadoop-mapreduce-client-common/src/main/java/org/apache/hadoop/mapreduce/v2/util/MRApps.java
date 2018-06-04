@@ -68,6 +68,7 @@ import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.hadoop.yarn.api.records.LocalResourceType;
 import org.apache.hadoop.yarn.api.records.LocalResourceVisibility;
+import org.apache.hadoop.yarn.api.records.URL;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.util.Apps;
@@ -234,7 +235,7 @@ public class MRApps extends Apps {
     }
     // TODO: Remove duplicates.
   }
-  
+
   @SuppressWarnings("deprecation")
   public static void setClasspath(Map<String, String> environment,
       Configuration conf) throws IOException {
@@ -245,11 +246,34 @@ public class MRApps extends Apps {
       conf.getBoolean(MRJobConfig.MAPREDUCE_JOB_CLASSLOADER, false)
         ? Environment.APP_CLASSPATH.name() : Environment.CLASSPATH.name();
 
+    String hadoopClasspathEnvVar = Environment.HADOOP_CLASSPATH.name();
+
     MRApps.addToEnvironment(environment,
       classpathEnvVar, crossPlatformifyMREnv(conf, Environment.PWD), conf);
+
+    MRApps.addToEnvironment(environment,
+        hadoopClasspathEnvVar, crossPlatformifyMREnv(conf, Environment.PWD),
+        conf);
+
     if (!userClassesTakesPrecedence) {
       MRApps.setMRFrameworkClasspath(environment, conf);
     }
+
+    addClasspathToEnv(environment, classpathEnvVar, conf);
+    addClasspathToEnv(environment, hadoopClasspathEnvVar, conf);
+
+    // MAPREDUCE-6619, retain $HADOOP_CLASSPATH
+    MRApps.addToEnvironment(environment, hadoopClasspathEnvVar,
+        System.getenv(hadoopClasspathEnvVar), conf);
+
+    if (userClassesTakesPrecedence) {
+      MRApps.setMRFrameworkClasspath(environment, conf);
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  public static void addClasspathToEnv(Map<String, String> environment,
+      String classpathEnvVar, Configuration conf) throws IOException {
     MRApps.addToEnvironment(
         environment,
         classpathEnvVar,
@@ -257,15 +281,21 @@ public class MRApps extends Apps {
     MRApps.addToEnvironment(
         environment,
         classpathEnvVar,
-        MRJobConfig.JOB_JAR + Path.SEPARATOR + "classes" + Path.SEPARATOR, conf);
+        MRJobConfig.JOB_JAR + Path.SEPARATOR + "classes" + Path.SEPARATOR,
+        conf);
+
     MRApps.addToEnvironment(
         environment,
         classpathEnvVar,
-        MRJobConfig.JOB_JAR + Path.SEPARATOR + "lib" + Path.SEPARATOR + "*", conf);
+        MRJobConfig.JOB_JAR + Path.SEPARATOR + "lib" + Path.SEPARATOR + "*",
+        conf);
+
     MRApps.addToEnvironment(
         environment,
         classpathEnvVar,
-        crossPlatformifyMREnv(conf, Environment.PWD) + Path.SEPARATOR + "*", conf);
+        crossPlatformifyMREnv(conf, Environment.PWD) + Path.SEPARATOR + "*",
+        conf);
+
     // a * in the classpath will only find a .jar, so we need to filter out
     // all .jars and add everything else
     addToClasspathIfNotJar(DistributedCache.getFileClassPaths(conf),
@@ -276,11 +306,8 @@ public class MRApps extends Apps {
         DistributedCache.getCacheArchives(conf),
         conf,
         environment, classpathEnvVar);
-    if (userClassesTakesPrecedence) {
-      MRApps.setMRFrameworkClasspath(environment, conf);
-    }
   }
-  
+
   /**
    * Add the paths to the classpath if they are not jars
    * @param paths the paths to add to the classpath
@@ -446,6 +473,7 @@ public class MRApps extends Apps {
     return startCommitFile;
   }
 
+  @SuppressWarnings("deprecation")
   public static void setupDistributedCache( 
       Configuration conf, 
       Map<String, LocalResource> localResources) 
@@ -478,6 +506,7 @@ public class MRApps extends Apps {
    * @param conf
    * @throws java.io.IOException
    */
+  @SuppressWarnings("deprecation")
   public static void setupDistributedCacheLocal(Configuration conf)
       throws IOException {
 
@@ -545,6 +574,7 @@ public class MRApps extends Apps {
   // TODO - Move this to MR!
   // Use TaskDistributedCacheManager.CacheFiles.makeCacheFiles(URI[], 
   // long[], boolean[], Path[], FileType)
+  @SuppressWarnings("deprecation")
   private static void parseDistributedCacheArtifacts(
       Configuration conf,
       Map<String, LocalResource> localResources,
@@ -579,8 +609,7 @@ public class MRApps extends Apps {
         }
         String linkName = name.toUri().getPath();
         LocalResource orig = localResources.get(linkName);
-        org.apache.hadoop.yarn.api.records.URL url = 
-          ConverterUtils.getYarnUrlFromURI(p.toUri());
+        URL url = URL.fromURI(p.toUri());
         if(orig != null && !orig.getResource().equals(url)) {
           LOG.warn(
               getResourceDescription(orig.getType()) + 
@@ -589,8 +618,8 @@ public class MRApps extends Apps {
               " This will be an error in Hadoop 2.0");
           continue;
         }
-        localResources.put(linkName, LocalResource.newInstance(ConverterUtils
-          .getYarnUrlFromURI(p.toUri()), type, visibilities[i]
+        localResources.put(linkName, LocalResource
+            .newInstance(URL.fromURI(p.toUri()), type, visibilities[i]
             ? LocalResourceVisibility.PUBLIC : LocalResourceVisibility.PRIVATE,
           sizes[i], timestamps[i]));
       }

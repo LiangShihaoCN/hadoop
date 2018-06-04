@@ -37,6 +37,7 @@ import org.apache.hadoop.hdfs.server.datanode.BlockScanner.Conf;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeReference;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi.BlockIterator;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi;
+import org.apache.hadoop.hdfs.server.datanode.metrics.DataNodeMetrics;
 import org.apache.hadoop.hdfs.util.DataTransferThrottler;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.util.Time;
@@ -69,12 +70,19 @@ public class VolumeScanner extends Thread {
   /**
    * The configuration.
    */
-  private final Conf conf;
+  private Conf conf;
+
+  @VisibleForTesting
+  void setConf(Conf conf) {
+    this.conf = conf;
+  }
 
   /**
    * The DataNode this VolumEscanner is associated with.
    */
   private final DataNode datanode;
+
+  private final DataNodeMetrics metrics;
 
   /**
    * A reference to the volume that we're scanning.
@@ -216,9 +224,8 @@ public class VolumeScanner extends Thread {
   }
 
   public void printStats(StringBuilder p) {
-    p.append("Block scanner information for volume " +
-        volume.getStorageID() + " with base path " + volume.getBasePath() +
-        "%n");
+    p.append(String.format("Block scanner information for volume %s with base" +
+        " path %s%n", volume.getStorageID(), volume.getBasePath()));
     synchronized (stats) {
       p.append(String.format("Bytes verified in last hour       : %57d%n",
           stats.bytesScannedInPastHour));
@@ -245,7 +252,7 @@ public class VolumeScanner extends Thread {
           stats.lastBlockScanned.toString())));
       p.append(String.format("More blocks to scan in period     : %57s%n",
           !stats.eof));
-      p.append("%n");
+      p.append(System.lineSeparator());
     }
   }
 
@@ -282,12 +289,13 @@ public class VolumeScanner extends Thread {
             volume.getBasePath(), block);
         return;
       }
-      LOG.warn("Reporting bad {} on {}", block, volume.getBasePath());
+      LOG.warn("Reporting bad " + block + " with volume "
+          + volume.getBasePath(), e);
       try {
-        scanner.datanode.reportBadBlocks(block);
+        scanner.datanode.reportBadBlocks(block, volume);
       } catch (IOException ie) {
         // This is bad, but not bad enough to shut down the scanner.
-        LOG.warn("Cannot report bad " + block.getBlockId(), e);
+        LOG.warn("Cannot report bad block " + block, ie);
       }
     }
   }
@@ -295,6 +303,7 @@ public class VolumeScanner extends Thread {
   VolumeScanner(Conf conf, DataNode datanode, FsVolumeReference ref) {
     this.conf = conf;
     this.datanode = datanode;
+    this.metrics = datanode.getMetrics();
     this.ref = ref;
     this.volume = ref.getVolume();
     ScanResultHandler handler;
@@ -430,6 +439,7 @@ public class VolumeScanner extends Thread {
     if (block == null) {
       return -1; // block not found.
     }
+    LOG.debug("start scanning block {}", block);
     BlockSender blockSender = null;
     try {
       blockSender = new BlockSender(block, 0, -1,
@@ -438,12 +448,14 @@ public class VolumeScanner extends Thread {
       throttler.setBandwidth(bytesPerSec);
       long bytesRead = blockSender.sendBlock(nullStream, null, throttler);
       resultHandler.handle(block, null);
+      metrics.incrBlocksVerified();
       return bytesRead;
     } catch (IOException e) {
       resultHandler.handle(block, e);
     } finally {
       IOUtils.cleanup(null, blockSender);
     }
+    metrics.incrBlockVerificationFailures();
     return -1;
   }
 
@@ -611,6 +623,7 @@ public class VolumeScanner extends Thread {
               break;
             }
             if (timeout > 0) {
+              LOG.debug("{}: wait for {} milliseconds", this, timeout);
               wait(timeout);
               if (stopping) {
                 break;

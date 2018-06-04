@@ -114,6 +114,7 @@ public class TestHASafeMode {
   public void shutdownCluster() {
     if (cluster != null) {
       cluster.shutdown();
+      cluster = null;
     }
   }
   
@@ -835,7 +836,7 @@ public class TestHASafeMode {
           new ExtendedBlock(previousBlock),
           new DatanodeInfo[0],
           DFSClientAdapter.getFileId((DFSOutputStream) create
-              .getWrappedStream()), null);
+              .getWrappedStream()), null, null);
       cluster.restartNameNode(0, true);
       cluster.restartDataNode(0);
       cluster.transitionToActive(0);

@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.mapreduce.v2.app.job.impl;
 
+import static org.apache.hadoop.test.GenericTestUtils.waitFor;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -33,6 +34,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 
+import com.google.common.base.Supplier;
 import org.junit.Assert;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -70,9 +72,13 @@ import org.apache.hadoop.mapreduce.v2.app.job.event.JobEventType;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptContainerAssignedEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptContainerLaunchedEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptDiagnosticsUpdateEvent;
+import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptKillEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptTooManyFetchFailureEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptEventType;
+import org.apache.hadoop.mapreduce.v2.app.job.event.TaskEvent;
+import org.apache.hadoop.mapreduce.v2.app.job.event.TaskEventType;
+import org.apache.hadoop.mapreduce.v2.app.job.event.TaskTAttemptKilledEvent;
 import org.apache.hadoop.mapreduce.v2.app.rm.ContainerRequestEvent;
 import org.apache.hadoop.mapreduce.v2.util.MRBuilderUtils;
 import org.apache.hadoop.security.Credentials;
@@ -112,6 +118,69 @@ public class TestTaskAttempt{
   public void testMRAppHistoryForReduce() throws Exception {
     MRApp app = new FailingAttemptsMRApp(0, 1);
     testMRAppHistory(app);
+  }
+
+  @Test
+  public void testMRAppHistoryForTAFailedInAssigned() throws Exception {
+    // test TA_CONTAINER_LAUNCH_FAILED for map
+    FailingAttemptsDuringAssignedMRApp app =
+        new FailingAttemptsDuringAssignedMRApp(1, 0,
+            TaskAttemptEventType.TA_CONTAINER_LAUNCH_FAILED);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_CONTAINER_LAUNCH_FAILED for reduce
+    app =
+        new FailingAttemptsDuringAssignedMRApp(0, 1,
+            TaskAttemptEventType.TA_CONTAINER_LAUNCH_FAILED);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_CONTAINER_COMPLETED for map
+    app =
+        new FailingAttemptsDuringAssignedMRApp(1, 0,
+            TaskAttemptEventType.TA_CONTAINER_COMPLETED);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_CONTAINER_COMPLETED for reduce
+    app =
+        new FailingAttemptsDuringAssignedMRApp(0, 1,
+            TaskAttemptEventType.TA_CONTAINER_COMPLETED);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_FAILMSG for map
+    app =
+        new FailingAttemptsDuringAssignedMRApp(1, 0,
+            TaskAttemptEventType.TA_FAILMSG);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_FAILMSG for reduce
+    app =
+        new FailingAttemptsDuringAssignedMRApp(0, 1,
+            TaskAttemptEventType.TA_FAILMSG);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_FAILMSG_BY_CLIENT for map
+    app =
+        new FailingAttemptsDuringAssignedMRApp(1, 0,
+            TaskAttemptEventType.TA_FAILMSG_BY_CLIENT);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_FAILMSG_BY_CLIENT for reduce
+    app =
+        new FailingAttemptsDuringAssignedMRApp(0, 1,
+            TaskAttemptEventType.TA_FAILMSG_BY_CLIENT);
+    testTaskAttemptAssignedFailHistory(app);
+
+    // test TA_KILL for map
+    app =
+        new FailingAttemptsDuringAssignedMRApp(1, 0,
+            TaskAttemptEventType.TA_KILL);
+    testTaskAttemptAssignedKilledHistory(app);
+
+    // test TA_KILL for reduce
+    app =
+        new FailingAttemptsDuringAssignedMRApp(0, 1,
+            TaskAttemptEventType.TA_KILL);
+    testTaskAttemptAssignedKilledHistory(app);
   }
 
   @Test
@@ -238,6 +307,7 @@ public class TestTaskAttempt{
     Assert.assertEquals(rta.getLaunchTime(), 10);
     Counters counters = job.getAllCounters();
     Assert.assertEquals((int) Math.ceil((float) mapMemMb / minContainerSize),
+
         counters.findCounter(JobCounter.SLOTS_MILLIS_MAPS).getValue());
     Assert.assertEquals((int) Math.ceil((float) reduceMemMb / minContainerSize),
         counters.findCounter(JobCounter.SLOTS_MILLIS_REDUCES).getValue());
@@ -301,6 +371,41 @@ public class TestTaskAttempt{
         report.getTaskAttemptState());
   }
 
+  private void testTaskAttemptAssignedFailHistory
+      (FailingAttemptsDuringAssignedMRApp app) throws Exception {
+    Configuration conf = new Configuration();
+    Job job = app.submit(conf);
+    app.waitForState(job, JobState.FAILED);
+    Map<TaskId, Task> tasks = job.getTasks();
+    Assert.assertTrue("No Ta Started JH Event", app.getTaStartJHEvent());
+    Assert.assertTrue("No Ta Failed JH Event", app.getTaFailedJHEvent());
+  }
+
+  private void testTaskAttemptAssignedKilledHistory
+      (final FailingAttemptsDuringAssignedMRApp app) throws Exception {
+    Configuration conf = new Configuration();
+    Job job = app.submit(conf);
+    app.waitForState(job, JobState.RUNNING);
+    Map<TaskId, Task> tasks = job.getTasks();
+    Task task = tasks.values().iterator().next();
+    app.waitForState(task, TaskState.SCHEDULED);
+    Map<TaskAttemptId, TaskAttempt> attempts = task.getAttempts();
+    TaskAttempt attempt = attempts.values().iterator().next();
+    app.waitForState(attempt, TaskAttemptState.KILLED);
+    waitFor(new Supplier<Boolean>() {
+      @Override
+      public Boolean get() {
+        return app.getTaStartJHEvent();
+      }
+    }, 100, 800);
+    waitFor(new Supplier<Boolean>() {
+      @Override
+      public Boolean get() {
+        return app.getTaKilledJHEvent();
+      }
+    }, 100, 800);
+  }
+
   static class FailingAttemptsMRApp extends MRApp {
     FailingAttemptsMRApp(int maps, int reduces) {
       super(maps, reduces, true, "FailingAttemptsMRApp", true);
@@ -325,6 +430,72 @@ public class TestTaskAttempt{
                 .getHistoryEvent().getDatum();
             Assert.assertEquals("Diagnostic Information is not Correct",
                 "Test Diagnostic Event", datum.get(8).toString());
+          }
+        }
+      };
+    }
+  }
+
+  static class FailingAttemptsDuringAssignedMRApp extends MRApp {
+    FailingAttemptsDuringAssignedMRApp(int maps, int reduces,
+        TaskAttemptEventType event) {
+      super(maps, reduces, true, "FailingAttemptsMRApp", true);
+      sendFailEvent = event;
+    }
+
+   TaskAttemptEventType sendFailEvent;
+
+   @Override
+    protected void containerLaunched(TaskAttemptId attemptID,
+        int shufflePort) {
+      //do nothing, not send TA_CONTAINER_LAUNCHED event
+    }
+
+    @Override
+    protected void attemptLaunched(TaskAttemptId attemptID) {
+      getContext().getEventHandler().handle(
+          new TaskAttemptEvent(attemptID, sendFailEvent));
+    }
+
+    private boolean receiveTaStartJHEvent = false;
+    private boolean receiveTaFailedJHEvent = false;
+    private boolean receiveTaKilledJHEvent = false;
+
+    public boolean getTaStartJHEvent(){
+      return receiveTaStartJHEvent;
+    }
+
+    public boolean getTaFailedJHEvent(){
+      return receiveTaFailedJHEvent;
+    }
+
+    public boolean getTaKilledJHEvent(){
+        return receiveTaKilledJHEvent;
+    }
+
+    protected EventHandler<JobHistoryEvent> createJobHistoryHandler(
+        AppContext context) {
+      return new EventHandler<JobHistoryEvent>() {
+        @Override
+        public void handle(JobHistoryEvent event) {
+          if (event.getType() == org.apache.hadoop.mapreduce.jobhistory.
+              EventType.MAP_ATTEMPT_FAILED) {
+            receiveTaFailedJHEvent = true;
+          } else if (event.getType() == org.apache.hadoop.mapreduce.
+              jobhistory.EventType.MAP_ATTEMPT_KILLED) {
+            receiveTaKilledJHEvent = true;
+          } else if (event.getType() == org.apache.hadoop.mapreduce.
+              jobhistory.EventType.MAP_ATTEMPT_STARTED) {
+            receiveTaStartJHEvent = true;
+          } else if (event.getType() == org.apache.hadoop.mapreduce.
+              jobhistory.EventType.REDUCE_ATTEMPT_FAILED) {
+            receiveTaFailedJHEvent = true;
+          } else if (event.getType() == org.apache.hadoop.mapreduce.
+                  jobhistory.EventType.REDUCE_ATTEMPT_KILLED) {
+            receiveTaKilledJHEvent = true;
+          } else if (event.getType() == org.apache.hadoop.mapreduce.
+              jobhistory.EventType.REDUCE_ATTEMPT_STARTED) {
+            receiveTaStartJHEvent = true;
           }
         }
       };
@@ -408,7 +579,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
     setupTaskAttemptFinishingMonitor(eventHandler, jobConf, appCtx);
 
     TaskAttemptImpl taImpl =
@@ -466,7 +637,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
     setupTaskAttemptFinishingMonitor(eventHandler, jobConf, appCtx);
 
     TaskAttemptImpl taImpl =
@@ -530,7 +701,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
     setupTaskAttemptFinishingMonitor(eventHandler, jobConf, appCtx);
 
     TaskAttemptImpl taImpl =
@@ -600,7 +771,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
     setupTaskAttemptFinishingMonitor(eventHandler, jobConf, appCtx);
 
     TaskAttemptImpl taImpl = new MapTaskAttemptImpl(taskId, 1, eventHandler,
@@ -620,6 +791,14 @@ public class TestTaskAttempt{
     assertFalse(
         "InternalError occurred trying to handle TA_DIAGNOSTICS_UPDATE on assigned task",
         eventHandler.internalError);
+    try {
+      taImpl.handle(new TaskAttemptEvent(attemptId,
+          TaskAttemptEventType.TA_KILL));
+      Assert.assertTrue("No exception on UNASSIGNED STATE KILL event", true);
+    } catch (Exception e) {
+      Assert.assertFalse(
+          "Exception not expected for UNASSIGNED STATE KILL event", true);
+    }
   }
 
   @Test
@@ -649,7 +828,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
     setupTaskAttemptFinishingMonitor(eventHandler, jobConf, appCtx);
 
     TaskAttemptImpl taImpl =
@@ -717,7 +896,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
     setupTaskAttemptFinishingMonitor(eventHandler, jobConf, appCtx);
 
     TaskAttemptImpl taImpl = new MapTaskAttemptImpl(taskId, 1, eventHandler,
@@ -809,7 +988,46 @@ public class TestTaskAttempt{
         + " Task attempt finish time is not the same ",
         finishTime, Long.valueOf(taImpl.getFinishTime()));
   }
-  
+
+  private void containerKillBeforeAssignment(boolean scheduleAttempt)
+      throws Exception {
+    MockEventHandler eventHandler = new MockEventHandler();
+    ApplicationId appId = ApplicationId.newInstance(1, 2);
+    JobId jobId = MRBuilderUtils.newJobId(appId, 1);
+    TaskId taskId = MRBuilderUtils.newTaskId(jobId, 1, TaskType.MAP);
+
+    TaskAttemptImpl taImpl =
+        new MapTaskAttemptImpl(taskId, 1, eventHandler, mock(Path.class), 1,
+            mock(TaskSplitMetaInfo.class), new JobConf(),
+            mock(TaskAttemptListener.class), mock(Token.class),
+            new Credentials(), new SystemClock(),
+            mock(AppContext.class));
+    if (scheduleAttempt) {
+      taImpl.handle(new TaskAttemptEvent(taImpl.getID(),
+          TaskAttemptEventType.TA_SCHEDULE));
+    }
+    taImpl.handle(new TaskAttemptKillEvent(taImpl.getID(),"", true));
+    assertEquals("Task attempt is not in KILLED state", taImpl.getState(),
+        TaskAttemptState.KILLED);
+    assertEquals("Task attempt's internal state is not KILLED",
+        taImpl.getInternalState(), TaskAttemptStateInternal.KILLED);
+    assertFalse("InternalError occurred", eventHandler.internalError);
+    TaskEvent event = eventHandler.lastTaskEvent;
+    assertEquals(TaskEventType.T_ATTEMPT_KILLED, event.getType());
+    // In NEW state, new map attempt should not be rescheduled.
+    assertFalse(((TaskTAttemptKilledEvent)event).getRescheduleAttempt());
+  }
+
+  @Test
+  public void testContainerKillOnNew() throws Exception {
+    containerKillBeforeAssignment(false);
+  }
+
+  @Test
+  public void testContainerKillOnUnassigned() throws Exception {
+    containerKillBeforeAssignment(true);
+  }
+
   @Test
   public void testContainerKillAfterAssigned() throws Exception {
     ApplicationId appId = ApplicationId.newInstance(1, 2);
@@ -838,7 +1056,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
 
     TaskAttemptImpl taImpl = new MapTaskAttemptImpl(taskId, 1, eventHandler,
         jobFile, 1, splits, jobConf, taListener, new Token(),
@@ -859,7 +1077,7 @@ public class TestTaskAttempt{
         taImpl.getInternalState(), TaskAttemptStateInternal.ASSIGNED);
     taImpl.handle(new TaskAttemptEvent(attemptId,
         TaskAttemptEventType.TA_KILL));
-    assertEquals("Task should be in KILLED state",
+    assertEquals("Task should be in KILL_CONTAINER_CLEANUP state",
         TaskAttemptStateInternal.KILL_CONTAINER_CLEANUP,
         taImpl.getInternalState());
   }
@@ -892,7 +1110,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
 
     TaskAttemptImpl taImpl = new MapTaskAttemptImpl(taskId, 1, eventHandler,
         jobFile, 1, splits, jobConf, taListener, new Token(),
@@ -916,7 +1134,7 @@ public class TestTaskAttempt{
         TaskAttemptEventType.TA_KILL));
     assertFalse("InternalError occurred trying to handle TA_KILL",
         eventHandler.internalError);
-    assertEquals("Task should be in KILLED state",
+    assertEquals("Task should be in KILL_CONTAINER_CLEANUP state",
         TaskAttemptStateInternal.KILL_CONTAINER_CLEANUP,
         taImpl.getInternalState());
   }
@@ -949,7 +1167,7 @@ public class TestTaskAttempt{
     ClusterInfo clusterInfo = mock(ClusterInfo.class);
     Resource resource = mock(Resource.class);
     when(appCtx.getClusterInfo()).thenReturn(clusterInfo);
-    when(resource.getMemory()).thenReturn(1024);
+    when(resource.getMemorySize()).thenReturn(1024L);
 
     TaskAttemptImpl taImpl = new MapTaskAttemptImpl(taskId, 1, eventHandler,
         jobFile, 1, splits, jobConf, taListener, new Token(),
@@ -977,11 +1195,10 @@ public class TestTaskAttempt{
         TaskAttemptEventType.TA_KILL));
     assertFalse("InternalError occurred trying to handle TA_KILL",
         eventHandler.internalError);
-    assertEquals("Task should be in KILLED state",
+    assertEquals("Task should be in KILL_CONTAINER_CLEANUP state",
         TaskAttemptStateInternal.KILL_CONTAINER_CLEANUP,
         taImpl.getInternalState());
   }
-
 
   @Test
   public void testKillMapTaskWhileSuccessFinishing() throws Exception {
@@ -1020,6 +1237,37 @@ public class TestTaskAttempt{
         TaskAttemptState.KILLED);
 
     assertFalse("InternalError occurred", eventHandler.internalError);
+  }
+
+  @Test
+  public void testKillMapTaskAfterSuccess() throws Exception {
+    MockEventHandler eventHandler = new MockEventHandler();
+    TaskAttemptImpl taImpl = createTaskAttemptImpl(eventHandler);
+
+    taImpl.handle(new TaskAttemptEvent(taImpl.getID(),
+        TaskAttemptEventType.TA_DONE));
+
+    assertEquals("Task attempt is not in SUCCEEDED state", taImpl.getState(),
+        TaskAttemptState.SUCCEEDED);
+    assertEquals("Task attempt's internal state is not " +
+        "SUCCESS_FINISHING_CONTAINER", taImpl.getInternalState(),
+        TaskAttemptStateInternal.SUCCESS_FINISHING_CONTAINER);
+
+    taImpl.handle(new TaskAttemptEvent(taImpl.getID(),
+        TaskAttemptEventType.TA_CONTAINER_CLEANED));
+    // Send a map task attempt kill event indicating next map attempt has to be
+    // reschedule
+    taImpl.handle(new TaskAttemptKillEvent(taImpl.getID(),"", true));
+    assertEquals("Task attempt is not in KILLED state", taImpl.getState(),
+        TaskAttemptState.KILLED);
+    assertEquals("Task attempt's internal state is not KILLED",
+        taImpl.getInternalState(), TaskAttemptStateInternal.KILLED);
+    assertFalse("InternalError occurred", eventHandler.internalError);
+    TaskEvent event = eventHandler.lastTaskEvent;
+    assertEquals(TaskEventType.T_ATTEMPT_KILLED, event.getType());
+    // Send an attempt killed event to TaskImpl forwarding the same reschedule
+    // flag we received in task attempt kill event.
+    assertTrue(((TaskTAttemptKilledEvent)event).getRescheduleAttempt());
   }
 
   @Test
@@ -1233,9 +1481,13 @@ public class TestTaskAttempt{
 
   public static class MockEventHandler implements EventHandler {
     public boolean internalError;
+    public TaskEvent lastTaskEvent;
 
     @Override
     public void handle(Event event) {
+      if (event instanceof TaskEvent) {
+        lastTaskEvent = (TaskEvent)event;
+      }
       if (event instanceof JobEvent) {
         JobEvent je = ((JobEvent) event);
         if (JobEventType.INTERNAL_ERROR == je.getType()) {

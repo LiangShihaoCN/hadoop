@@ -20,6 +20,7 @@ package org.apache.hadoop.hdfs.server.namenode.web.resources;
 import static org.mockito.Mockito.*;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.util.Arrays;
 import java.util.List;
 
@@ -33,6 +34,7 @@ import org.apache.hadoop.hdfs.DFSTestUtil;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeManager;
@@ -61,6 +63,9 @@ public class TestWebHdfsDataLocality {
   private static final String RACK0 = "/rack0";
   private static final String RACK1 = "/rack1";
   private static final String RACK2 = "/rack2";
+
+  private static final String LOCALHOST =
+      InetAddress.getLoopbackAddress().getHostName();
 
   @Rule
   public final ExpectedException exception = ExpectedException.none();
@@ -96,7 +101,8 @@ public class TestWebHdfsDataLocality {
 
           //The chosen datanode must be the same as the client address
           final DatanodeInfo chosen = NamenodeWebHdfsMethods.chooseDatanode(
-              namenode, f, PutOpParam.Op.CREATE, -1L, blocksize, null);
+              namenode, f, PutOpParam.Op.CREATE, -1L, blocksize, null,
+              LOCALHOST, null);
           Assert.assertEquals(ipAddr, chosen.getIpAddr());
         }
       }
@@ -120,20 +126,26 @@ public class TestWebHdfsDataLocality {
       //the chosen datanode must be the same as the replica location.
 
       { //test GETFILECHECKSUM
+        final HdfsFileStatus status = dfs.getClient().getFileInfo(f);
         final DatanodeInfo chosen = NamenodeWebHdfsMethods.chooseDatanode(
-            namenode, f, GetOpParam.Op.GETFILECHECKSUM, -1L, blocksize, null);
+            namenode, f, GetOpParam.Op.GETFILECHECKSUM, -1L, blocksize, null,
+            LOCALHOST, status);
         Assert.assertEquals(expected, chosen);
       }
   
       { //test OPEN
+        final HdfsFileStatus status = dfs.getClient().getFileInfo(f);
         final DatanodeInfo chosen = NamenodeWebHdfsMethods.chooseDatanode(
-            namenode, f, GetOpParam.Op.OPEN, 0, blocksize, null);
+            namenode, f, GetOpParam.Op.OPEN, 0, blocksize, null,
+            LOCALHOST, status);
         Assert.assertEquals(expected, chosen);
       }
 
       { //test APPEND
+        final HdfsFileStatus status = dfs.getClient().getFileInfo(f);
         final DatanodeInfo chosen = NamenodeWebHdfsMethods.chooseDatanode(
-            namenode, f, PostOpParam.Op.APPEND, -1L, blocksize, null);
+            namenode, f, PostOpParam.Op.APPEND, -1L, blocksize, null,
+            LOCALHOST, status);
         Assert.assertEquals(expected, chosen);
       }
     } finally {
@@ -187,9 +199,10 @@ public class TestWebHdfsDataLocality {
       for (int i = 0; i < 2; i++) {
         sb.append(locations[i].getXferAddr());
         { // test GETFILECHECKSUM
+          final HdfsFileStatus status = dfs.getClient().getFileInfo(f);
           final DatanodeInfo chosen = NamenodeWebHdfsMethods.chooseDatanode(
               namenode, f, GetOpParam.Op.GETFILECHECKSUM, -1L, blocksize,
-              sb.toString());
+              sb.toString(), LOCALHOST, status);
           for (int j = 0; j <= i; j++) {
             Assert.assertNotEquals(locations[j].getHostName(),
                 chosen.getHostName());
@@ -197,8 +210,10 @@ public class TestWebHdfsDataLocality {
         }
 
         { // test OPEN
+          final HdfsFileStatus status = dfs.getClient().getFileInfo(f);
           final DatanodeInfo chosen = NamenodeWebHdfsMethods.chooseDatanode(
-              namenode, f, GetOpParam.Op.OPEN, 0, blocksize, sb.toString());
+              namenode, f, GetOpParam.Op.OPEN, 0, blocksize, sb.toString(),
+              LOCALHOST, status);
           for (int j = 0; j <= i; j++) {
             Assert.assertNotEquals(locations[j].getHostName(),
                 chosen.getHostName());
@@ -206,9 +221,10 @@ public class TestWebHdfsDataLocality {
         }
   
         { // test APPEND
+          final HdfsFileStatus status = dfs.getClient().getFileInfo(f);
           final DatanodeInfo chosen = NamenodeWebHdfsMethods
               .chooseDatanode(namenode, f, PostOpParam.Op.APPEND, -1L,
-                  blocksize, sb.toString());
+                  blocksize, sb.toString(), LOCALHOST, status);
           for (int j = 0; j <= i; j++) {
             Assert.assertNotEquals(locations[j].getHostName(),
                 chosen.getHostName());
@@ -229,6 +245,6 @@ public class TestWebHdfsDataLocality {
     exception.expect(IOException.class);
     exception.expectMessage("Namesystem has not been intialized yet.");
     NamenodeWebHdfsMethods.chooseDatanode(nn, "/path", PutOpParam.Op.CREATE, 0,
-        DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT, null);
+        DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT, null, LOCALHOST, null);
   }
 }

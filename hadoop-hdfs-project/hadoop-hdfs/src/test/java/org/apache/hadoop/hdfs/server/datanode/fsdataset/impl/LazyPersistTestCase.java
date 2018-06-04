@@ -130,17 +130,33 @@ public abstract class LazyPersistTestCase {
   public Timeout timeout = new Timeout(300000);
 
   protected final LocatedBlocks ensureFileReplicasOnStorageType(
-      Path path, StorageType storageType) throws IOException {
+      final Path path, final StorageType storageType)
+      throws IOException, TimeoutException, InterruptedException {
     // Ensure that returned block locations returned are correct!
     LOG.info("Ensure path: " + path + " is on StorageType: " + storageType);
     assertThat(fs.exists(path), is(true));
-    long fileLength = client.getFileInfo(path.toString()).getLen();
-    LocatedBlocks locatedBlocks =
-        client.getLocatedBlocks(path.toString(), 0, fileLength);
-    for (LocatedBlock locatedBlock : locatedBlocks.getLocatedBlocks()) {
-      assertThat(locatedBlock.getStorageTypes()[0], is(storageType));
-    }
-    return locatedBlocks;
+    final long fileLength = client.getFileInfo(path.toString()).getLen();
+
+    GenericTestUtils.waitFor(new Supplier<Boolean>() {
+      @Override
+      public Boolean get() {
+        try {
+          LocatedBlocks locatedBlocks =
+              client.getLocatedBlocks(path.toString(), 0, fileLength);
+          for (LocatedBlock locatedBlock : locatedBlocks.getLocatedBlocks()) {
+            if (locatedBlock.getStorageTypes()[0] != storageType) {
+              return false;
+            }
+          }
+          return true;
+        } catch (IOException ioe) {
+          LOG.warn("Exception got in ensureFileReplicasOnStorageType()", ioe);
+          return false;
+        }
+      }
+    }, 100, 30 * 1000);
+
+    return client.getLocatedBlocks(path.toString(), 0, fileLength);
   }
 
   /**
@@ -264,11 +280,12 @@ public abstract class LazyPersistTestCase {
     if (useSCR) {
       conf.setBoolean(HdfsClientConfigKeys.Read.ShortCircuit.KEY, true);
       // Do not share a client context across tests.
-      conf.set(DFS_CLIENT_CONTEXT, UUID.randomUUID().toString());
+      conf.set(HdfsClientConfigKeys.DFS_CLIENT_CONTEXT, UUID.randomUUID().toString());
       conf.set(DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY,
           UserGroupInformation.getCurrentUser().getShortUserName());
       if (useLegacyBlockReaderLocal) {
-        conf.setBoolean(DFS_CLIENT_USE_LEGACY_BLOCKREADERLOCAL, true);
+        conf.setBoolean(
+            HdfsClientConfigKeys.DFS_CLIENT_USE_LEGACY_BLOCKREADERLOCAL, true);
       } else {
         sockDir = new TemporarySocketDirectory();
         conf.set(DFS_DOMAIN_SOCKET_PATH_KEY, new File(sockDir.getDir(),
@@ -479,6 +496,7 @@ public abstract class LazyPersistTestCase {
 
   protected final void verifyRamDiskJMXMetric(String metricName,
       long expectedValue) throws Exception {
+    waitForMetric(metricName, (int)expectedValue);
     assertEquals(expectedValue, Integer.parseInt(jmx.getValue(metricName)));
   }
 
@@ -509,20 +527,7 @@ public abstract class LazyPersistTestCase {
 
   protected void waitForMetric(final String metricName, final int expectedValue)
       throws TimeoutException, InterruptedException {
-    GenericTestUtils.waitFor(new Supplier<Boolean>() {
-      @Override
-      public Boolean get() {
-        try {
-          final int currentValue = Integer.parseInt(jmx.getValue(metricName));
-          LOG.info("Waiting for " + metricName +
-                       " to reach value " + expectedValue +
-                       ", current value = " + currentValue);
-          return currentValue == expectedValue;
-        } catch (Exception e) {
-          throw new UnhandledException("Test failed due to unexpected exception", e);
-        }
-      }
-    }, 1000, Integer.MAX_VALUE);
+    DFSTestUtil.waitForMetric(jmx, metricName, expectedValue);
   }
 
   protected void triggerEviction(DataNode dn) {

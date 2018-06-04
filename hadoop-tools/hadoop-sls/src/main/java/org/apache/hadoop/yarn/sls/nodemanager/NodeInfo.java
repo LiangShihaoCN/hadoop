@@ -26,6 +26,7 @@ import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.net.Node;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
+import org.apache.hadoop.yarn.api.records.Container;
 import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerState;
@@ -33,6 +34,7 @@ import org.apache.hadoop.yarn.api.records.ContainerStatus;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.hadoop.yarn.api.records.ResourceUtilization;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NodeHeartbeatResponse;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
@@ -141,12 +143,15 @@ public class NodeInfo {
       return runningApplications;
     }
 
-    public void updateNodeHeartbeatResponseForCleanup(
-            NodeHeartbeatResponse response) {
+    public void setAndUpdateNodeHeartbeatResponse(
+        NodeHeartbeatResponse response) {
     }
 
     public NodeHeartbeatResponse getLastNodeHeartBeatResponse() {
       return null;
+    }
+
+    public void resetLastNodeHeartBeatResponse() {
     }
 
     public List<UpdatedContainerInfo> pullContainerUpdates() {
@@ -170,6 +175,31 @@ public class NodeInfo {
     @Override
     public Set<String> getNodeLabels() {
       return RMNodeLabelsManager.EMPTY_STRING_SET;
+    }
+
+    @Override
+    public List<Container> pullNewlyIncreasedContainers() {
+      // TODO Auto-generated method stub
+      return null;
+    }
+
+    @Override
+    public ResourceUtilization getAggregatedContainersUtilization() {
+      return null;
+    }
+
+    @Override
+    public ResourceUtilization getNodeUtilization() {
+      return null;
+    }
+
+    @Override
+    public long getUntrackedTimeStamp() {
+      return 0;
+    }
+
+    @Override
+    public void setUntrackedTimeStamp(long timeStamp) {
     }
   }
 

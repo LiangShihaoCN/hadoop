@@ -52,6 +52,7 @@ import org.apache.hadoop.hdfs.server.namenode.SecondaryNameNode;
 import org.apache.hadoop.hdfs.server.namenode.TestFileTruncate;
 import org.apache.hadoop.hdfs.tools.DFSAdmin;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -168,6 +169,7 @@ public class TestRollingUpgrade {
 
     final Configuration conf = new HdfsConfiguration();
     final MiniJournalCluster mjc = new MiniJournalCluster.Builder(conf).build();
+    mjc.waitActive();
     setConf(conf, nn1Dir, mjc);
 
     {
@@ -406,7 +408,8 @@ public class TestRollingUpgrade {
       runCmd(dfsadmin, true, args2);
 
       // the datanode should be down.
-      Thread.sleep(2000);
+      GenericTestUtils.waitForThreadTermination(
+          "Async datanode shutdown thread", 100, 10000);
       Assert.assertFalse("DataNode should exit", dn.isDatanodeUp());
 
       // ping should fail.

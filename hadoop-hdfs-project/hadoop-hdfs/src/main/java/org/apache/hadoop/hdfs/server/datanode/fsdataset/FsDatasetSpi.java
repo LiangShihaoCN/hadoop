@@ -60,6 +60,7 @@ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
 import org.apache.hadoop.hdfs.server.protocol.ReplicaRecoveryInfo;
 import org.apache.hadoop.hdfs.server.protocol.StorageReport;
 import org.apache.hadoop.hdfs.server.protocol.VolumeFailureSummary;
+import org.apache.hadoop.util.AutoCloseableLock;
 import org.apache.hadoop.util.ReflectionUtils;
 
 /**
@@ -229,11 +230,17 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
    */
   VolumeFailureSummary getVolumeFailureSummary();
 
-  /** @return a list of finalized blocks for the given block pool. */
+  /**
+   * Gets a list of references to the finalized blocks for the given block pool.
+   * <p>
+   * Callers of this function should call
+   * {@link FsDatasetSpi#acquireDatasetLock} to avoid blocks' status being
+   * changed during list iteration.
+   * </p>
+   * @return a list of references to the finalized blocks for the given block
+   *         pool.
+   */
   List<FinalizedReplica> getFinalizedBlocks(String bpid);
-
-  /** @return a list of finalized blocks for the given block pool. */
-  List<FinalizedReplica> getFinalizedBlocksOnPersistentStorage(String bpid);
 
   /**
    * Check whether the in-memory block record matches the block on the disk,
@@ -301,13 +308,14 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
   /**
    * Creates a temporary replica and returns the meta information of the replica
    * .
-   * 
    * @param b block
+   * @param isTransfer whether for transfer
+   *
    * @return the meta info of the replica which is being written to
    * @throws IOException if an error occurs
    */
   ReplicaHandler createTemporary(StorageType storageType,
-      ExtendedBlock b) throws IOException;
+      ExtendedBlock b, boolean isTransfer) throws IOException;
 
   /**
    * Creates a RBW replica and returns the meta info of the replica
@@ -375,19 +383,21 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
    * @return the storage uuid of the replica.
    * @throws IOException
    */
-  String recoverClose(ExtendedBlock b, long newGS, long expectedBlockLen
+  Replica recoverClose(ExtendedBlock b, long newGS, long expectedBlockLen
       ) throws IOException;
   
   /**
    * Finalizes the block previously opened for writing using writeToBlock.
    * The block size is what is in the parameter b and it must match the amount
    *  of data written
+   * @param block Block to be finalized
+   * @param fsyncDir whether to sync the directory changes to durable device.
    * @throws IOException
    * @throws ReplicaNotFoundException if the replica can not be found when the
    * block is been finalized. For instance, the block resides on an HDFS volume
    * that has been removed.
    */
-  void finalizeBlock(ExtendedBlock b) throws IOException;
+  void finalizeBlock(ExtendedBlock b, boolean fsyncDir) throws IOException;
 
   /**
    * Unfinalizes the block previously opened for writing using writeToBlock.
@@ -525,7 +535,7 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
    * Update replica's generation stamp and length and finalize it.
    * @return the ID of storage that stores the block
    */
-  String updateReplicaUnderRecovery(ExtendedBlock oldBlock,
+  Replica updateReplicaUnderRecovery(ExtendedBlock oldBlock,
       long recoveryId, long newBlockId, long newLength) throws IOException;
 
   /**
@@ -641,4 +651,9 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
    * Confirm whether the block is deleting
    */
   boolean isDeletingBlock(String bpid, long blockId);
+
+  /**
+   * Acquire the lock of the dataset.
+   */
+  AutoCloseableLock acquireDatasetLock();
 }

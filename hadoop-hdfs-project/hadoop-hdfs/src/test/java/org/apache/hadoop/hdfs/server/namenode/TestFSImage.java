@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.util.EnumSet;
 
 import org.junit.Assert;
+import org.junit.Assume;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -48,6 +49,8 @@ import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeDirType;
 import org.apache.hadoop.hdfs.util.MD5FileUtils;
 import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.test.PathUtils;
+import org.apache.hadoop.util.NativeCodeLoader;
+import org.apache.hadoop.util.Time;
 import org.junit.Test;
 
 public class TestFSImage {
@@ -64,8 +67,22 @@ public class TestFSImage {
   public void testCompression() throws IOException {
     Configuration conf = new Configuration();
     conf.setBoolean(DFSConfigKeys.DFS_IMAGE_COMPRESS_KEY, true);
-    conf.set(DFSConfigKeys.DFS_IMAGE_COMPRESSION_CODEC_KEY,
-        "org.apache.hadoop.io.compress.GzipCodec");
+    setCompressCodec(conf, "org.apache.hadoop.io.compress.DefaultCodec");
+    setCompressCodec(conf, "org.apache.hadoop.io.compress.GzipCodec");
+    setCompressCodec(conf, "org.apache.hadoop.io.compress.BZip2Codec");
+  }
+
+  @Test
+  public void testNativeCompression() throws IOException {
+    Assume.assumeTrue(NativeCodeLoader.isNativeCodeLoaded());
+    Configuration conf = new Configuration();
+    conf.setBoolean(DFSConfigKeys.DFS_IMAGE_COMPRESS_KEY, true);
+    setCompressCodec(conf, "org.apache.hadoop.io.compress.Lz4Codec");
+  }
+
+  private void setCompressCodec(Configuration conf, String compressCodec)
+      throws IOException {
+    conf.set(DFSConfigKeys.DFS_IMAGE_COMPRESSION_CODEC_KEY, compressCodec);
     testPersistHelper(conf);
   }
 
@@ -232,7 +249,30 @@ public class TestFSImage {
       }
     }
   }
-  
+
+  /**
+   * Ensure ctime is set during namenode formatting.
+   */
+  @Test(timeout=60000)
+  public void testCtime() throws Exception {
+    Configuration conf = new Configuration();
+    MiniDFSCluster cluster = null;
+    try {
+      final long pre = Time.now();
+      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+      cluster.waitActive();
+      final long post = Time.now();
+      final long ctime = cluster.getNamesystem().getCTime();
+
+      assertTrue(pre <= ctime);
+      assertTrue(ctime <= post);
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
   /**
    * In this test case, I have created an image with a file having
    * preferredblockSize = 0. We are trying to read this image (since file with

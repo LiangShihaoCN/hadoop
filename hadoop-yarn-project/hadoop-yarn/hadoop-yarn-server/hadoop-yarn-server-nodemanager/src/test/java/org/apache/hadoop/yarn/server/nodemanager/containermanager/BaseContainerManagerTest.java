@@ -22,24 +22,25 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.hadoop.yarn.server.nodemanager.executor.DeletionAsUserContext;
 import org.junit.Assert;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileContext;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.UnsupportedFileSystemException;
+import org.apache.hadoop.net.ServerSocketUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
-import org.apache.hadoop.util.NodeHealthScriptRunner;
 import org.apache.hadoop.yarn.api.ContainerManagementProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.GetContainerStatusesRequest;
+import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerState;
@@ -73,6 +74,8 @@ import org.apache.hadoop.yarn.server.nodemanager.security.NMTokenSecretManagerIn
 import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
 import org.junit.After;
 import org.junit.Before;
+
+import static org.mockito.Mockito.spy;
 
 public abstract class BaseContainerManagerTest {
 
@@ -149,7 +152,7 @@ public abstract class BaseContainerManagerTest {
   protected ContainerExecutor createContainerExecutor() {
     DefaultContainerExecutor exec = new DefaultContainerExecutor();
     exec.setConf(conf);
-    return exec;
+    return spy(exec);
   }
 
   @Before
@@ -165,7 +168,7 @@ public abstract class BaseContainerManagerTest {
     LOG.info("Created localDir in " + localDir.getAbsolutePath());
     LOG.info("Created tmpDir in " + tmpDir.getAbsolutePath());
 
-    String bindAddress = "0.0.0.0:12345";
+    String bindAddress = "0.0.0.0:" + ServerSocketUtil.getPort(49162, 10);
     conf.set(YarnConfiguration.NM_ADDRESS, bindAddress);
     conf.set(YarnConfiguration.NM_LOCAL_DIRS, localDir.getAbsolutePath());
     conf.set(YarnConfiguration.NM_LOG_DIRS, localLogDir.getAbsolutePath());
@@ -186,13 +189,14 @@ public abstract class BaseContainerManagerTest {
     nodeStatusUpdater.init(conf);
     containerManager.init(conf);
     nodeStatusUpdater.start();
+    ((NMContext)context).setNodeStatusUpdater(nodeStatusUpdater);
   }
 
   protected ContainerManagerImpl
       createContainerManager(DeletionService delSrvc) {
     
     return new ContainerManagerImpl(context, exec, delSrvc, nodeStatusUpdater,
-      metrics, new ApplicationACLsManager(conf), dirsHandler) {
+      metrics, dirsHandler) {
       @Override
       public void
           setBlockNewContainerRequests(boolean blockNewContainerRequests) {
@@ -210,12 +214,13 @@ public abstract class BaseContainerManagerTest {
         // do nothing
       }
       @Override
-        protected void authorizeStartRequest(
-            NMTokenIdentifier nmTokenIdentifier,
-            ContainerTokenIdentifier containerTokenIdentifier) throws YarnException {
-          // do nothing
-        }
-      
+      protected void authorizeStartAndResourceIncreaseRequest(
+          NMTokenIdentifier nmTokenIdentifier,
+          ContainerTokenIdentifier containerTokenIdentifier,
+          boolean startRequest) throws YarnException {
+        // do nothing
+      }
+
       @Override
         protected void updateNMTokenIdentifier(
             NMTokenIdentifier nmTokenIdentifier) throws InvalidToken {
@@ -246,7 +251,7 @@ public abstract class BaseContainerManagerTest {
       public void delete(String user, Path subDir, Path... baseDirs) {
         // Don't do any deletions.
         LOG.info("Psuedo delete: user - " + user + ", subDir - " + subDir
-            + ", baseDirs - " + baseDirs); 
+            + ", baseDirs - " + Arrays.asList(baseDirs));
       };
     };
   }
@@ -311,4 +316,48 @@ public abstract class BaseContainerManagerTest {
         app.getApplicationState().equals(finalState));
   }
 
+  public static void waitForNMContainerState(ContainerManagerImpl
+      containerManager, ContainerId containerID,
+          org.apache.hadoop.yarn.server.nodemanager.containermanager
+              .container.ContainerState finalState)
+                  throws InterruptedException, YarnException, IOException {
+    waitForNMContainerState(containerManager, containerID, finalState, 20);
+  }
+
+  public static void waitForNMContainerState(ContainerManagerImpl
+      containerManager, ContainerId containerID,
+          org.apache.hadoop.yarn.server.nodemanager.containermanager
+          .container.ContainerState finalState, int timeOutMax)
+              throws InterruptedException, YarnException, IOException {
+    Container container =
+        containerManager.getContext().getContainers().get(containerID);
+    org.apache.hadoop.yarn.server.nodemanager
+        .containermanager.container.ContainerState currentState =
+            container.getContainerState();
+    int timeoutSecs = 0;
+    while (!currentState.equals(finalState)
+        && timeoutSecs++ < timeOutMax) {
+      Thread.sleep(1000);
+      LOG.info("Waiting for NM container to get into state " + finalState
+          + ". Current state is " + currentState);
+      currentState = container.getContainerState();
+    }
+    LOG.info("Container state is " + currentState);
+    Assert.assertEquals("ContainerState is not correct (timedout)",
+        finalState, currentState);
+  }
+
+  public static ContainerId createContainerId(int id) {
+    // Use default appId = 0
+    return createContainerId(id, 0);
+  }
+
+  public static ContainerId createContainerId(int cId, int aId) {
+    ApplicationId appId = ApplicationId.newInstance(0, aId);
+    ApplicationAttemptId appAttemptId =
+        ApplicationAttemptId.newInstance(appId, 1);
+    ContainerId containerId =
+        ContainerId.newContainerId(appAttemptId, cId);
+    return containerId;
+  }
 }

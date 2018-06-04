@@ -203,6 +203,20 @@ public class DistCpOptions {
   public void setDeleteMissing(boolean deleteMissing) {
     validate(DistCpOptionSwitch.DELETE_MISSING, deleteMissing);
     this.deleteMissing = deleteMissing;
+    ignoreDeleteMissingIfUseDiff();
+  }
+
+  /**
+   * -delete and -diff are mutually exclusive.
+   * For backward compatibility, we ignore the -delete option here, instead of
+   * throwing an IllegalArgumentException. See HDFS-10397 for more discussion.
+   */
+  private void ignoreDeleteMissingIfUseDiff() {
+    if (deleteMissing && useDiff) {
+      OptionsParser.LOG.warn("-delete and -diff are mutually exclusive. " +
+          "The -delete option will be ignored.");
+      deleteMissing = false;
+    }
   }
 
   /**
@@ -294,6 +308,7 @@ public class DistCpOptions {
     this.useDiff = useDiff;
     this.fromSnapshot = fromSnapshot;
     this.toSnapshot = toSnapshot;
+    ignoreDeleteMissingIfUseDiff();
   }
 
   public void disableUsingDiff() {
@@ -614,9 +629,9 @@ public class DistCpOptions {
       throw new IllegalArgumentException(
           "Append is disallowed when skipping CRC");
     }
-    if ((!syncFolder || !deleteMissing) && useDiff) {
+    if (!syncFolder && useDiff) {
       throw new IllegalArgumentException(
-          "Diff is valid only with update and delete options");
+          "Diff is valid only with update options");
     }
   }
 
@@ -664,14 +679,22 @@ public class DistCpOptions {
         ", syncFolder=" + syncFolder +
         ", deleteMissing=" + deleteMissing +
         ", ignoreFailures=" + ignoreFailures +
+        ", overwrite=" + overwrite +
+        ", skipCRC=" + skipCRC +
+        ", blocking=" + blocking +
+        ", numListstatusThreads=" + numListstatusThreads +
         ", maxMaps=" + maxMaps +
+        ", mapBandwidth=" + mapBandwidth +
         ", sslConfigurationFile='" + sslConfigurationFile + '\'' +
         ", copyStrategy='" + copyStrategy + '\'' +
+        ", preserveStatus=" + preserveStatus +
+        ", preserveRawXattrs=" + preserveRawXattrs +
+        ", atomicWorkPath=" + atomicWorkPath +
+        ", logPath=" + logPath +
         ", sourceFileListing=" + sourceFileListing +
         ", sourcePaths=" + sourcePaths +
         ", targetPath=" + targetPath +
         ", targetPathExists=" + targetPathExists +
-        ", preserveRawXattrs=" + preserveRawXattrs +
         ", filtersFile='" + filtersFile + '\'' +
         '}';
   }

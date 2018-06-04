@@ -54,8 +54,14 @@ message ContainerIdProto {
 }
 
 message ResourceProto {
-  optional int32 memory = 1;
+  optional int64 memory = 1;
   optional int32 virtual_cores = 2;
+}
+
+message ResourceUtilizationProto {
+  optional int32 pmem = 1;
+  optional int32 vmem = 2;
+  optional float cpu = 3;
 }
 
 message ResourceOptionProto {
@@ -85,6 +91,7 @@ message ContainerProto {
   optional ResourceProto resource = 4;
   optional PriorityProto priority = 5;
   optional hadoop.common.TokenProto container_token = 6;
+  optional int32 version = 9 [default = 0];
 }
 
 message ContainerReportProto {
@@ -131,6 +138,7 @@ enum FinalApplicationStatusProto {
   APP_SUCCEEDED = 1;
   APP_FAILED = 2;
   APP_KILLED = 3;
+  APP_ENDED = 4;
 }
 
 message URLProto {
@@ -171,6 +179,10 @@ message ApplicationResourceUsageReportProto {
   optional ResourceProto needed_resources = 5;
   optional int64 memory_seconds = 6;
   optional int64 vcore_seconds = 7;
+  optional float queue_usage_percentage = 8;
+  optional float cluster_usage_percentage = 9;
+  optional int64 preempted_memory_seconds = 10;
+  optional int64 preempted_vcore_seconds = 11;
 }
 
 message ApplicationReportProto {
@@ -197,6 +209,8 @@ message ApplicationReportProto {
   optional LogAggregationStatusProto log_aggregation_status = 21;
   optional bool unmanaged_application = 22 [default = false];
   optional PriorityProto priority = 23;
+  optional string appNodeLabelExpression = 24;
+  optional string amNodeLabelExpression = 25;
 }
 
 enum LogAggregationStatusProto {
@@ -249,15 +263,17 @@ message NodeReportProto {
   optional string health_report = 8;
   optional int64 last_health_report_time = 9;
   repeated string node_labels = 10;
+  optional ResourceUtilizationProto containers_utilization = 11;
+  optional ResourceUtilizationProto node_utilization = 12;
 }
 
-message NodeIdToLabelsInfoProto {
+message NodeIdToLabelsProto {
   optional NodeIdProto nodeId = 1;
-  repeated NodeLabelProto nodeLabels = 2;
+  repeated string nodeLabels = 2;
 }
 
 message LabelsToNodeIdsProto {
-  optional NodeLabelProto nodeLabels = 1;
+  optional string nodeLabels = 1;
   repeated NodeIdProto nodeId = 2;
 }
 
@@ -271,6 +287,10 @@ enum ContainerTypeProto {
   TASK = 2;
 }
 
+message AMBlackListingRequestProto {
+  optional bool blacklisting_enabled = 1 [default = false];
+  optional float blacklisting_failure_threshold = 2;
+}
 ////////////////////////////////////////////////////////////////////////
 ////// From AM_RM_Protocol /////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////
@@ -343,6 +363,8 @@ message LogAggregationContextProto {
  optional string exclude_pattern = 2 [default = ""];
  optional string rolled_logs_include_pattern = 3 [default = ""];
  optional string rolled_logs_exclude_pattern = 4 [default = ".*"];
+ optional string log_aggregation_policy_class_name = 5;
+ optional string log_aggregation_policy_parameters = 6;
 }
 
 enum ApplicationAccessTypeProto {
@@ -401,6 +423,8 @@ message QueueInfoProto {
   repeated string accessibleNodeLabels = 8;
   optional string defaultNodeLabelExpression = 9;
   optional QueueStatisticsProto queueStatistics = 10;
+  optional bool preemptionDisabled = 11;
+  optional bool intraQueuePreemptionDisabled = 12;
 }
 
 enum QueueACLProto {
@@ -411,6 +435,12 @@ enum QueueACLProto {
 message QueueUserACLInfoProto {
   optional string queueName = 1;
   repeated QueueACLProto userAcls = 2;
+}
+
+enum SignalContainerCommandProto {
+  OUTPUT_THREAD_DUMP = 1;
+  GRACEFUL_SHUTDOWN = 2;
+  FORCEFUL_SHUTDOWN = 3;
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -441,6 +471,23 @@ message ReservationDefinitionProto {
   optional string reservation_name = 4;
 }
 
+message ResourceAllocationRequestProto {
+  optional int64 start_time = 1;
+  optional int64 end_time = 2;
+  optional ResourceProto resource = 3;
+}
+
+message ReservationAllocationStateProto {
+  optional ReservationDefinitionProto reservation_definition = 1;
+  repeated ResourceAllocationRequestProto allocation_requests = 2;
+  optional int64 start_time = 3;
+  optional int64 end_time = 4;
+  optional string user = 5;
+  optional bool contains_gangs = 6;
+  optional int64 acceptance_time = 7;
+  optional ReservationIdProto reservation_id = 8;
+}
+
 enum ReservationRequestInterpreterProto {
   R_ANY = 0;
   R_ALL = 1;
@@ -466,6 +513,7 @@ message ContainerStatusProto {
   optional ContainerStateProto state = 2;
   optional string diagnostics = 3 [default = "N/A"];
   optional int32 exit_status = 4 [default = -1000];
+  optional ResourceProto capability = 5;
 }
 
 enum ContainerExitStatusProto {
@@ -475,21 +523,6 @@ enum ContainerExitStatusProto {
   DISKS_FAILED = -101;
 }
 
-message ContainerResourceIncreaseRequestProto {
-  optional ContainerIdProto container_id = 1;
-  optional ResourceProto capability = 2;
-} 
-
-message ContainerResourceIncreaseProto {
-  optional ContainerIdProto container_id = 1;
-  optional ResourceProto capability = 2;
-  optional hadoop.common.TokenProto container_token = 3;
-}
-
-message ContainerResourceDecreaseProto {
-  optional ContainerIdProto container_id = 1;
-  optional ResourceProto capability = 2;
-}
 
 ////////////////////////////////////////////////////////////////////////
 ////// From common//////////////////////////////////////////////////////
@@ -507,4 +540,22 @@ message StringStringMapProto {
 message StringBytesMapProto {
   optional string key = 1;
   optional bytes value = 2;
+}
+
+///////////////////////////////////////////////////////////////////////
+/////// DEPRECATED ////////////////////////////////////////////////////
+message ContainerResourceIncreaseRequestProto {
+  optional ContainerIdProto container_id = 1;
+  optional ResourceProto capability = 2;
+}
+
+message ContainerResourceIncreaseProto {
+  optional ContainerIdProto container_id = 1;
+  optional ResourceProto capability = 2;
+  optional hadoop.common.TokenProto container_token = 3;
+}
+
+message ContainerResourceDecreaseProto {
+  optional ContainerIdProto container_id = 1;
+  optional ResourceProto capability = 2;
 }

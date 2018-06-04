@@ -19,10 +19,13 @@
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
 
 import java.io.Serializable;
+import java.text.DecimalFormat;
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -52,6 +55,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManage
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.NodeType;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNode;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 import org.apache.hadoop.yarn.util.resource.DefaultResourceCalculator;
 import org.apache.hadoop.yarn.util.resource.Resources;
@@ -78,6 +82,11 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
   private RMContainerComparator comparator = new RMContainerComparator();
   private final Map<RMContainer, Long> preemptionMap = new HashMap<RMContainer, Long>();
 
+  // Used to record node reservation by an app.
+  // Key = RackName, Value = Set of Nodes reserved by app on rack
+  private Map<String, Set<String>> reservations = new HashMap<>();
+
+  private List<NodeId> blacklistNodeIds = new ArrayList<NodeId>();
   /**
    * Delay scheduling: We often want to prioritize scheduling of node-local
    * containers over rack-local or off-switch containers. To achieve this
@@ -115,7 +124,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
 
   synchronized public void containerCompleted(RMContainer rmContainer,
       ContainerStatus containerStatus, RMContainerEventType event) {
-    
+
     Container container = rmContainer.getContainer();
     ContainerId containerId = container.getId();
     
@@ -131,9 +140,13 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
         );
     LOG.info("Completed container: " + rmContainer.getContainerId() + 
         " in state: " + rmContainer.getState() + " event:" + event);
-    
+
     // Remove from the list of containers
-    liveContainers.remove(rmContainer.getContainerId());
+    if (liveContainers.remove(containerId) == null) {
+      LOG.info("Additional complete request on completed container " +
+          rmContainer.getContainerId());
+      return;
+    }
 
     RMAuditLogger.logSuccess(getUser(), 
         AuditConstants.RELEASE_CONTAINER, "SchedulerApp", 
@@ -141,7 +154,8 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     
     // Update usage metrics 
     Resource containerResource = rmContainer.getContainer().getResource();
-    queue.getMetrics().releaseResources(getUser(), 1, containerResource);
+    queue.getMetrics().releaseResources(rmContainer.getNodeLabelExpression(),
+        getUser(), 1, containerResource);
     this.attemptResourceUsage.decUsed(containerResource);
 
     // remove from preemption map if it is completed
@@ -172,6 +186,21 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
         + this.attemptResourceUsage.getReserved());
   }
 
+  private void subtractResourcesOnBlacklistedNodes(
+      Resource availableResources) {
+    if (appSchedulingInfo.getAndResetBlacklistChanged()) {
+      blacklistNodeIds.clear();
+      scheduler.addBlacklistedNodeIdsToList(this, blacklistNodeIds);
+    }
+    for (NodeId nodeId: blacklistNodeIds) {
+      SchedulerNode node = scheduler.getSchedulerNode(nodeId);
+      if (node != null) {
+        Resources.subtractFromNonNegative(availableResources,
+            node.getAvailableResource());
+      }
+    }
+  }
+
   /**
    * Headroom depends on resources in the cluster, current usage of the
    * queue, queue's fair-share and queue's max-resources.
@@ -189,6 +218,8 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
 
     Resource clusterAvailableResources =
         Resources.subtract(clusterResource, clusterUsage);
+    subtractResourcesOnBlacklistedNodes(clusterAvailableResources);
+
     Resource queueMaxAvailableResources =
         Resources.subtract(queue.getMaxShare(), queueUsage);
     Resource maxAvailableResource = Resources.componentwiseMin(
@@ -279,6 +310,13 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
 
     // default level is NODE_LOCAL
     if (! allowedLocalityLevel.containsKey(priority)) {
+      // add the initial time of priority to prevent comparing with FsApp
+      // startTime and allowedLocalityLevel degrade
+      lastScheduledContainer.put(priority, currentTimeMs);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Init the lastScheduledContainer time, priority: " + priority
+            + ", time: " + currentTimeMs);
+      }
       allowedLocalityLevel.put(priority, NodeType.NODE_LOCAL);
       return NodeType.NODE_LOCAL;
     }
@@ -340,6 +378,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     RMContainer rmContainer = new RMContainerImpl(container, 
         getApplicationAttemptId(), node.getNodeID(),
         appSchedulingInfo.getUser(), rmContext);
+    ((RMContainerImpl)rmContainer).setQueueName(this.getQueueName());
 
     // Add it to allContainers list.
     newlyAllocatedContainers.add(rmContainer);
@@ -415,7 +454,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
   }
 
   public void clearPreemptedResources() {
-    preemptedResources.setMemory(0);
+    preemptedResources.setMemorySize(0);
     preemptedResources.setVirtualCores(0);
   }
 
@@ -444,24 +483,61 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
    * the container is {@code alreadyReserved} on the node, simply
    * update relevant bookeeping. This dispatches ro relevant handlers
    * in {@link FSSchedulerNode}..
+   * return whether reservation was possible with the current threshold limits
    */
-  private void reserve(Priority priority, FSSchedulerNode node,
-      Container container, boolean alreadyReserved) {
-    LOG.info("Making reservation: node=" + node.getNodeName() +
-        " app_id=" + getApplicationId());
+  private boolean reserve(Priority priority, FSSchedulerNode node,
+      Container container, NodeType type, boolean alreadyReserved) {
 
-    if (!alreadyReserved) {
-      getMetrics().reserveResource(getUser(), container.getResource());
-      RMContainer rmContainer =
-          super.reserve(node, priority, null, container);
-      node.reserveResource(this, priority, rmContainer);
-    } else {
-      RMContainer rmContainer = node.getReservedContainer();
-      super.reserve(node, priority, rmContainer, container);
-      node.reserveResource(this, priority, rmContainer);
+    if (!reservationExceedsThreshold(node, type)) {
+      LOG.info("Making reservation: node=" + node.getNodeName() +
+              " app_id=" + getApplicationId());
+      if (!alreadyReserved) {
+        getMetrics().reserveResource(node.getPartition(),
+            getUser(), container.getResource());
+        RMContainer rmContainer =
+                super.reserve(node, priority, null, container);
+        node.reserveResource(this, priority, rmContainer);
+        setReservation(node);
+      } else {
+        RMContainer rmContainer = node.getReservedContainer();
+        super.reserve(node, priority, rmContainer, container);
+        node.reserveResource(this, priority, rmContainer);
+        setReservation(node);
+      }
+      return true;
     }
+    return false;
   }
 
+  private boolean reservationExceedsThreshold(FSSchedulerNode node,
+                                                 NodeType type) {
+    // Only if not node-local
+    if (type != NodeType.NODE_LOCAL) {
+      int existingReservations = getNumReservations(node.getRackName(),
+              type == NodeType.OFF_SWITCH);
+      int totalAvailNodes =
+              (type == NodeType.OFF_SWITCH) ? scheduler.getNumClusterNodes() :
+                      scheduler.getNumNodesInRack(node.getRackName());
+      int numAllowedReservations =
+              (int)Math.ceil(
+                      totalAvailNodes * scheduler.getReservableNodesRatio());
+      if (existingReservations >= numAllowedReservations) {
+        DecimalFormat df = new DecimalFormat();
+        df.setMaximumFractionDigits(2);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Reservation Exceeds Allowed number of nodes:" +
+                  " app_id=" + getApplicationId() +
+                  " existingReservations=" + existingReservations +
+                  " totalAvailableNodes=" + totalAvailNodes +
+                  " reservableNodesRatio=" + df.format(
+                                          scheduler.getReservableNodesRatio()) +
+                  " numAllowedReservations=" + numAllowedReservations);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
   /**
    * Remove the reservation on {@code node} at the given {@link Priority}.
    * This dispatches SchedulerNode handlers as well.
@@ -470,8 +546,45 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     RMContainer rmContainer = node.getReservedContainer();
     unreserveInternal(priority, node);
     node.unreserveResource(this);
-    getMetrics().unreserveResource(
+    clearReservation(node);
+    getMetrics().unreserveResource(node.getPartition(),
         getUser(), rmContainer.getContainer().getResource());
+  }
+
+  private synchronized void setReservation(SchedulerNode node) {
+    String rackName = node.getRackName() == null ? "NULL" : node.getRackName();
+    Set<String> rackReservations = reservations.get(rackName);
+    if (rackReservations == null) {
+      rackReservations = new HashSet<>();
+      reservations.put(rackName, rackReservations);
+    }
+    rackReservations.add(node.getNodeName());
+  }
+
+  private synchronized void clearReservation(SchedulerNode node) {
+    String rackName = node.getRackName() == null ? "NULL" : node.getRackName();
+    Set<String> rackReservations = reservations.get(rackName);
+    if (rackReservations != null) {
+      rackReservations.remove(node.getNodeName());
+    }
+  }
+
+  int getNumReservations(String rackName, boolean isAny) {
+    int counter = 0;
+    if (isAny) {
+      for (Set<String> nodes : reservations.values()) {
+        if (nodes != null) {
+          counter += nodes.size();
+        }
+      }
+    } else {
+      Set<String> nodes = reservations.get(
+              rackName == null ? "NULL" : rackName);
+      if (nodes != null) {
+        counter += nodes.size();
+      }
+    }
+    return counter;
   }
 
   /**
@@ -544,9 +657,21 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     }
 
     // The desired container won't fit here, so reserve
-    reserve(request.getPriority(), node, container, reserved);
+    if (isReservable(container) &&
+        reserve(request.getPriority(), node, container, type, reserved)) {
+      return FairScheduler.CONTAINER_RESERVED;
+    } else {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Not creating reservation as container " + container.getId()
+            + " is not reservable");
+      }
+      return Resources.none();
+    }
+  }
 
-    return FairScheduler.CONTAINER_RESERVED;
+  private boolean isReservable(Container container) {
+    return scheduler.isAtLeastReservationThreshold(
+      getQueue().getPolicy().getResourceCalculator(), container.getResource());
   }
 
   private boolean hasNodeOrRackLocalRequests(Priority priority) {
@@ -766,7 +891,12 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
   public Resource getResourceUsage() {
     // Here the getPreemptedResources() always return zero, except in
     // a preemption round
-    return Resources.subtract(getCurrentConsumption(), getPreemptedResources());
+    // In the common case where preempted resource is zero, return the
+    // current consumption Resource object directly without calling
+    // Resources.subtract which creates a new Resource object for each call.
+    return getPreemptedResources().equals(Resources.none()) ?
+        getCurrentConsumption() :
+        Resources.subtract(getCurrentConsumption(), getPreemptedResources());
   }
 
   @Override

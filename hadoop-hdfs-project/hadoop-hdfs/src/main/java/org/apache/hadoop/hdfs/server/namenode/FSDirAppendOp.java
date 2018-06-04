@@ -33,8 +33,11 @@ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.BlockUCState;
+import org.apache.hadoop.hdfs.server.namenode.FSDirectory.DirOp;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem.RecoverLeaseOp;
 import org.apache.hadoop.hdfs.server.namenode.NameNodeLayoutVersion.Feature;
+import org.apache.hadoop.ipc.RetriableException;
 
 import com.google.common.base.Preconditions;
 
@@ -80,15 +83,12 @@ final class FSDirAppendOp {
       final boolean logRetryCache) throws IOException {
     assert fsn.hasWriteLock();
 
-    final byte[][] pathComponents = FSDirectory
-        .getPathComponentsForReservedPath(srcArg);
     final LocatedBlock lb;
     final FSDirectory fsd = fsn.getFSDirectory();
-    final String src;
+    final INodesInPath iip;
     fsd.writeLock();
     try {
-      src = fsd.resolvePath(pc, srcArg, pathComponents);
-      final INodesInPath iip = fsd.getINodesInPath4Write(src);
+      iip = fsd.resolvePath(pc, srcArg, DirOp.WRITE);
       // Verify that the destination does not exist as a directory already
       final INode inode = iip.getLastINode();
       final String path = iip.getPath();
@@ -119,10 +119,17 @@ final class FSDirAppendOp {
 
       final BlockInfo lastBlock = file.getLastBlock();
       // Check that the block has at least minimum replication.
-      if (lastBlock != null && lastBlock.isComplete()
+      if (lastBlock != null) {
+        if (lastBlock.getBlockUCState() == BlockUCState.COMMITTED) {
+          throw new RetriableException(
+              new NotReplicatedYetException("append: lastBlock="
+                  + lastBlock + " of src=" + path
+                  + " is COMMITTED but not yet COMPLETE."));
+        } else if (lastBlock.isComplete()
           && !blockManager.isSufficientlyReplicated(lastBlock)) {
-        throw new IOException("append: lastBlock=" + lastBlock + " of src="
-            + path + " is not sufficiently replicated yet.");
+          throw new IOException("append: lastBlock=" + lastBlock + " of src="
+              + path + " is not sufficiently replicated yet.");
+        }
       }
       lb = prepareFileForAppend(fsn, iip, holder, clientMachine, newBlock,
           true, logRetryCache);
@@ -134,8 +141,7 @@ final class FSDirAppendOp {
       fsd.writeUnlock();
     }
 
-    HdfsFileStatus stat = FSDirStatAndListingOp.getFileInfo(fsd, src, false,
-        FSDirectory.isReservedRawName(srcArg), true);
+    HdfsFileStatus stat = FSDirStatAndListingOp.getFileInfo(fsd, iip);
     if (lb != null) {
       NameNode.stateChangeLog.debug(
           "DIR* NameSystem.appendFile: file {} for {} at {} block {} block"
@@ -245,7 +251,7 @@ final class FSDirAppendOp {
     final BlockInfo lastBlock = file.getLastBlock();
     if (lastBlock != null) {
       final long diff = file.getPreferredBlockSize() - lastBlock.getNumBytes();
-      final short repl = file.getPreferredBlockReplication();
+      final short repl = lastBlock.getReplication();
       delta.addStorageSpace(diff * repl);
       final BlockStoragePolicy policy = fsn.getFSDirectory()
           .getBlockStoragePolicySuite().getPolicy(file.getStoragePolicyID());

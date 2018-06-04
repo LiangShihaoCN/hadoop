@@ -33,6 +33,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -98,6 +99,7 @@ import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptStatusUpdateEvent
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptTooManyFetchFailureEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskEventType;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskTAttemptEvent;
+import org.apache.hadoop.mapreduce.v2.app.job.event.TaskTAttemptKilledEvent;
 import org.apache.hadoop.mapreduce.v2.app.launcher.ContainerLauncher;
 import org.apache.hadoop.mapreduce.v2.app.launcher.ContainerLauncherEvent;
 import org.apache.hadoop.mapreduce.v2.app.launcher.ContainerRemoteLaunchEvent;
@@ -134,7 +136,6 @@ import org.apache.hadoop.yarn.state.SingleArcTransition;
 import org.apache.hadoop.yarn.state.StateMachine;
 import org.apache.hadoop.yarn.state.StateMachineFactory;
 import org.apache.hadoop.yarn.util.Clock;
-import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.RackResolver;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -173,6 +174,7 @@ public abstract class TaskAttemptImpl implements
   private static AtomicBoolean initialClasspathFlag = new AtomicBoolean();
   private static String initialClasspath = null;
   private static String initialAppClasspath = null;
+  private static String initialHadoopClasspath = null;
   private static Object commonContainerSpecLock = new Object();
   private static ContainerLaunchContext commonContainerSpec = null;
   private static final Object classpathLock = new Object();
@@ -184,6 +186,7 @@ public abstract class TaskAttemptImpl implements
   private int httpPort;
   private Locality locality;
   private Avataar avataar;
+  private boolean rescheduleNextAttempt = false;
 
   private static final CleanupContainerTransition
       CLEANUP_CONTAINER_TRANSITION = new CleanupContainerTransition();
@@ -661,7 +664,7 @@ public abstract class TaskAttemptImpl implements
 
     //TODO:create the resource reqt for this Task attempt
     this.resourceCapability = recordFactory.newRecordInstance(Resource.class);
-    this.resourceCapability.setMemory(
+    this.resourceCapability.setMemorySize(
         getMemoryRequired(conf, taskId.getTaskType()));
     this.resourceCapability.setVirtualCores(
         getCpuRequired(conf, taskId.getTaskType()));
@@ -718,8 +721,7 @@ public abstract class TaskAttemptImpl implements
       LocalResourceType type, LocalResourceVisibility visibility)
       throws IOException {
     FileStatus fstat = fc.getFileStatus(file);
-    URL resourceURL = ConverterUtils.getYarnUrlFromPath(fc.resolvePath(fstat
-        .getPath()));
+    URL resourceURL = URL.fromPath(fc.resolvePath(fstat.getPath()));
     long resourceSize = fstat.getLen();
     long resourceModificationTime = fstat.getModificationTime();
 
@@ -742,6 +744,7 @@ public abstract class TaskAttemptImpl implements
       MRApps.setClasspath(env, conf);
       initialClasspath = env.get(Environment.CLASSPATH.name());
       initialAppClasspath = env.get(Environment.APP_CLASSPATH.name());
+      initialHadoopClasspath = env.get(Environment.HADOOP_CLASSPATH.name());
       initialClasspathFlag.set(true);
       return initialClasspath;
     }
@@ -875,14 +878,21 @@ public abstract class TaskAttemptImpl implements
       }
 
       MRApps.addToEnvironment(
-          environment,  
-          Environment.CLASSPATH.name(), 
+          environment,
+          Environment.CLASSPATH.name(),
           getInitialClasspath(conf), conf);
+
+      if (initialHadoopClasspath != null) {
+        MRApps.addToEnvironment(
+            environment,
+            Environment.HADOOP_CLASSPATH.name(),
+            initialHadoopClasspath, conf);
+      }
 
       if (initialAppClasspath != null) {
         MRApps.addToEnvironment(
             environment,  
-            Environment.APP_CLASSPATH.name(), 
+            Environment.APP_CLASSPATH.name(),
             initialAppClasspath, conf);
       }
     } catch (IOException e) {
@@ -1205,9 +1215,16 @@ public abstract class TaskAttemptImpl implements
             JobEventType.INTERNAL_ERROR));
       }
       if (oldState != getInternalState()) {
-          LOG.info(attemptId + " TaskAttempt Transitioned from " 
-           + oldState + " to "
-           + getInternalState());
+        if (getInternalState() == TaskAttemptStateInternal.FAILED) {
+          String nodeId = null == this.container ? "Not-assigned"
+              : this.container.getNodeId().toString();
+          LOG.info(attemptId + " transitioned from state " + oldState + " to "
+              + getInternalState() + ", event type is " + event.getType()
+              + " and nodeId=" + nodeId);
+        } else {
+          LOG.info(attemptId + " TaskAttempt Transitioned from " + oldState
+              + " to " + getInternalState());
+        }
       }
     } finally {
       writeLock.unlock();
@@ -1245,8 +1262,8 @@ public abstract class TaskAttemptImpl implements
   public TaskAttemptStateInternal recover(TaskAttemptInfo taInfo,
       OutputCommitter committer, boolean recoverOutput) {
     ContainerId containerId = taInfo.getContainerId();
-    NodeId containerNodeId = ConverterUtils.toNodeId(taInfo.getHostname() + ":"
-        + taInfo.getPort());
+    NodeId containerNodeId = NodeId.fromString(
+        taInfo.getHostname() + ":" + taInfo.getPort());
     String nodeHttpAddress = StringInterner.weakIntern(taInfo.getHostname() + ":"
         + taInfo.getHttpPort());
     // Resource/Priority/Tokens are only needed while launching the container on
@@ -1340,7 +1357,7 @@ public abstract class TaskAttemptImpl implements
     return attemptState;
   }
 
-  private static TaskAttemptState getExternalState(
+  protected static TaskAttemptState getExternalState(
       TaskAttemptStateInternal smState) {
     switch (smState) {
     case ASSIGNED:
@@ -1370,6 +1387,21 @@ public abstract class TaskAttemptImpl implements
           + "stateMachineTaskAttemptState to externalTaskAttemptState: "
           + smState);
     }
+  }
+
+  // check whether the attempt is assigned if container is not null
+  boolean isContainerAssigned() {
+    return container != null;
+  }
+
+  //always called in write lock
+  private boolean getRescheduleNextAttempt() {
+    return rescheduleNextAttempt;
+  }
+
+  //always called in write lock
+  private void setRescheduleNextAttempt(boolean reschedule) {
+    rescheduleNextAttempt = reschedule;
   }
 
   //always called in write lock
@@ -1403,6 +1435,7 @@ public abstract class TaskAttemptImpl implements
       TaskAttemptImpl taskAttempt) {
     TaskType taskType = taskAttempt.getID().getTaskId().getTaskType();
     long duration = (taskAttempt.getFinishTime() - taskAttempt.getLaunchTime());
+
     int mbRequired =
         taskAttempt.getMemoryRequired(taskAttempt.conf, taskType);
     int vcoresRequired = taskAttempt.getCpuRequired(taskAttempt.conf, taskType);
@@ -1491,6 +1524,21 @@ public abstract class TaskAttemptImpl implements
     return tauce;
   }
 
+  private static void
+      sendJHStartEventForAssignedFailTask(TaskAttemptImpl taskAttempt) {
+    if (null == taskAttempt.container) {
+      return;
+    }
+    taskAttempt.launchTime = taskAttempt.clock.getTime();
+
+    InetSocketAddress nodeHttpInetAddr =
+        NetUtils.createSocketAddr(taskAttempt.container.getNodeHttpAddress());
+    taskAttempt.trackerName = nodeHttpInetAddr.getHostName();
+    taskAttempt.httpPort = nodeHttpInetAddr.getPort();
+    taskAttempt.sendLaunchedEvents();
+  }
+
+
   @SuppressWarnings("unchecked")
   private void sendLaunchedEvents() {
     JobCounterUpdateEvent jce = new JobCounterUpdateEvent(attemptId.getTaskId()
@@ -1571,7 +1619,6 @@ public abstract class TaskAttemptImpl implements
     taskAttempt.reportedStatus.progress = 1.0f;
     taskAttempt.updateProgressSplits();
   }
-
 
   static class RequestContainerTransition implements
       SingleArcTransition<TaskAttemptImpl, TaskAttemptEvent> {
@@ -1688,6 +1735,9 @@ public abstract class TaskAttemptImpl implements
     @Override
     public void transition(TaskAttemptImpl taskAttempt, 
         TaskAttemptEvent event) {
+      if (taskAttempt.getLaunchTime() == 0) {
+        sendJHStartEventForAssignedFailTask(taskAttempt);
+      }
       //set the finish time
       taskAttempt.setFinishTime();
 
@@ -1715,30 +1765,25 @@ public abstract class TaskAttemptImpl implements
               TaskEventType.T_ATTEMPT_FAILED));
           break;
         case KILLED:
-          taskAttempt.eventHandler.handle(new TaskTAttemptEvent(
-              taskAttempt.attemptId,
-              TaskEventType.T_ATTEMPT_KILLED));
+          taskAttempt.eventHandler.handle(new TaskTAttemptKilledEvent(
+              taskAttempt.attemptId, false));
           break;
         default:
           LOG.error("Task final state is not FAILED or KILLED: " + finalState);
       }
-      if (taskAttempt.getLaunchTime() != 0) {
-        TaskAttemptUnsuccessfulCompletionEvent tauce =
-            createTaskAttemptUnsuccessfulCompletionEvent(taskAttempt,
-                finalState);
-        if(finalState == TaskAttemptStateInternal.FAILED) {
-          taskAttempt.eventHandler
-            .handle(createJobCounterUpdateEventTAFailed(taskAttempt, false));
-        } else if(finalState == TaskAttemptStateInternal.KILLED) {
-          taskAttempt.eventHandler
-          .handle(createJobCounterUpdateEventTAKilled(taskAttempt, false));
-        }
-        taskAttempt.eventHandler.handle(new JobHistoryEvent(
-            taskAttempt.attemptId.getTaskId().getJobId(), tauce));
-      } else {
-        LOG.debug("Not generating HistoryFinish event since start event not " +
-            "generated for taskAttempt: " + taskAttempt.getID());
+
+      TaskAttemptUnsuccessfulCompletionEvent tauce =
+          createTaskAttemptUnsuccessfulCompletionEvent(taskAttempt,
+              finalState);
+      if(finalState == TaskAttemptStateInternal.FAILED) {
+        taskAttempt.eventHandler
+          .handle(createJobCounterUpdateEventTAFailed(taskAttempt, false));
+      } else if(finalState == TaskAttemptStateInternal.KILLED) {
+        taskAttempt.eventHandler
+        .handle(createJobCounterUpdateEventTAKilled(taskAttempt, false));
       }
+      taskAttempt.eventHandler.handle(new JobHistoryEvent(
+          taskAttempt.attemptId.getTaskId().getJobId(), tauce));
     }
   }
 
@@ -1759,6 +1804,7 @@ public abstract class TaskAttemptImpl implements
       // register it to TaskAttemptListener so that it can start monitoring it.
       taskAttempt.taskAttemptListener
         .registerLaunchedTask(taskAttempt.attemptId, taskAttempt.jvmID);
+
       //TODO Resolve to host / IP in case of a local address.
       InetSocketAddress nodeHttpInetAddr = // TODO: Costly to create sock-addr?
           NetUtils.createSocketAddr(taskAttempt.container.getNodeHttpAddress());
@@ -1988,8 +2034,13 @@ public abstract class TaskAttemptImpl implements
           taskAttempt, TaskAttemptStateInternal.KILLED);
       taskAttempt.eventHandler.handle(new JobHistoryEvent(taskAttempt.attemptId
           .getTaskId().getJobId(), tauce));
-      taskAttempt.eventHandler.handle(new TaskTAttemptEvent(
-          taskAttempt.attemptId, TaskEventType.T_ATTEMPT_KILLED));
+      boolean rescheduleNextTaskAttempt = false;
+      if (event instanceof TaskAttemptKillEvent) {
+        rescheduleNextTaskAttempt =
+            ((TaskAttemptKillEvent)event).getRescheduleAttempt();
+      }
+      taskAttempt.eventHandler.handle(new TaskTAttemptKilledEvent(
+          taskAttempt.attemptId, rescheduleNextTaskAttempt));
       return TaskAttemptStateInternal.KILLED;
     }
   }
@@ -2018,6 +2069,12 @@ public abstract class TaskAttemptImpl implements
             taskAttempt.getID().toString());
         return TaskAttemptStateInternal.SUCCESS_CONTAINER_CLEANUP;
       } else {
+        // Store reschedule flag so that after clean up is completed, new
+        // attempt is scheduled/rescheduled based on it.
+        if (event instanceof TaskAttemptKillEvent) {
+          taskAttempt.setRescheduleNextAttempt(
+              ((TaskAttemptKillEvent)event).getRescheduleAttempt());
+        }
         return TaskAttemptStateInternal.KILL_CONTAINER_CLEANUP;
       }
     }
@@ -2030,30 +2087,27 @@ public abstract class TaskAttemptImpl implements
     @Override
     public void transition(TaskAttemptImpl taskAttempt,
         TaskAttemptEvent event) {
+      if (taskAttempt.getLaunchTime() == 0) {
+        sendJHStartEventForAssignedFailTask(taskAttempt);
+      }
       //set the finish time
       taskAttempt.setFinishTime();
-      if (taskAttempt.getLaunchTime() != 0) {
-        taskAttempt.eventHandler
-            .handle(createJobCounterUpdateEventTAKilled(taskAttempt, false));
-        TaskAttemptUnsuccessfulCompletionEvent tauce =
-            createTaskAttemptUnsuccessfulCompletionEvent(taskAttempt,
-                TaskAttemptStateInternal.KILLED);
-        taskAttempt.eventHandler.handle(new JobHistoryEvent(
-            taskAttempt.attemptId.getTaskId().getJobId(), tauce));
-      }else {
-        LOG.debug("Not generating HistoryFinish event since start event not " +
-            "generated for taskAttempt: " + taskAttempt.getID());
-      }
+
+      taskAttempt.eventHandler
+          .handle(createJobCounterUpdateEventTAKilled(taskAttempt, false));
+      TaskAttemptUnsuccessfulCompletionEvent tauce =
+          createTaskAttemptUnsuccessfulCompletionEvent(taskAttempt,
+              TaskAttemptStateInternal.KILLED);
+      taskAttempt.eventHandler.handle(new JobHistoryEvent(
+          taskAttempt.attemptId.getTaskId().getJobId(), tauce));
 
       if (event instanceof TaskAttemptKillEvent) {
         taskAttempt.addDiagnosticInfo(
             ((TaskAttemptKillEvent) event).getMessage());
       }
 
-//      taskAttempt.logAttemptFinishedEvent(TaskAttemptStateInternal.KILLED); Not logging Map/Reduce attempts in case of failure.
-      taskAttempt.eventHandler.handle(new TaskTAttemptEvent(
-          taskAttempt.attemptId,
-          TaskEventType.T_ATTEMPT_KILLED));
+      taskAttempt.eventHandler.handle(new TaskTAttemptKilledEvent(
+          taskAttempt.attemptId, taskAttempt.getRescheduleNextAttempt()));
     }
   }
 
@@ -2092,6 +2146,12 @@ public abstract class TaskAttemptImpl implements
       // for it.
       finalizeProgress(taskAttempt);
       sendContainerCleanup(taskAttempt, event);
+      // Store reschedule flag so that after clean up is completed, new
+      // attempt is scheduled/rescheduled based on it.
+      if (event instanceof TaskAttemptKillEvent) {
+        taskAttempt.setRescheduleNextAttempt(
+            ((TaskAttemptKillEvent)event).getRescheduleAttempt());
+      }
     }
   }
 
@@ -2108,7 +2168,8 @@ public abstract class TaskAttemptImpl implements
         taskAttempt.container.getId(), StringInterner
         .weakIntern(taskAttempt.container.getNodeId().toString()),
         taskAttempt.container.getContainerToken(),
-        ContainerLauncher.EventType.CONTAINER_REMOTE_CLEANUP));
+        ContainerLauncher.EventType.CONTAINER_REMOTE_CLEANUP,
+        event.getType() == TaskAttemptEventType.TA_TIMED_OUT));
   }
 
   /**
@@ -2164,23 +2225,19 @@ public abstract class TaskAttemptImpl implements
 
   @SuppressWarnings("unchecked")
   private static void notifyTaskAttemptFailed(TaskAttemptImpl taskAttempt) {
+    if (taskAttempt.getLaunchTime() == 0) {
+      sendJHStartEventForAssignedFailTask(taskAttempt);
+    }
     // set the finish time
     taskAttempt.setFinishTime();
+    taskAttempt.eventHandler
+        .handle(createJobCounterUpdateEventTAFailed(taskAttempt, false));
+    TaskAttemptUnsuccessfulCompletionEvent tauce =
+        createTaskAttemptUnsuccessfulCompletionEvent(taskAttempt,
+            TaskAttemptStateInternal.FAILED);
+    taskAttempt.eventHandler.handle(new JobHistoryEvent(
+        taskAttempt.attemptId.getTaskId().getJobId(), tauce));
 
-    if (taskAttempt.getLaunchTime() != 0) {
-      taskAttempt.eventHandler
-          .handle(createJobCounterUpdateEventTAFailed(taskAttempt, false));
-      TaskAttemptUnsuccessfulCompletionEvent tauce =
-          createTaskAttemptUnsuccessfulCompletionEvent(taskAttempt,
-              TaskAttemptStateInternal.FAILED);
-      taskAttempt.eventHandler.handle(new JobHistoryEvent(
-          taskAttempt.attemptId.getTaskId().getJobId(), tauce));
-      // taskAttempt.logAttemptFinishedEvent(TaskAttemptStateInternal.FAILED); Not
-      // handling failed map/reduce events.
-    }else {
-      LOG.debug("Not generating HistoryFinish event since start event not " +
-          "generated for taskAttempt: " + taskAttempt.getID());
-    }
     taskAttempt.eventHandler.handle(new TaskTAttemptEvent(
         taskAttempt.attemptId, TaskEventType.T_ATTEMPT_FAILED));
 
@@ -2193,15 +2250,20 @@ public abstract class TaskAttemptImpl implements
   }
 
   private static class StatusUpdater 
-       implements SingleArcTransition<TaskAttemptImpl, TaskAttemptEvent> {
+      implements SingleArcTransition<TaskAttemptImpl, TaskAttemptEvent> {
     @SuppressWarnings("unchecked")
     @Override
     public void transition(TaskAttemptImpl taskAttempt, 
         TaskAttemptEvent event) {
-      // Status update calls don't really change the state of the attempt.
+      TaskAttemptStatusUpdateEvent statusEvent =
+          ((TaskAttemptStatusUpdateEvent)event);
+
+      AtomicReference<TaskAttemptStatus> taskAttemptStatusRef =
+          statusEvent.getTaskAttemptStatusRef();
+
       TaskAttemptStatus newReportedStatus =
-          ((TaskAttemptStatusUpdateEvent) event)
-              .getReportedTaskAttemptStatus();
+          taskAttemptStatusRef.getAndSet(null);
+
       // Now switch the information in the reportedStatus
       taskAttempt.reportedStatus = newReportedStatus;
       taskAttempt.reportedStatus.taskState = taskAttempt.getState();
@@ -2210,12 +2272,10 @@ public abstract class TaskAttemptImpl implements
       taskAttempt.eventHandler.handle
           (new SpeculatorEvent
               (taskAttempt.reportedStatus, taskAttempt.clock.getTime()));
-      
       taskAttempt.updateProgressSplits();
-      
       //if fetch failures are present, send the fetch failure event to job
       //this only will happen in reduce attempt type
-      if (taskAttempt.reportedStatus.fetchFailedMaps != null && 
+      if (taskAttempt.reportedStatus.fetchFailedMaps != null &&
           taskAttempt.reportedStatus.fetchFailedMaps.size() > 0) {
         String hostname = taskAttempt.container == null ? "UNKNOWN"
             : taskAttempt.container.getNodeId().getHost();

@@ -20,9 +20,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.util.EnumSet;
 
 import org.apache.hadoop.conf.Configuration;
@@ -32,7 +30,6 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.MiniDFSCluster.DataNodeProperties;
 import org.apache.hadoop.hdfs.protocol.Block;
-import org.apache.hadoop.hdfs.protocol.BlockLocalPathInfo;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
@@ -60,6 +57,7 @@ public class TestLeaseRecovery {
   public void shutdown() throws IOException {
     if (cluster != null) {
       cluster.shutdown();
+      cluster = null;
     }
   }
 
@@ -178,8 +176,9 @@ public class TestLeaseRecovery {
     Path file = new Path("/testRecoveryFile");
     DistributedFileSystem dfs = cluster.getFileSystem();
     FSDataOutputStream out = dfs.create(file);
+    final int FILE_SIZE = 2 * 1024 * 1024;
     int count = 0;
-    while (count < 2 * 1024 * 1024) {
+    while (count < FILE_SIZE) {
       out.writeBytes("Data");
       count += 4;
     }
@@ -190,15 +189,23 @@ public class TestLeaseRecovery {
     LocatedBlocks locations = cluster.getNameNodeRpc().getBlockLocations(
         file.toString(), 0, count);
     ExtendedBlock block = locations.get(0).getBlock();
-    DataNode dn = cluster.getDataNodes().get(0);
-    BlockLocalPathInfo localPathInfo = dn.getBlockLocalPathInfo(block, null);
-    File metafile = new File(localPathInfo.getMetaPath());
-    assertTrue(metafile.exists());
 
-    // reduce the block meta file size
-    RandomAccessFile raf = new RandomAccessFile(metafile, "rw");
-    raf.setLength(metafile.length() - 20);
-    raf.close();
+    // Calculate meta file size
+    // From DataNode.java, checksum size is given by:
+    // (length of data + BYTE_PER_CHECKSUM - 1)/BYTES_PER_CHECKSUM *
+    // CHECKSUM_SIZE
+    final int CHECKSUM_SIZE = 4; // CRC32 & CRC32C
+    final int bytesPerChecksum = conf.getInt(
+        DFSConfigKeys.DFS_BYTES_PER_CHECKSUM_KEY,
+        DFSConfigKeys.DFS_BYTES_PER_CHECKSUM_DEFAULT);
+    final int metaFileSize =
+        (FILE_SIZE + bytesPerChecksum - 1) / bytesPerChecksum * CHECKSUM_SIZE +
+        8; // meta file header is 8 bytes
+    final int newMetaFileSize = metaFileSize - CHECKSUM_SIZE;
+
+    // Corrupt the block meta file by dropping checksum for bytesPerChecksum
+    // bytes. Lease recovery is expected to recover the uncorrupted file length.
+    cluster.truncateMeta(0, block, newMetaFileSize);
 
     // restart DN to make replica to RWR
     DataNodeProperties dnProp = cluster.stopDataNode(0);
@@ -213,6 +220,55 @@ public class TestLeaseRecovery {
     }
     assertTrue("File should be closed", newdfs.recoverLease(file));
 
+    // Verify file length after lease recovery. The new file length should not
+    // include the bytes with corrupted checksum.
+    final long expectedNewFileLen = FILE_SIZE - bytesPerChecksum;
+    final long newFileLen = newdfs.getFileStatus(file).getLen();
+    assertEquals(newFileLen, expectedNewFileLen);
+  }
+
+  /**
+   * Block/lease recovery should be retried with failed nodes from the second
+   * stage removed to avoid perpetual recovery failures.
+   */
+  @Test
+  public void testBlockRecoveryRetryAfterFailedRecovery() throws Exception {
+    Configuration conf = new Configuration();
+    cluster = new MiniDFSCluster.Builder(conf).numDataNodes(3).build();
+    Path file = new Path("/testBlockRecoveryRetryAfterFailedRecovery");
+    DistributedFileSystem dfs = cluster.getFileSystem();
+
+    // Create a file.
+    FSDataOutputStream out = dfs.create(file);
+    final int FILE_SIZE = 128 * 1024;
+    int count = 0;
+    while (count < FILE_SIZE) {
+      out.writeBytes("DE K9SUL");
+      count += 8;
+    }
+    out.hsync();
+
+    // Abort the original stream.
+    ((DFSOutputStream) out.getWrappedStream()).abort();
+
+    LocatedBlocks locations = cluster.getNameNodeRpc().getBlockLocations(
+        file.toString(), 0, count);
+    ExtendedBlock block = locations.get(0).getBlock();
+
+    // Finalize one replica to simulate a partial close failure.
+    cluster.getDataNodes().get(0).getFSDataset().finalizeBlock(block, false);
+    // Delete the meta file to simulate a rename/move failure.
+    cluster.deleteMeta(0, block);
+
+    // Try to recover the lease.
+    DistributedFileSystem newDfs = (DistributedFileSystem) FileSystem
+        .newInstance(cluster.getConfiguration(0));
+    count = 0;
+    while (count++ < 15 && !newDfs.recoverLease(file)) {
+      Thread.sleep(1000);
+    }
+    // The lease should have been recovered.
+    assertTrue("File should be closed", newDfs.recoverLease(file));
   }
 
   /**

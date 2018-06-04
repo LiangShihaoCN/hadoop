@@ -30,8 +30,12 @@ import javax.management.MBeanInfo;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.hadoop.metrics2.impl.ConfigBuilder;
+import org.apache.hadoop.metrics2.impl.TestMetricsConfig;
 import org.junit.Test;
 import org.mortbay.util.ajax.JSON;
 
@@ -137,12 +141,16 @@ public class TestFSNamesystemMBean {
     MiniDFSCluster cluster = null;
     FSNamesystem fsn = null;
 
+    int jmxCachePeriod = 1;
+    new ConfigBuilder().add("namenode.period", jmxCachePeriod)
+        .save(TestMetricsConfig.getTestFilename("hadoop-metrics2-namenode"));
     try {
       cluster = new MiniDFSCluster.Builder(conf).build();
       cluster.waitActive();
 
       fsn = cluster.getNameNode().namesystem;
       fsn.writeLock();
+      Thread.sleep(jmxCachePeriod * 1000);
 
       MBeanClient client = new MBeanClient();
       client.start();
@@ -154,6 +162,64 @@ public class TestFSNamesystemMBean {
       if (fsn != null && fsn.hasWriteLock()) {
         fsn.writeUnlock();
       }
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
+  // The test makes sure JMX request can be processed even if FSEditLog
+  // is synchronized.
+  @Test
+  public void testWithFSEditLogLock() throws Exception {
+    Configuration conf = new Configuration();
+    int jmxCachePeriod = 1;
+    new ConfigBuilder().add("namenode.period", jmxCachePeriod)
+        .save(TestMetricsConfig.getTestFilename("hadoop-metrics2-namenode"));
+    MiniDFSCluster cluster = null;
+    try {
+      cluster = new MiniDFSCluster.Builder(conf).build();
+      cluster.waitActive();
+      synchronized (cluster.getNameNode().getFSImage().getEditLog()) {
+        Thread.sleep(jmxCachePeriod * 1000);
+        MBeanClient client = new MBeanClient();
+        client.start();
+        client.join(20000);
+        assertTrue("JMX calls are blocked when FSEditLog" +
+            " is synchronized by another thread", client.succeeded);
+        client.interrupt();
+      }
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
+  @Test(timeout = 120000)
+  public void testFsEditLogMetrics() throws Exception {
+    final Configuration conf = new Configuration();
+    MiniDFSCluster cluster = null;
+    try {
+      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(0).build();
+      cluster.waitActive();
+      MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+      ObjectName mxbeanNameFs =
+          new ObjectName("Hadoop:service=NameNode,name=FSNamesystemState");
+
+      FileSystem fs = cluster.getFileSystem();
+      final int NUM_OPS = 10;
+      for (int i = 0; i < NUM_OPS; i++) {
+        final Path path = new Path(String.format("/user%d", i));
+        fs.mkdirs(path);
+      }
+
+      long syncCount = (long) mbs.getAttribute(mxbeanNameFs, "TotalSyncCount");
+      String syncTimes =
+          (String) mbs.getAttribute(mxbeanNameFs, "TotalSyncTimes");
+      assertTrue(syncCount > 0);
+      assertNotNull(syncTimes);
+    } finally {
       if (cluster != null) {
         cluster.shutdown();
       }

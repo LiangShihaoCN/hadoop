@@ -20,8 +20,10 @@ package org.apache.hadoop.hdfs.server.blockmanagement;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -82,12 +84,12 @@ public class CorruptReplicasMap{
     if (!nodes.keySet().contains(dn)) {
       NameNode.blockStateChangeLog.debug(
           "BLOCK NameSystem.addToCorruptReplicasMap: {} added as corrupt on "
-              + "{} by {} {}", blk.getBlockName(), dn, Server.getRemoteIp(),
+              + "{} by {} {}", blk, dn, Server.getRemoteIp(),
           reasonText);
     } else {
       NameNode.blockStateChangeLog.debug(
           "BLOCK NameSystem.addToCorruptReplicasMap: duplicate requested for" +
-              " {} to add as corrupt on {} by {} {}", blk.getBlockName(), dn,
+              " {} to add as corrupt on {} by {} {}", blk, dn,
               Server.getRemoteIp(), reasonText);
     }
     // Add the node or update the reason.
@@ -229,6 +231,16 @@ public class CorruptReplicasMap{
     }
     
     return ret;
+  }
+
+  /**
+   * method to get the set of corrupt blocks in corruptReplicasMap.
+   * @return Set of Block objects
+   */
+  Set<Block> getCorruptBlocks() {
+    Set<Block> corruptBlocks = new HashSet<Block>();
+    corruptBlocks.addAll(corruptReplicasMap.keySet());
+    return corruptBlocks;
   }
 
   /**

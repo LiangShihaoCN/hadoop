@@ -69,7 +69,7 @@ import org.apache.hadoop.yarn.util.Records;
 import org.apache.log4j.Logger;
 
 import org.apache.hadoop.yarn.sls.scheduler.ContainerSimulator;
-import org.apache.hadoop.yarn.sls.scheduler.ResourceSchedulerWrapper;
+import org.apache.hadoop.yarn.sls.scheduler.SchedulerWrapper;
 import org.apache.hadoop.yarn.sls.SLSRunner;
 import org.apache.hadoop.yarn.sls.scheduler.TaskRunner;
 import org.apache.hadoop.yarn.sls.utils.SLSUtils;
@@ -90,7 +90,7 @@ public abstract class AMSimulator extends TaskRunner.Task {
           RecordFactoryProvider.getRecordFactory(null);
   // response queue
   protected final BlockingQueue<AllocateResponse> responseQueue;
-  protected int RESPONSE_ID = 1;
+  private int responseId = 0;
   // user name
   protected String user;  
   // queue name
@@ -190,7 +190,7 @@ public abstract class AMSimulator extends TaskRunner.Task {
     simulateFinishTimeMS = System.currentTimeMillis() -
         SLSRunner.getRunner().getStartTimeMS();
     // record job running information
-    ((ResourceSchedulerWrapper)rm.getResourceScheduler())
+    ((SchedulerWrapper)rm.getResourceScheduler())
          .addAMRuntime(appId, 
                       traceStartTimeMS, traceFinishTimeMS, 
                       simulateStartTimeMS, simulateFinishTimeMS);
@@ -213,7 +213,7 @@ public abstract class AMSimulator extends TaskRunner.Task {
       List<ContainerId> toRelease) {
     AllocateRequest allocateRequest =
             recordFactory.newRecordInstance(AllocateRequest.class);
-    allocateRequest.setResponseId(RESPONSE_ID ++);
+    allocateRequest.setResponseId(responseId++);
     allocateRequest.setAskList(ask);
     allocateRequest.setReleaseList(toRelease);
     return allocateRequest;
@@ -315,13 +315,13 @@ public abstract class AMSimulator extends TaskRunner.Task {
 
   private void trackApp() {
     if (isTracked) {
-      ((ResourceSchedulerWrapper) rm.getResourceScheduler())
+      ((SchedulerWrapper) rm.getResourceScheduler())
               .addTrackedApp(appAttemptId, oldAppId);
     }
   }
   public void untrackApp() {
     if (isTracked) {
-      ((ResourceSchedulerWrapper) rm.getResourceScheduler())
+      ((SchedulerWrapper) rm.getResourceScheduler())
               .removeTrackedApp(appAttemptId, oldAppId);
     }
   }

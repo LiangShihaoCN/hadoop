@@ -15,6 +15,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+/* FreeBSD protects the getline() prototype. See getline(3) for more */
+#ifdef __FreeBSD__
+#define _WITH_GETLINE
+#endif
+
 #include <pwd.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -59,7 +65,9 @@ enum errorcodes {
   TRAFFIC_CONTROL_EXECUTION_FAILED = 28,
   DOCKER_RUN_FAILED=29,
   ERROR_OPENING_FILE = 30,
-  ERROR_READING_FILE = 31
+  ERROR_READING_FILE = 31,
+  FEATURE_DISABLED = 32,
+  ERROR_SANITIZING_DOCKER_COMMAND = 33
 };
 
 enum operations {
@@ -86,7 +94,17 @@ enum operations {
 #define BANNED_USERS_KEY "banned.users"
 #define ALLOWED_SYSTEM_USERS_KEY "allowed.system.users"
 #define DOCKER_BINARY_KEY "docker.binary"
+#define DOCKER_SUPPORT_ENABLED_KEY "feature.docker.enabled"
+#define TC_SUPPORT_ENABLED_KEY "feature.tc.enabled"
 #define TMP_DIR "tmp"
+
+/* Macros for min/max. */
+#ifndef MIN
+#define MIN(a,b) (((a)<(b))?(a):(b))
+#endif /* MIN */
+#ifndef MAX
+#define MAX(a,b) (((a)>(b))?(a):(b))
+#endif  /* MAX */
 
 extern struct passwd *user_detail;
 
@@ -95,9 +113,14 @@ extern FILE *LOGFILE;
 // the log file for error messages
 extern FILE *ERRORFILE;
 
-
 // get the executable's filename
-char* get_executable();
+char* get_executable(char *argv0);
+
+//function used to load the configurations present in the secure config
+void read_executor_config(const char* file_name);
+
+//Lookup nodemanager group from container executor configuration.
+char *get_nodemanager_group();
 
 /**
  * Check the permissions on the container-executor to make sure that security is
@@ -110,6 +133,12 @@ char* get_executable();
  * @return -1 on error 0 on success.
  */
 int check_executor_permissions(char *executable_file);
+
+//function used to load the configurations present in the secure config.
+void read_executor_config(const char* file_name);
+
+//function used to free executor configuration data
+void free_executor_configurations();
 
 // initialize the application directory
 int initialize_app(const char *user, const char *app_id,
@@ -166,7 +195,7 @@ int signal_container_as_user(const char *user, int pid, int sig);
 // delete a directory (or file) recursively as the user. The directory
 // could optionally be relative to the baseDir set of directories (if the same
 // directory appears on multiple disk volumes, the disk volumes should be passed
-// as the baseDirs). If baseDirs is not specified, then dir_to_be_deleted is 
+// as the baseDirs). If baseDirs is not specified, then dir_to_be_deleted is
 // assumed as the absolute path
 int delete_as_user(const char *user,
                    const char *dir_to_be_deleted,
@@ -195,6 +224,11 @@ char *get_user_directory(const char *nm_root, const char *user);
 
 char *get_app_directory(const char * nm_root, const char *user,
                         const char *app_id);
+
+/**
+ * Check node manager local dir permission.
+ */
+int check_nm_local_dir(uid_t caller_uid, const char *nm_root);
 
 char *get_container_work_directory(const char *nm_root, const char *user,
 				 const char *app_id, const char *container_id);
@@ -238,6 +272,12 @@ int check_dir(const char* npath, mode_t st_mode, mode_t desired,
 int create_validate_dir(const char* npath, mode_t perm, const char* path,
    int finalComponent);
 
+/** Check if tc (traffic control) support is enabled in configuration. */
+int is_tc_support_enabled();
+
+/** Check if docker support is enabled in configuration. */
+int is_docker_support_enabled();
+
 /**
  * Run a batch of tc commands that modify interface configuration
  */
@@ -257,8 +297,17 @@ int traffic_control_read_state(char *command_file);
  */
 int traffic_control_read_stats(char *command_file);
 
+/**
+ * Get the docker binary path.
+ */
+char *get_docker_binary();
 
 /**
  * Run a docker command passing the command file as an argument
  */
 int run_docker(const char *command_file);
+
+/**
+ * Sanitize docker commands. Returns NULL if there was any failure.
+*/
+char* sanitize_docker_command(const char *line);

@@ -321,7 +321,7 @@ public class YARNRunner implements ClientProtocol {
       throws IOException {
     LocalResource rsrc = recordFactory.newRecordInstance(LocalResource.class);
     FileStatus rsrcStat = fs.getFileStatus(p);
-    rsrc.setResource(ConverterUtils.getYarnUrlFromPath(fs
+    rsrc.setResource(URL.fromPath(fs
         .getDefaultFileSystem().resolvePath(rsrcStat.getPath())));
     rsrc.setSize(rsrcStat.getLen());
     rsrc.setTimestamp(rsrcStat.getModificationTime());
@@ -337,7 +337,7 @@ public class YARNRunner implements ClientProtocol {
 
     // Setup resource requirements
     Resource capability = recordFactory.newRecordInstance(Resource.class);
-    capability.setMemory(
+    capability.setMemorySize(
         conf.getInt(
             MRJobConfig.MR_AM_VMEM_MB, MRJobConfig.DEFAULT_MR_AM_VMEM_MB
             )
@@ -355,8 +355,7 @@ public class YARNRunner implements ClientProtocol {
 
     Path jobConfPath = new Path(jobSubmitDir, MRJobConfig.JOB_CONF_FILE);
 
-    URL yarnUrlForJobSubmitDir = ConverterUtils
-        .getYarnUrlFromPath(defaultFileContext.getDefaultFileSystem()
+    URL yarnUrlForJobSubmitDir = URL.fromPath(defaultFileContext.getDefaultFileSystem()
             .resolvePath(
                 defaultFileContext.makeQualified(new Path(jobSubmitDir))));
     LOG.debug("Creating setup context, jobSubmitDir url is "
@@ -402,6 +401,10 @@ public class YARNRunner implements ClientProtocol {
     vargs.add(MRApps.crossPlatformifyMREnv(jobConf, Environment.JAVA_HOME)
         + "/bin/java");
 
+    Path amTmpDir =
+        new Path(MRApps.crossPlatformifyMREnv(conf, Environment.PWD),
+            YarnConfiguration.DEFAULT_CONTAINER_TEMP_DIR);
+    vargs.add("-Djava.io.tmpdir=" + amTmpDir);
     MRApps.addLog4jSystemProperties(null, vargs, conf);
 
     // Check for Java Lib Path usage in MAP and REDUCE configs
@@ -468,13 +471,14 @@ public class YARNRunner implements ClientProtocol {
         conf.get(MRJobConfig.MAPRED_ADMIN_USER_SHELL,
             MRJobConfig.DEFAULT_SHELL));
 
-    // Add the container working directory at the front of LD_LIBRARY_PATH
+    // Add the container working directory in front of LD_LIBRARY_PATH
     MRApps.addToEnvironment(environment, Environment.LD_LIBRARY_PATH.name(),
         MRApps.crossPlatformifyMREnv(conf, Environment.PWD), conf);
 
     // Setup the environment variables for Admin first
     MRApps.setEnvFromInputString(environment, 
-        conf.get(MRJobConfig.MR_AM_ADMIN_USER_ENV), conf);
+        conf.get(MRJobConfig.MR_AM_ADMIN_USER_ENV,
+            MRJobConfig.DEFAULT_MR_AM_ADMIN_USER_ENV), conf);
     // Setup the environment variables (LD_LIBRARY_PATH, etc)
     MRApps.setEnvFromInputString(environment, 
         conf.get(MRJobConfig.MR_AM_ENV), conf);
@@ -558,13 +562,30 @@ public class YARNRunner implements ClientProtocol {
       appContext.setApplicationTags(new HashSet<String>(tagsFromConf));
     }
 
+    String jobPriority = jobConf.get(MRJobConfig.PRIORITY);
+    if (jobPriority != null) {
+      int iPriority;
+      try {
+        iPriority = TypeConverter.toYarnApplicationPriority(jobPriority);
+      } catch (IllegalArgumentException e) {
+        iPriority = Integer.parseInt(jobPriority);
+      }
+      appContext.setPriority(Priority.newInstance(iPriority));
+    }
+
     return appContext;
   }
 
   @Override
   public void setJobPriority(JobID arg0, String arg1) throws IOException,
       InterruptedException {
-    resMgrDelegate.setJobPriority(arg0, arg1);
+    ApplicationId appId = TypeConverter.toYarn(arg0).getAppId();
+    try {
+      resMgrDelegate.updateApplicationPriority(appId,
+          Priority.newInstance(Integer.parseInt(arg1)));
+    } catch (YarnException e) {
+      throw new IOException(e);
+    }
   }
 
   @Override
@@ -732,6 +753,17 @@ public class YARNRunner implements ClientProtocol {
                "are used. These values should be set as part of the " +
                "LD_LIBRARY_PATH in the " + component + " JVM env using " +
                envConf + " config settings.");
+    }
+  }
+
+  public void close() throws IOException {
+    if (resMgrDelegate != null) {
+      resMgrDelegate.close();
+      resMgrDelegate = null;
+    }
+    if (clientCache != null) {
+      clientCache.close();
+      clientCache = null;
     }
   }
 }

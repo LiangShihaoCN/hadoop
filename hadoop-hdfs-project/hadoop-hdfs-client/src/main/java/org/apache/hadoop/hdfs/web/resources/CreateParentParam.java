@@ -22,7 +22,7 @@ public class CreateParentParam extends BooleanParam {
   /** Parameter name. */
   public static final String NAME = "createparent";
   /** Default parameter value. */
-  public static final String DEFAULT = FALSE;
+  public static final String DEFAULT = TRUE;
 
   private static final Domain DOMAIN = new Domain(NAME);
 
@@ -39,7 +39,7 @@ public class CreateParentParam extends BooleanParam {
    * @param str a string representation of the parameter value.
    */
   public CreateParentParam(final String str) {
-    this(DOMAIN.parse(str));
+    this(DOMAIN.parse(str == null ? DEFAULT : str));
   }
 
   @Override

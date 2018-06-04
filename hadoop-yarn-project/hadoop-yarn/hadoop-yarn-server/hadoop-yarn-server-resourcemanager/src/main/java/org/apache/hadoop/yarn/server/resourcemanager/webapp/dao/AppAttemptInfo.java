@@ -27,8 +27,6 @@ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
-import org.apache.hadoop.yarn.server.resourcemanager.webapp.RMAppAttemptBlock;
-import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
 
 @XmlRootElement(name = "appAttempt")
@@ -42,11 +40,13 @@ public class AppAttemptInfo {
   protected String nodeId;
   protected String logsLink;
   protected String blacklistedNodes;
+  protected String nodesBlacklistedBySystem;
 
   public AppAttemptInfo() {
   }
 
-  public AppAttemptInfo(ResourceManager rm, RMAppAttempt attempt, String user) {
+  public AppAttemptInfo(ResourceManager rm, RMAppAttempt attempt, String user,
+      String schemePrefix) {
     this.startTime = 0;
     this.containerId = "";
     this.nodeHttpAddress = "";
@@ -61,9 +61,13 @@ public class AppAttemptInfo {
         this.containerId = masterContainer.getId().toString();
         this.nodeHttpAddress = masterContainer.getNodeHttpAddress();
         this.nodeId = masterContainer.getNodeId().toString();
-        this.logsLink =
-            WebAppUtils.getRunningLogURL("//" + masterContainer.getNodeHttpAddress(),
-                ConverterUtils.toString(masterContainer.getId()), user);
+        this.logsLink = WebAppUtils.getRunningLogURL(schemePrefix
+            + masterContainer.getNodeHttpAddress(),
+            masterContainer.getId().toString(), user);
+
+        nodesBlacklistedBySystem =
+            StringUtils.join(attempt.getAMBlacklistManager()
+              .getBlacklistUpdates().getBlacklistAdditions(), ", ");
         if (rm.getResourceScheduler() instanceof AbstractYarnScheduler) {
           AbstractYarnScheduler ayScheduler =
               (AbstractYarnScheduler) rm.getResourceScheduler();

@@ -44,8 +44,11 @@ import org.apache.hadoop.mapreduce.v2.util.MRApps;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
+import org.apache.hadoop.yarn.api.protocolrecords.GetNewReservationResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationDeleteRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationDeleteResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.ReservationListRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.ReservationListResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationSubmissionRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationSubmissionResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationUpdateRequest;
@@ -61,7 +64,9 @@ import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeLabel;
 import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.NodeState;
+import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+import org.apache.hadoop.yarn.api.records.SignalContainerCommand;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
 import org.apache.hadoop.yarn.client.ClientRMProxy;
@@ -292,6 +297,12 @@ public class ResourceMgrDelegate extends YarnClient {
   }
 
   @Override
+  public void failApplicationAttempt(ApplicationAttemptId attemptId)
+      throws YarnException, IOException {
+    client.failApplicationAttempt(attemptId);
+  }
+
+  @Override
   public void killApplication(ApplicationId applicationId)
       throws YarnException, IOException {
     client.killApplication(applicationId);
@@ -426,6 +437,12 @@ public class ResourceMgrDelegate extends YarnClient {
   }
 
   @Override
+  public GetNewReservationResponse createReservation() throws YarnException,
+      IOException {
+    return client.createReservation();
+  }
+
+  @Override
   public ReservationSubmissionResponse submitReservation(
       ReservationSubmissionRequest request) throws YarnException, IOException {
     return client.submitReservation(request);
@@ -444,19 +461,24 @@ public class ResourceMgrDelegate extends YarnClient {
   }
 
   @Override
-  public Map<NodeId, Set<NodeLabel>> getNodeToLabels() throws YarnException,
+  public ReservationListResponse listReservations(
+          ReservationListRequest request) throws YarnException, IOException {
+    return client.listReservations(request);
+  }
+  @Override
+  public Map<NodeId, Set<String>> getNodeToLabels() throws YarnException,
       IOException {
     return client.getNodeToLabels();
   }
 
   @Override
-  public Map<NodeLabel, Set<NodeId>> getLabelsToNodes() throws YarnException,
+  public Map<String, Set<NodeId>> getLabelsToNodes() throws YarnException,
       IOException {
     return client.getLabelsToNodes();
   }
 
   @Override
-  public Map<NodeLabel, Set<NodeId>> getLabelsToNodes(Set<String> labels)
+  public Map<String, Set<NodeId>> getLabelsToNodes(Set<String> labels)
       throws YarnException, IOException {
     return client.getLabelsToNodes(labels);
   }
@@ -465,5 +487,24 @@ public class ResourceMgrDelegate extends YarnClient {
   public List<NodeLabel> getClusterNodeLabels()
       throws YarnException, IOException {
     return client.getClusterNodeLabels();
+  }
+
+  @Override
+  public Priority updateApplicationPriority(ApplicationId applicationId,
+      Priority priority) throws YarnException, IOException {
+    return client.updateApplicationPriority(applicationId, priority);
+  }
+
+  @Override
+  public void signalToContainer(ContainerId containerId,
+      SignalContainerCommand command)
+      throws YarnException, IOException {
+    client.signalToContainer(containerId, command);
+  }
+
+  @Override
+  public void killApplication(ApplicationId appId, String diagnostics)
+      throws YarnException, IOException {
+    client.killApplication(appId, diagnostics);
   }
 }

@@ -26,7 +26,6 @@ import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.util.StringUtils;
-import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperationException;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperationExecutor;
@@ -34,6 +33,7 @@ import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.Contai
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerRuntimeContext;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.LinuxContainerRuntimeConstants.*;
 
@@ -57,6 +57,11 @@ public class DefaultLinuxContainerRuntime implements LinuxContainerRuntime {
   }
 
   @Override
+  public boolean useWhitelistEnv(Map<String, String> env) {
+    return true;
+  }
+
+  @Override
   public void prepareContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
     //nothing to do here at the moment.
@@ -65,9 +70,8 @@ public class DefaultLinuxContainerRuntime implements LinuxContainerRuntime {
   @Override
   public void launchContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
-    Container container = ctx.getContainer();
     PrivilegedOperation launchOp = new PrivilegedOperation(
-        PrivilegedOperation.OperationType.LAUNCH_CONTAINER, (String) null);
+        PrivilegedOperation.OperationType.LAUNCH_CONTAINER);
 
     //All of these arguments are expected to be available in the runtime context
     launchOp.appendArgs(ctx.getExecutionAttribute(RUN_AS_USER),
@@ -101,8 +105,7 @@ public class DefaultLinuxContainerRuntime implements LinuxContainerRuntime {
 
     try {
       privilegedOperationExecutor.executePrivilegedOperation(prefixCommands,
-            launchOp, null, container.getLaunchContext().getEnvironment(),
-            false);
+            launchOp, null, null, false, false);
     } catch (PrivilegedOperationException e) {
       LOG.warn("Launch container failed. Exception: ", e);
 
@@ -114,9 +117,8 @@ public class DefaultLinuxContainerRuntime implements LinuxContainerRuntime {
   @Override
   public void signalContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
-    Container container = ctx.getContainer();
     PrivilegedOperation signalOp = new PrivilegedOperation(
-        PrivilegedOperation.OperationType.SIGNAL_CONTAINER, (String) null);
+        PrivilegedOperation.OperationType.SIGNAL_CONTAINER);
 
     signalOp.appendArgs(ctx.getExecutionAttribute(RUN_AS_USER),
         ctx.getExecutionAttribute(USER),
@@ -125,16 +127,18 @@ public class DefaultLinuxContainerRuntime implements LinuxContainerRuntime {
         ctx.getExecutionAttribute(PID),
         Integer.toString(ctx.getExecutionAttribute(SIGNAL).getValue()));
 
+    //Some failures here are acceptable. Let the calling executor decide.
+    signalOp.disableFailureLogging();
+
     try {
       PrivilegedOperationExecutor executor = PrivilegedOperationExecutor
           .getInstance(conf);
 
       executor.executePrivilegedOperation(null,
-          signalOp, null, container.getLaunchContext().getEnvironment(),
-          false);
+          signalOp, null, null, false, false);
     } catch (PrivilegedOperationException e) {
-      LOG.warn("Signal container failed. Exception: ", e);
-
+      //Don't log the failure here. Some kinds of signaling failures are
+      // acceptable. Let the calling executor decide what to do.
       throw new ContainerExecutionException("Signal container failed", e
           .getExitCode(), e.getOutput(), e.getErrorOutput());
     }

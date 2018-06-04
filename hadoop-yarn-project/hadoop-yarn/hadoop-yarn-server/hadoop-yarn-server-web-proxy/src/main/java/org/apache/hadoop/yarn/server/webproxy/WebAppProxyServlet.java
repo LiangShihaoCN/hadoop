@@ -49,6 +49,9 @@ import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.ApplicationNotFoundException;
 import org.apache.hadoop.yarn.exceptions.YarnException;
+import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+import org.apache.hadoop.yarn.server.webproxy.AppReportFetcher.AppReportSource;
+import org.apache.hadoop.yarn.server.webproxy.AppReportFetcher.FetchedAppReport;
 import org.apache.hadoop.yarn.util.Apps;
 import org.apache.hadoop.yarn.util.StringHelper;
 import org.apache.hadoop.yarn.util.TrackingUriPlugin;
@@ -90,6 +93,7 @@ public class WebAppProxyServlet extends HttpServlet {
 
   private transient List<TrackingUriPlugin> trackingUriPlugins;
   private final String rmAppPageUrlBase;
+  private final String ahsAppPageUrlBase;
   private transient YarnConfiguration conf;
 
   /**
@@ -125,6 +129,9 @@ public class WebAppProxyServlet extends HttpServlet {
             TrackingUriPlugin.class);
     this.rmAppPageUrlBase = StringHelper.pjoin(
         WebAppUtils.getResolvedRMWebAppURLWithScheme(conf), "cluster", "app");
+    this.ahsAppPageUrlBase = StringHelper.pjoin(
+        WebAppUtils.getHttpSchemePrefix(conf) + WebAppUtils
+        .getAHSWebAppURLWithoutScheme(conf), "applicationhistory", "app");
   }
 
   /**
@@ -266,7 +273,7 @@ public class WebAppProxyServlet extends HttpServlet {
     return b != null ? b : false;
   }
   
-  private ApplicationReport getApplicationReport(ApplicationId id)
+  private FetchedAppReport getApplicationReport(ApplicationId id)
       throws IOException, YarnException {
     return ((AppReportFetcher) getServletContext()
         .getAttribute(WebAppProxy.FETCHER_ATTRIBUTE)).getApplicationReport(id);
@@ -304,7 +311,7 @@ public class WebAppProxyServlet extends HttpServlet {
       String userApprovedParamS = 
         req.getParameter(ProxyUriUtils.PROXY_APPROVAL_PARAM);
       boolean userWasWarned = false;
-      boolean userApproved = Boolean.valueOf(userApprovedParamS);
+      boolean userApproved = Boolean.parseBoolean(userApprovedParamS);
       boolean securityEnabled = isSecurityEnabled();
       final String remoteUser = req.getRemoteUser();
       final String pathInfo = req.getPathInfo();
@@ -321,8 +328,14 @@ public class WebAppProxyServlet extends HttpServlet {
       //parts[0] is empty because path info always starts with a /
       String appId = parts[1];
       String rest = parts.length > 2 ? parts[2] : "";
-      ApplicationId id = Apps.toAppID(appId);
-      if(id == null) {
+      ApplicationId id = null;
+      try {
+        id = Apps.toAppID(appId);
+      } catch (YarnRuntimeException e) {
+        throw new YarnRuntimeException("Error parsing Application Id");
+      }
+
+      if (id == null) {
         LOG.warn("{} attempting to access {} that is invalid",
             remoteUser, appId);
         notFound(resp, appId + " appears to be formatted incorrectly.");
@@ -336,7 +349,7 @@ public class WebAppProxyServlet extends HttpServlet {
           for (Cookie c : cookies) {
             if (cookieName.equals(c.getName())) {
               userWasWarned = true;
-              userApproved = userApproved || Boolean.valueOf(c.getValue());
+              userApproved = userApproved || Boolean.parseBoolean(c.getValue());
               break;
             }
           }
@@ -345,9 +358,18 @@ public class WebAppProxyServlet extends HttpServlet {
       
       boolean checkUser = securityEnabled && (!userWasWarned || !userApproved);
 
-      ApplicationReport applicationReport;
+      FetchedAppReport fetchedAppReport = null;
+      ApplicationReport applicationReport = null;
       try {
-        applicationReport = getApplicationReport(id);
+        fetchedAppReport = getApplicationReport(id);
+        if (fetchedAppReport != null) {
+          if (fetchedAppReport.getAppReportSource() != AppReportSource.RM &&
+              fetchedAppReport.getAppReportSource() != AppReportSource.AHS) {
+            throw new UnsupportedOperationException("Application report not "
+                + "fetched from RM or history server.");
+          }
+          applicationReport = fetchedAppReport.getApplicationReport();
+        }
       } catch (ApplicationNotFoundException e) {
         applicationReport = null;
       }
@@ -363,16 +385,29 @@ public class WebAppProxyServlet extends HttpServlet {
           return;
         }
 
-        notFound(resp, "Application " + appId + " could not be found, " +
-                       "please try the history server");
+        notFound(resp, "Application " + appId + " could not be found " +
+            "in RM or history server");
         return;
       }
       String original = applicationReport.getOriginalTrackingUrl();
       URI trackingUri;
-      // fallback to ResourceManager's app page if no tracking URI provided
-      if(original == null || original.equals("N/A")) {
-        ProxyUtils.sendRedirect(req, resp, 
-            StringHelper.pjoin(rmAppPageUrlBase, id.toString()));
+      if (original == null || original.equals("N/A") || original.equals("")) {
+        if (fetchedAppReport.getAppReportSource() == AppReportSource.RM) {
+          // fallback to ResourceManager's app page if no tracking URI provided
+          // and Application Report was fetched from RM
+          LOG.debug("Original tracking url is '{}'. Redirecting to RM app page",
+              original == null? "NULL" : original);
+          ProxyUtils.sendRedirect(req, resp,
+              StringHelper.pjoin(rmAppPageUrlBase, id.toString()));
+        } else if (fetchedAppReport.getAppReportSource()
+              == AppReportSource.AHS) {
+          // fallback to Application History Server app page if the application
+          // report was fetched from AHS
+          LOG.debug("Original tracking url is '{}'. Redirecting to AHS app page"
+              , original == null? "NULL" : original);
+          ProxyUtils.sendRedirect(req, resp,
+              StringHelper.pjoin(ahsAppPageUrlBase, id.toString()));
+        }
         return;
       } else {
         if (ProxyUriUtils.getSchemeFromUrl(original).isEmpty()) {
@@ -395,11 +430,14 @@ public class WebAppProxyServlet extends HttpServlet {
 
       // Append the user-provided path and query parameter to the original
       // tracking url.
-      List<NameValuePair> queryPairs =
-          URLEncodedUtils.parse(req.getQueryString(), null);
       UriBuilder builder = UriBuilder.fromUri(trackingUri);
-      for (NameValuePair pair : queryPairs) {
-        builder.queryParam(pair.getName(), pair.getValue());
+      String queryString = req.getQueryString();
+      if (queryString != null) {
+        List<NameValuePair> queryPairs =
+            URLEncodedUtils.parse(queryString, null);
+        for (NameValuePair pair : queryPairs) {
+          builder.queryParam(pair.getName(), pair.getValue());
+        }
       }
       URI toFetch = builder.path(rest).build();
 

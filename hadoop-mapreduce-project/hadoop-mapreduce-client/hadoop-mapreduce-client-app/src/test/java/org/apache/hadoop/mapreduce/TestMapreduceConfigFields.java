@@ -75,9 +75,9 @@ public class TestMapreduceConfigFields extends TestConfigurationFieldsBase {
     // Obsolete entries listed in MAPREDUCE-6057 were removed from trunk
     // but not removed from branch-2.
     xmlPropsToSkipCompare.add("map.sort.class");
-    xmlPropsToSkipCompare.add("mapreduce.reduce.skip.proc.count.autoincr");
-    xmlPropsToSkipCompare.add("mapreduce.map.skip.proc.count.autoincr");
     xmlPropsToSkipCompare.add("mapreduce.local.clientfactory.class.name");
+    xmlPropsToSkipCompare.add("mapreduce.jobtracker.system.dir");
+    xmlPropsToSkipCompare.add("mapreduce.jobtracker.staging.root.dir");
   }
 
 }

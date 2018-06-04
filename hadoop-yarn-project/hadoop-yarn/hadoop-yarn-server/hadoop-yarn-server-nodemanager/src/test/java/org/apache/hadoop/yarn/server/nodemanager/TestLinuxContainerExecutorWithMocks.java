@@ -22,7 +22,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
@@ -39,6 +41,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -46,12 +49,15 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.ContainerDiagnosticsUpdateEvent;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperationException;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperationExecutor;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.DefaultLinuxContainerRuntime;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.LinuxContainerRuntime;
@@ -64,10 +70,16 @@ import org.junit.Assert;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
 import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
+import static org.mockito.Matchers.anyListOf;
+import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 public class TestLinuxContainerExecutorWithMocks {
 
@@ -81,6 +93,8 @@ public class TestLinuxContainerExecutorWithMocks {
 
   private String tmpMockExecutor;
   private LinuxContainerExecutor mockExec = null;
+  private LinuxContainerExecutor mockExecMockRuntime = null;
+  private PrivilegedOperationExecutor mockPrivilegedExec;
   private final File mockParamFile = new File("./params.txt");
   private LocalDirsHandlerService dirsHandler;
   
@@ -128,24 +142,30 @@ public class TestLinuxContainerExecutorWithMocks {
     tmpMockExecutor = System.getProperty("test.build.data") +
         "/tmp-mock-container-executor";
 
-    Configuration conf = new Configuration();
+    Configuration conf = new YarnConfiguration();
     LinuxContainerRuntime linuxContainerRuntime;
+    LinuxContainerRuntime mockLinuxContainerRuntime;
 
     setupMockExecutor(MOCK_EXECUTOR, conf);
     linuxContainerRuntime = new DefaultLinuxContainerRuntime(
         PrivilegedOperationExecutor.getInstance(conf));
+    mockPrivilegedExec = Mockito.mock(PrivilegedOperationExecutor.class);
+    mockLinuxContainerRuntime = new DefaultLinuxContainerRuntime(
+        mockPrivilegedExec);
     dirsHandler = new LocalDirsHandlerService();
     dirsHandler.init(conf);
     linuxContainerRuntime.initialize(conf);
     mockExec = new LinuxContainerExecutor(linuxContainerRuntime);
     mockExec.setConf(conf);
+    mockExecMockRuntime = new LinuxContainerExecutor(mockLinuxContainerRuntime);
+    mockExecMockRuntime.setConf(conf);
   }
 
   @After
   public void tearDown() {
     deleteMockParamFile();
   }
-  
+
   @Test
   public void testContainerLaunch() throws IOException {
     String appSubmitter = "nobody";
@@ -157,7 +177,7 @@ public class TestLinuxContainerExecutorWithMocks {
     ContainerId cId = mock(ContainerId.class);
     ContainerLaunchContext context = mock(ContainerLaunchContext.class);
     HashMap<String, String> env = new HashMap<String,String>();
-    
+
     when(container.getContainerId()).thenReturn(cId);
     when(container.getLaunchContext()).thenReturn(context);
     
@@ -216,7 +236,7 @@ public class TestLinuxContainerExecutorWithMocks {
   public void testLaunchCommandWithoutPriority() throws IOException {
     // make sure the command doesn't contain the nice -n since priority
     // not specified
-   List<String> command = new ArrayList<String>();
+    List<String> command = new ArrayList<String>();
     mockExec.addSchedPriorityCommand(command);
     assertEquals("addSchedPriority should be empty", 0, command.size());
   }
@@ -239,7 +259,7 @@ public class TestLinuxContainerExecutorWithMocks {
           .build());
 
       List<String> result=readMockParams();
-      Assert.assertEquals(result.size(), 18);
+      Assert.assertEquals(result.size(), 19);
       Assert.assertEquals(result.get(0), YarnConfiguration.DEFAULT_NM_NONSECURE_MODE_LOCAL_USER);
       Assert.assertEquals(result.get(1), "test");
       Assert.assertEquals(result.get(2), "0" );
@@ -479,5 +499,130 @@ public class TestLinuxContainerExecutorWithMocks {
     assertEquals(Arrays.asList(YarnConfiguration.DEFAULT_NM_NONSECURE_MODE_LOCAL_USER,
         appSubmitter, cmd, "", baseDir0.toString(), baseDir1.toString()),
         readMockParams());
+  }
+
+  @Test
+  public void testNoExitCodeFromPrivilegedOperation() throws Exception {
+    Configuration conf = new Configuration();
+    final PrivilegedOperationExecutor spyPrivilegedExecutor =
+        spy(PrivilegedOperationExecutor.getInstance(conf));
+    doThrow(new PrivilegedOperationException("interrupted"))
+        .when(spyPrivilegedExecutor).executePrivilegedOperation(
+            any(List.class), any(PrivilegedOperation.class),
+            any(File.class), any(Map.class), anyBoolean(), anyBoolean());
+    LinuxContainerRuntime runtime = new DefaultLinuxContainerRuntime(
+        spyPrivilegedExecutor);
+    runtime.initialize(conf);
+    mockExec = new LinuxContainerExecutor(runtime);
+    mockExec.setConf(conf);
+    LinuxContainerExecutor lce = new LinuxContainerExecutor(runtime) {
+      @Override
+      protected PrivilegedOperationExecutor getPrivilegedOperationExecutor() {
+        return spyPrivilegedExecutor;
+      }
+    };
+    lce.setConf(conf);
+    InetSocketAddress address = InetSocketAddress.createUnresolved(
+        "localhost", 8040);
+    Path nmPrivateCTokensPath= new Path("file:///bin/nmPrivateCTokensPath");
+    LocalDirsHandlerService dirService = new LocalDirsHandlerService();
+    dirService.init(conf);
+
+    String appSubmitter = "nobody";
+    ApplicationId appId = ApplicationId.newInstance(1, 1);
+    ApplicationAttemptId attemptId = ApplicationAttemptId.newInstance(appId, 1);
+    ContainerId cid = ContainerId.newContainerId(attemptId, 1);
+    HashMap<String, String> env = new HashMap<>();
+    Container container = mock(Container.class);
+    ContainerLaunchContext context = mock(ContainerLaunchContext.class);
+    when(container.getContainerId()).thenReturn(cid);
+    when(container.getLaunchContext()).thenReturn(context);
+    when(context.getEnvironment()).thenReturn(env);
+    Path workDir = new Path("/tmp");
+
+    try {
+      lce.startLocalizer(new LocalizerStartContext.Builder()
+          .setNmPrivateContainerTokens(nmPrivateCTokensPath)
+          .setNmAddr(address)
+          .setUser(appSubmitter)
+          .setAppId(appId.toString())
+          .setLocId("12345")
+          .setDirsHandler(dirService)
+          .build());
+      Assert.fail("startLocalizer should have thrown an exception");
+    } catch (IOException e) {
+      assertTrue("Unexpected exception " + e,
+          e.getMessage().contains("exitCode"));
+    }
+
+    lce.activateContainer(cid, new Path(workDir, "pid.txt"));
+    lce.launchContainer(new ContainerStartContext.Builder()
+        .setContainer(container)
+        .setNmPrivateContainerScriptPath(new Path("file:///bin/echo"))
+        .setNmPrivateTokensPath(new Path("file:///dev/null"))
+        .setUser(appSubmitter)
+        .setAppId(appId.toString())
+        .setContainerWorkDir(workDir)
+        .setLocalDirs(dirsHandler.getLocalDirs())
+        .setLogDirs(dirsHandler.getLogDirs())
+        .build());
+    lce.deleteAsUser(new DeletionAsUserContext.Builder()
+        .setUser(appSubmitter)
+        .setSubDir(new Path("/tmp/testdir"))
+        .build());
+
+    try {
+      lce.mountCgroups(new ArrayList<String>(), "hierarchy");
+      Assert.fail("mountCgroups should have thrown an exception");
+    } catch (IOException e) {
+      assertTrue("Unexpected exception " + e,
+          e.getMessage().contains("exit code"));
+    }
+  }
+
+  @Test
+  public void testContainerLaunchEnvironment()
+      throws IOException,
+      PrivilegedOperationException {
+    String appSubmitter = "nobody";
+    String appId = "APP_ID";
+    String containerId = "CONTAINER_ID";
+    Container container = mock(Container.class);
+    ContainerId cId = mock(ContainerId.class);
+    ContainerLaunchContext context = mock(ContainerLaunchContext.class);
+    HashMap<String, String> env = new HashMap<String,String>();
+    env.put("FROM_CLIENT", "1");
+
+    when(container.getContainerId()).thenReturn(cId);
+    when(container.getLaunchContext()).thenReturn(context);
+
+    when(cId.toString()).thenReturn(containerId);
+
+    when(context.getEnvironment()).thenReturn(env);
+
+    Path scriptPath = new Path("file:///bin/echo");
+    Path tokensPath = new Path("file:///dev/null");
+    Path workDir = new Path("/tmp");
+    Path pidFile = new Path(workDir, "pid.txt");
+
+    mockExecMockRuntime.activateContainer(cId, pidFile);
+    mockExecMockRuntime.launchContainer(new ContainerStartContext.Builder()
+        .setContainer(container)
+        .setNmPrivateContainerScriptPath(scriptPath)
+        .setNmPrivateTokensPath(tokensPath)
+        .setUser(appSubmitter)
+        .setAppId(appId)
+        .setContainerWorkDir(workDir)
+        .setLocalDirs(dirsHandler.getLocalDirs())
+        .setLogDirs(dirsHandler.getLogDirs())
+        .build());
+    ArgumentCaptor<PrivilegedOperation> opCaptor = ArgumentCaptor.forClass(
+        PrivilegedOperation.class);
+    // Verify that
+    verify(mockPrivilegedExec, times(1))
+        .executePrivilegedOperation(anyListOf(
+            String.class), opCaptor.capture(), any(
+            File.class), eq((Map<String, String>)null),
+            eq(false), eq(false));
   }
 }

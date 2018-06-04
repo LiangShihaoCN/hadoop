@@ -23,10 +23,12 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.mapreduce.MRJobConfig;
+import org.apache.hadoop.mapreduce.util.MRJobConfUtil;
 import org.apache.hadoop.mapreduce.v2.api.records.TaskAttemptId;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptDiagnosticsUpdateEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptEvent;
@@ -67,13 +69,15 @@ public class TaskHeartbeatHandler extends AbstractService {
   //received from a task.
   private Thread lostTaskCheckerThread;
   private volatile boolean stopped;
-  private int taskTimeOut = 5 * 60 * 1000;// 5 mins
+  private long taskTimeOut;
+  private long unregisterTimeOut;
   private int taskTimeOutCheckInterval = 30 * 1000; // 30 seconds.
 
   private final EventHandler eventHandler;
   private final Clock clock;
   
   private ConcurrentMap<TaskAttemptId, ReportTime> runningAttempts;
+  private ConcurrentMap<TaskAttemptId, ReportTime> recentlyUnregisteredAttempts;
 
   public TaskHeartbeatHandler(EventHandler eventHandler, Clock clock,
       int numThreads) {
@@ -82,12 +86,28 @@ public class TaskHeartbeatHandler extends AbstractService {
     this.clock = clock;
     runningAttempts =
       new ConcurrentHashMap<TaskAttemptId, ReportTime>(16, 0.75f, numThreads);
+    recentlyUnregisteredAttempts =
+        new ConcurrentHashMap<TaskAttemptId, ReportTime>(16, 0.75f, numThreads);
   }
 
   @Override
   protected void serviceInit(Configuration conf) throws Exception {
     super.serviceInit(conf);
-    taskTimeOut = conf.getInt(MRJobConfig.TASK_TIMEOUT, 5 * 60 * 1000);
+    taskTimeOut = conf.getLong(
+        MRJobConfig.TASK_TIMEOUT, MRJobConfig.DEFAULT_TASK_TIMEOUT_MILLIS);
+    unregisterTimeOut = conf.getLong(MRJobConfig.TASK_EXIT_TIMEOUT,
+        MRJobConfig.TASK_EXIT_TIMEOUT_DEFAULT);
+
+    // enforce task timeout is at least twice as long as task report interval
+    long taskProgressReportIntervalMillis = MRJobConfUtil.
+        getTaskProgressReportInterval(conf);
+    long minimumTaskTimeoutAllowed = taskProgressReportIntervalMillis * 2;
+    if(taskTimeOut < minimumTaskTimeoutAllowed) {
+      taskTimeOut = minimumTaskTimeoutAllowed;
+      LOG.info("Task timeout must be as least twice as long as the task " +
+          "status report interval. Setting task timeout to " + taskTimeOut);
+    }
+
     taskTimeOutCheckInterval =
         conf.getInt(MRJobConfig.TASK_TIMEOUT_CHECK_INTERVAL_MS, 30 * 1000);
   }
@@ -125,6 +145,12 @@ public class TaskHeartbeatHandler extends AbstractService {
 
   public void unregister(TaskAttemptId attemptID) {
     runningAttempts.remove(attemptID);
+    recentlyUnregisteredAttempts.put(attemptID,
+        new ReportTime(clock.getTime()));
+  }
+
+  public boolean hasRecentlyUnregistered(TaskAttemptId attemptID) {
+    return recentlyUnregisteredAttempts.containsKey(attemptID);
   }
 
   private class PingChecker implements Runnable {
@@ -132,27 +158,9 @@ public class TaskHeartbeatHandler extends AbstractService {
     @Override
     public void run() {
       while (!stopped && !Thread.currentThread().isInterrupted()) {
-        Iterator<Map.Entry<TaskAttemptId, ReportTime>> iterator =
-            runningAttempts.entrySet().iterator();
-
-        // avoid calculating current time everytime in loop
         long currentTime = clock.getTime();
-
-        while (iterator.hasNext()) {
-          Map.Entry<TaskAttemptId, ReportTime> entry = iterator.next();
-          boolean taskTimedOut = (taskTimeOut > 0) && 
-              (currentTime > (entry.getValue().getLastProgress() + taskTimeOut));
-           
-          if(taskTimedOut) {
-            // task is lost, remove from the list and raise lost event
-            iterator.remove();
-            eventHandler.handle(new TaskAttemptDiagnosticsUpdateEvent(entry
-                .getKey(), "AttemptID:" + entry.getKey().toString()
-                + " Timed out after " + taskTimeOut / 1000 + " secs"));
-            eventHandler.handle(new TaskAttemptEvent(entry.getKey(),
-                TaskAttemptEventType.TA_TIMED_OUT));
-          }
-        }
+        checkRunning(currentTime);
+        checkRecentlyUnregistered(currentTime);
         try {
           Thread.sleep(taskTimeOutCheckInterval);
         } catch (InterruptedException e) {
@@ -161,6 +169,43 @@ public class TaskHeartbeatHandler extends AbstractService {
         }
       }
     }
+
+    private void checkRunning(long currentTime) {
+      Iterator<Map.Entry<TaskAttemptId, ReportTime>> iterator =
+          runningAttempts.entrySet().iterator();
+
+      while (iterator.hasNext()) {
+        Map.Entry<TaskAttemptId, ReportTime> entry = iterator.next();
+        boolean taskTimedOut = (taskTimeOut > 0) &&
+            (currentTime > (entry.getValue().getLastProgress() + taskTimeOut));
+
+        if(taskTimedOut) {
+          // task is lost, remove from the list and raise lost event
+          iterator.remove();
+          eventHandler.handle(new TaskAttemptDiagnosticsUpdateEvent(entry
+              .getKey(), "AttemptID:" + entry.getKey().toString()
+              + " Timed out after " + taskTimeOut / 1000 + " secs"));
+          eventHandler.handle(new TaskAttemptEvent(entry.getKey(),
+              TaskAttemptEventType.TA_TIMED_OUT));
+        }
+      }
+    }
+
+    private void checkRecentlyUnregistered(long currentTime) {
+      Iterator<ReportTime> iterator =
+          recentlyUnregisteredAttempts.values().iterator();
+      while (iterator.hasNext()) {
+        ReportTime unregisteredTime = iterator.next();
+        if (currentTime >
+            unregisteredTime.getLastProgress() + unregisterTimeOut) {
+          iterator.remove();
+        }
+      }
+    }
   }
 
+  @VisibleForTesting
+  public long getTaskTimeOut() {
+    return taskTimeOut;
+  }
 }

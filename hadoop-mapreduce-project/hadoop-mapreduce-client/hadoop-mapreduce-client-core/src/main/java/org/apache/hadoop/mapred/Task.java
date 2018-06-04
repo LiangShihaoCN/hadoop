@@ -42,6 +42,7 @@ import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocalDirAllocator;
+import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.FileSystem.Statistics;
 import org.apache.hadoop.io.BytesWritable;
@@ -61,8 +62,10 @@ import org.apache.hadoop.mapreduce.MRConfig;
 import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.mapreduce.lib.reduce.WrappedReducer;
 import org.apache.hadoop.mapreduce.task.ReduceContextImpl;
+import org.apache.hadoop.mapreduce.util.MRJobConfUtil;
 import org.apache.hadoop.yarn.util.ResourceCalculatorProcessTree;
 import org.apache.hadoop.net.NetUtils;
+import org.apache.hadoop.util.ExitUtil;
 import org.apache.hadoop.util.Progress;
 import org.apache.hadoop.util.Progressable;
 import org.apache.hadoop.util.ReflectionUtils;
@@ -192,6 +195,7 @@ abstract public class Task implements Writable, Configurable {
   protected SecretKey tokenSecret;
   protected SecretKey shuffleSecret;
   protected GcTimeUpdater gcUpdater;
+  private boolean uberized = false;
 
   ////////////////////////////////////////////
   // Constructors
@@ -729,20 +733,59 @@ abstract public class Task implements Writable, Configurable {
       } else {
         return split;
       }
-    }  
-    /** 
-     * The communication thread handles communication with the parent (Task Tracker). 
-     * It sends progress updates if progress has been made or if the task needs to 
-     * let the parent know that it's alive. It also pings the parent to see if it's alive. 
+    }
+
+    /**
+     * exception thrown when the task exceeds some configured limits.
+     */
+    public class TaskLimitException extends IOException {
+      public TaskLimitException(String str) {
+        super(str);
+      }
+    }
+
+    /**
+     * check the counters to see whether the task has exceeded any configured
+     * limits.
+     * @throws TaskLimitException
+     */
+    protected void checkTaskLimits() throws TaskLimitException {
+      // check the limit for writing to local file system
+      long limit = conf.getLong(MRJobConfig.TASK_LOCAL_WRITE_LIMIT_BYTES,
+              MRJobConfig.DEFAULT_TASK_LOCAL_WRITE_LIMIT_BYTES);
+      if (limit >= 0) {
+        Counters.Counter localWritesCounter = null;
+        try {
+          LocalFileSystem localFS = FileSystem.getLocal(conf);
+          localWritesCounter = counters.findCounter(localFS.getScheme(),
+                  FileSystemCounter.BYTES_WRITTEN);
+        } catch (IOException e) {
+          LOG.warn("Could not get LocalFileSystem BYTES_WRITTEN counter");
+        }
+        if (localWritesCounter != null
+                && localWritesCounter.getCounter() > limit) {
+          throw new TaskLimitException("too much write to local file system." +
+                  " current value is " + localWritesCounter.getCounter() +
+                  " the limit is " + limit);
+        }
+      }
+    }
+
+    /**
+     * The communication thread handles communication with the parent (Task
+     * Tracker). It sends progress updates if progress has been made or if
+     * the task needs to let the parent know that it's alive. It also pings
+     * the parent to see if it's alive.
      */
     public void run() {
       final int MAX_RETRIES = 3;
       int remainingRetries = MAX_RETRIES;
       // get current flag value and reset it as well
       boolean sendProgress = resetProgressFlag();
-      long taskProgressInterval =
-          conf.getLong(MRJobConfig.TASK_PROGRESS_REPORT_INTERVAL,
-                       MRJobConfig.DEFAULT_TASK_PROGRESS_REPORT_INTERVAL);
+
+      long taskProgressInterval = MRJobConfUtil.
+          getTaskProgressReportInterval(conf);
+
       while (!taskDone.get()) {
         synchronized (lock) {
           done = false;
@@ -763,8 +806,9 @@ abstract public class Task implements Writable, Configurable {
           if (sendProgress) {
             // we need to send progress update
             updateCounters();
+            checkTaskLimits();
             taskStatus.statusUpdate(taskProgress.get(),
-                                    taskProgress.toString(), 
+                                    taskProgress.toString(),
                                     counters);
             taskFound = umbilical.statusUpdate(taskId, taskStatus);
             taskStatus.clearStatus();
@@ -777,15 +821,31 @@ abstract public class Task implements Writable, Configurable {
           // if Task Tracker is not aware of our task ID (probably because it died and 
           // came back up), kill ourselves
           if (!taskFound) {
-            LOG.warn("Parent died.  Exiting "+taskId);
-            resetDoneFlag();
-            System.exit(66);
+            if (uberized) {
+              taskDone.set(true);
+              break;
+            } else {
+              LOG.warn("Parent died.  Exiting "+taskId);
+              resetDoneFlag();
+              System.exit(66);
+            }
           }
 
-          sendProgress = resetProgressFlag(); 
+          sendProgress = resetProgressFlag();
           remainingRetries = MAX_RETRIES;
-        } 
-        catch (Throwable t) {
+        } catch (TaskLimitException e) {
+          String errMsg = "Task exceeded the limits: " +
+                  StringUtils.stringifyException(e);
+          LOG.fatal(errMsg);
+          try {
+            umbilical.fatalError(taskId, errMsg);
+          } catch (IOException ioe) {
+            LOG.fatal("Failed to update failure diagnosis", ioe);
+          }
+          LOG.fatal("Killing " + taskId);
+          resetDoneFlag();
+          ExitUtil.terminate(69);
+        } catch (Throwable t) {
           LOG.info("Communication exception: " + StringUtils.stringifyException(t));
           remainingRetries -=1;
           if (remainingRetries == 0) {
@@ -1043,7 +1103,7 @@ abstract public class Task implements Writable, Configurable {
                    TaskReporter reporter
                    ) throws IOException, InterruptedException {
     LOG.info("Task:" + taskId + " is done."
-             + " And is in the process of committing");
+            + " And is in the process of committing");
     updateCounters();
 
     boolean commitRequired = isCommitRequired();
@@ -1076,6 +1136,18 @@ abstract public class Task implements Writable, Configurable {
     sendLastUpdate(umbilical);
     //signal the tasktracker that we are done
     sendDone(umbilical);
+    LOG.info("Final Counters for " + taskId + ": " +
+              getCounters().toString());
+    /**
+     *   File System Counters
+     *           FILE: Number of bytes read=0
+     *           FILE: Number of bytes written=146972
+     *           ...
+     *   Map-Reduce Framework
+     *           Map output records=6
+     *           Map output records=6
+     *           ...
+     */
   }
 
   /**
@@ -1102,11 +1174,17 @@ abstract public class Task implements Writable, Configurable {
   public void statusUpdate(TaskUmbilicalProtocol umbilical) 
   throws IOException {
     int retries = MAX_RETRIES;
+
     while (true) {
       try {
         if (!umbilical.statusUpdate(getTaskID(), taskStatus)) {
-          LOG.warn("Parent died.  Exiting "+taskId);
-          System.exit(66);
+          if (uberized) {
+            LOG.warn("Task no longer available: " + taskId);
+            break;
+          } else {
+            LOG.warn("Parent died.  Exiting " + taskId);
+            ExitUtil.terminate(66);
+          }
         }
         taskStatus.clearStatus();
         return;
@@ -1319,6 +1397,8 @@ abstract public class Task implements Writable, Configurable {
         NetUtils.addStaticResolution(name, resolvedName);
       }
     }
+
+    uberized = conf.getBoolean("mapreduce.task.uberized", false);
   }
 
   public Configuration getConf() {

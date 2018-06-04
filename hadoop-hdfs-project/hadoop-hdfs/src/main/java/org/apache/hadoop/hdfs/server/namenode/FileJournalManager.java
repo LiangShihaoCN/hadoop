@@ -77,6 +77,15 @@ public class FileJournalManager implements JournalManager {
 
   private File currentInProgress = null;
 
+  /**
+   * A FileJournalManager should maintain the largest Tx ID that has been
+   * safely written to its edit log files.
+   * It should limit readers to read beyond this ID to avoid potential race
+   * with ongoing writers.
+   * Initial value indicates that all transactions can be read.
+   */
+  private long lastReadableTxId = Long.MAX_VALUE;
+
   @VisibleForTesting
   StoragePurger purger
     = new NNStorageRetentionManager.DeletionStoragePurger();
@@ -160,6 +169,15 @@ public class FileJournalManager implements JournalManager {
     this.outputBufferCapacity = size;
   }
 
+
+  public long getLastReadableTxId() {
+    return lastReadableTxId;
+  }
+
+  public void setLastReadableTxId(long id) {
+    this.lastReadableTxId = id;
+  }
+
   @Override
   public void purgeLogsOlderThan(long minTxIdToKeep)
       throws IOException {
@@ -194,7 +212,7 @@ public class FileJournalManager implements JournalManager {
       }
       if (elf.isInProgress()) {
         try {
-          elf.validateLog();
+          elf.scanLog(getLastReadableTxId(), true);
         } catch (IOException e) {
           LOG.error("got IOException while trying to validate header of " +
               elf + ".  Skipping.", e);
@@ -326,11 +344,13 @@ public class FileJournalManager implements JournalManager {
           (inProgressOk ? " (inProgress ok) " : " (excluding inProgress) ") +
           "from among " + elfs.size() + " candidate file(s)");
     }
-    addStreamsToCollectionFromFiles(elfs, streams, fromTxId, inProgressOk);
+    addStreamsToCollectionFromFiles(elfs, streams, fromTxId,
+        getLastReadableTxId(), inProgressOk);
   }
   
   static void addStreamsToCollectionFromFiles(Collection<EditLogFile> elfs,
-      Collection<EditLogInputStream> streams, long fromTxId, boolean inProgressOk) {
+      Collection<EditLogInputStream> streams, long fromTxId,
+      long maxTxIdToScan, boolean inProgressOk) {
     for (EditLogFile elf : elfs) {
       if (elf.isInProgress()) {
         if (!inProgressOk) {
@@ -341,7 +361,7 @@ public class FileJournalManager implements JournalManager {
           continue;
         }
         try {
-          elf.validateLog();
+          elf.scanLog(maxTxIdToScan, true);
         } catch (IOException e) {
           LOG.error("got IOException while trying to validate header of " +
               elf + ".  Skipping.", e);
@@ -385,7 +405,7 @@ public class FileJournalManager implements JournalManager {
           continue;
         }
 
-        elf.validateLog();
+        elf.scanLog(getLastReadableTxId(), true);
 
         if (elf.hasCorruptHeader()) {
           elf.moveAsideCorruptFile();
@@ -517,15 +537,16 @@ public class FileJournalManager implements JournalManager {
      * Find out where the edit log ends.
      * This will update the lastTxId of the EditLogFile or
      * mark it as corrupt if it is.
+     * @param maxTxIdToScan Maximum Tx ID to try to scan.
+     *                      The scan returns after reading this or a higher ID.
+     *                      The file portion beyond this ID is potentially being
+     *                      updated.
+     * @param verifyVersion Whether the scan should verify the layout version
      */
-    public void validateLog() throws IOException {
-      EditLogValidation val = EditLogFileInputStream.validateEditLog(file);
-      this.lastTxId = val.getEndTxId();
-      this.hasCorruptHeader = val.hasCorruptHeader();
-    }
-
-    public void scanLog() throws IOException {
-      EditLogValidation val = EditLogFileInputStream.scanEditLog(file);
+    public void scanLog(long maxTxIdToScan, boolean verifyVersion)
+        throws IOException {
+      EditLogValidation val = EditLogFileInputStream.scanEditLog(file,
+          maxTxIdToScan, verifyVersion);
       this.lastTxId = val.getEndTxId();
       this.hasCorruptHeader = val.hasCorruptHeader();
     }

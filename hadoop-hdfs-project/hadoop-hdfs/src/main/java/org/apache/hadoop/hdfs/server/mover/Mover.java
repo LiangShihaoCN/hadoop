@@ -123,13 +123,16 @@ public class Mover {
     final int maxConcurrentMovesPerNode = conf.getInt(
         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_KEY,
         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_DEFAULT);
+    final int maxNoMoveInterval = conf.getInt(
+        DFSConfigKeys.DFS_MOVER_MAX_NO_MOVE_INTERVAL_KEY,
+        DFSConfigKeys.DFS_MOVER_MAX_NO_MOVE_INTERVAL_DEFAULT);
     this.retryMaxAttempts = conf.getInt(
         DFSConfigKeys.DFS_MOVER_RETRY_MAX_ATTEMPTS_KEY,
         DFSConfigKeys.DFS_MOVER_RETRY_MAX_ATTEMPTS_DEFAULT);
     this.retryCount = retryCount;
     this.dispatcher = new Dispatcher(nnc, Collections.<String> emptySet(),
         Collections.<String> emptySet(), movedWinWidth, moverThreads, 0,
-        maxConcurrentMovesPerNode, conf);
+        maxConcurrentMovesPerNode, maxNoMoveInterval, conf);
     this.storages = new StorageMap();
     this.targetPaths = nnc.getTargetPaths();
     this.blockStoragePolicies = new BlockStoragePolicy[1 <<
@@ -348,10 +351,15 @@ public class Mover {
     /** @return true if it is necessary to run another round of migration */
     private void processFile(String fullPath, HdfsLocatedFileStatus status,
         Result result) {
-      final byte policyId = status.getStoragePolicy();
-      // currently we ignore files with unspecified storage policy
+      byte policyId = status.getStoragePolicy();
       if (policyId == HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-        return;
+        try {
+          // get default policy from namenode
+          policyId = dfs.getServerDefaults().getDefaultStoragePolicyId();
+        } catch (IOException e) {
+          LOG.warn("Failed to get default policy for " + fullPath, e);
+          return;
+        }
       }
       final BlockStoragePolicy policy = blockStoragePolicies[policyId];
       if (policy == null) {
@@ -457,7 +465,9 @@ public class Mover {
         List<StorageType> targetTypes, Matcher matcher) {
       final NetworkTopology cluster = dispatcher.getCluster(); 
       for (StorageType t : targetTypes) {
-        for(StorageGroup target : storages.getTargetStorages(t)) {
+        final List<StorageGroup> targets = storages.getTargetStorages(t);
+        Collections.shuffle(targets);
+        for (StorageGroup target : targets) {
           if (matcher.match(cluster, source.getDatanodeInfo(),
               target.getDatanodeInfo())) {
             final PendingMove pm = source.addPendingMove(db, target);
@@ -571,12 +581,23 @@ public class Mover {
             IOUtils.cleanup(LOG, nnc);
             iter.remove();
           } else if (r != ExitStatus.IN_PROGRESS) {
+            if (r == ExitStatus.NO_MOVE_PROGRESS) {
+              System.err.println("Failed to move some blocks after "
+                  + m.retryMaxAttempts + " retries. Exiting...");
+            } else if (r == ExitStatus.NO_MOVE_BLOCK) {
+              System.err.println("Some blocks can't be moved. Exiting...");
+            } else {
+              System.err.println("Mover failed. Exiting with status " + r
+                  + "... ");
+            }
             // must be an error statue, return
             return r.getExitCode();
           }
         }
         Thread.sleep(sleeptime);
       }
+      System.out.println("Mover Successful: all blocks satisfy"
+          + " the specified storage policy. Exiting...");
       return ExitStatus.SUCCESS.getExitCode();
     } finally {
       for (NameNodeConnector nnc : connectors) {
@@ -632,7 +653,7 @@ public class Mover {
       } else if (line.hasOption("p")) {
         paths = line.getOptionValues("p");
       }
-      Collection<URI> namenodes = DFSUtil.getNsServiceRpcUris(conf);
+      Collection<URI> namenodes = DFSUtil.getInternalNsRpcUris(conf);
       if (paths == null || paths.length == 0) {
         for (URI namenode : namenodes) {
           map.put(namenode, null);
